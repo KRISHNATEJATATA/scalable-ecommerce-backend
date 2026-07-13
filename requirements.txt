@@ -1,0 +1,35 @@
+# Runtime dependencies (pinned). Dev/test tooling lives in the [dev] extra of pyproject.toml.
+# CI installs this file first, then `pip install -e ".[dev]"`.
+
+# --- Web framework / server ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+gunicorn==23.0.0
+
+# --- Database (async app, sync Alembic) ---
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+psycopg2-binary==2.9.10          # Alembic migrations only (sync driver)
+
+# --- Config / validation ---
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# --- Auth (Phase 5) ---
+pyjwt==2.10.1
+pwdlib[argon2]==0.2.1
+authlib==1.4.0
+
+# --- Ephemeral shared state ---
+valkey==6.0.2
+
+# --- Object storage + upload validation (Phase 7) ---
+aioboto3==13.3.0
+pillow==11.0.0
+python-magic==0.4.27
+
+# --- Observability ---
+python-json-logger==3.2.1
+ecs-logging==2.2.0
+prometheus-client==0.21.1

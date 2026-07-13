@@ -1,0 +1,12 @@
+{
+  "name": "scalable-ecommerce-backend-tooling",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tooling-only package: Spectral OpenAPI lint for the API contract.",
+  "scripts": {
+    "validate": "spectral lint api/openapi/ecommerce-api.openapi.yaml"
+  },
+  "devDependencies": {
+    "@stoplight/spectral-cli": "^6.14.2"
+  }
+}

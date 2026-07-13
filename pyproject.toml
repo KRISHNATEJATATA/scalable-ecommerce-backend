@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scalable-ecommerce-backend"
+version = "0.1.0"
+description = "Async, API-first FastAPI e-commerce backend targeting AWS ECS Fargate."
+readme = "README.md"
+requires-python = ">=3.13"
+license = { file = "LICENSE" }
+
+# Runtime deps are pinned in requirements.txt (CI installs it first). Keep this
+# list in sync at the top level; requirements.txt is the pinned lockfile.
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "gunicorn",
+    "sqlalchemy[asyncio]",
+    "asyncpg",
+    "alembic",
+    "psycopg2-binary",
+    "pydantic",
+    "pydantic-settings",
+    "pyjwt",
+    "pwdlib[argon2]",
+    "authlib",
+    "valkey",
+    "aioboto3",
+    "pillow",
+    "python-magic",
+    "python-json-logger",
+    "ecs-logging",
+    "prometheus-client",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "httpx",
+    "testcontainers[postgres]",
+    "moto",
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
