@@ -5,8 +5,9 @@ Every setting is a field on :class:`AppSettings`; **no code reads ``os.environ``
 directly** (see ``.github/copilot-instructions.md``). Adding an env var means
 adding a field here *and* an entry in ``.env.example``.
 
-Instantiated once at import (``settings``) so a missing required var fails the
-process immediately at startup rather than at first use.
+Resolved once on first access (``settings`` / ``get_settings()``) so a missing
+required var fails the process at startup rather than at mere import time — the
+latter would break test collection and any env without config.
 """
 
 from functools import lru_cache
@@ -72,4 +73,9 @@ def get_settings() -> AppSettings:
     return AppSettings()
 
 
-settings = get_settings()
+def __getattr__(name: str) -> AppSettings:
+    # lazy singleton via PEP 562 so importing this module doesn't
+    # require config; fail-fast still fires on first `settings` access.
+    if name == "settings":
+        return get_settings()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
