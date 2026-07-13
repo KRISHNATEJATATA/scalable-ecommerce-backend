@@ -1,0 +1,37 @@
+openapi: 3.1.0
+info:
+  title: Scalable E-commerce Backend API
+  version: 0.1.0
+  description: >-
+    Async, API-first FastAPI e-commerce backend. Hand-authored contract and
+    design source of truth (Spectral-linted). Paths are filled in per phase.
+  license:
+    name: MIT
+servers:
+  - url: http://localhost:8000
+    description: Local development
+tags:
+  - name: health
+    description: Liveness and readiness probes
+paths: {}
+components:
+  schemas:
+    Problem:
+      description: RFC 9457 Problem Details (the one flat error shape).
+      type: object
+      properties:
+        type:
+          type: string
+        status:
+          type: integer
+        title:
+          type: string
+        detail:
+          type: string
+        trace_id:
+          type: string
+        details:
+          type: array
+          items:
+            type: object
+      required: [type, status, title]

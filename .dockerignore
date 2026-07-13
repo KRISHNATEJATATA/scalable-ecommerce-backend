@@ -1,0 +1,48 @@
+# Python artefacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+.env.*
+*.env
+
+# Test and development artefacts
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Docs and temp files
+docs/
+temp/
+*.md
+!README.md
+
+# Version control
+.git/
+.gitignore
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# CI config (not needed in image)
+.github/
+
+# Node (package.json is present for spectral linting only)
+node_modules/
