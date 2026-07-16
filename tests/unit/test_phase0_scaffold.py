@@ -37,6 +37,8 @@ def test_settings_load_when_database_url_present(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@localhost:5432/db")
     s = AppSettings(_env_file=None)
     assert s.jwt_algorithm == "RS256"
+    assert s.keycloak_realm == "ecommerce"
+    assert s.api_v1_prefix == "/v1"
     assert s.environment == "local"
 
 

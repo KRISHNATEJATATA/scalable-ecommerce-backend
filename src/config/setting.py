@@ -42,20 +42,27 @@ class AppSettings(BaseSettings):
     db_max_overflow: int = 10
     db_pool_pre_ping: bool = True
 
-    # --- Valkey (ephemeral state: rate-limit, idempotency, jti denylist) ---
+    # --- Valkey (ephemeral state: rate-limit counters, idempotency keys) ---
     valkey_url: str = "redis://localhost:6379/0"
 
-    # --- Auth / JWT (RS256, Phase 5) ---
-    jwt_private_key_path: str | None = None
-    jwt_public_key_path: str | None = None
+    # --- Auth: OIDC via Keycloak (app is a pure resource server, Phase 5) ---
+    # The app only VALIDATES Keycloak-issued RS256 tokens (JWKS). Keycloak owns
+    # login/refresh/passwords. Algorithm is hardcoded to RS256 (alg:none guard).
+    keycloak_issuer: str | None = None
+    keycloak_realm: str = "ecommerce"
+    keycloak_audience: str = "ecommerce-api"
+    keycloak_jwks_url: str | None = None
     jwt_algorithm: Literal["RS256"] = "RS256"
-    access_token_ttl_seconds: int = 900  # 15 min
-    refresh_token_ttl_seconds: int = 60 * 60 * 24 * 14  # 14 days
+    # Admin service-account for user/role management via Keycloak's Admin API.
+    keycloak_admin_client_id: str | None = None
+    keycloak_admin_client_secret: str | None = None
 
-    # --- Cookies / security ---
-    cookie_secure: bool = True
-    cookie_samesite: Literal["lax", "strict", "none"] = "lax"
+    # --- HTTP / CORS (bearer-token auth: no cookies → allow_credentials false) ---
+    api_v1_prefix: str = "/v1"
     cors_allow_origins: list[str] = Field(default_factory=list)
+
+    # --- Feature flags (plain env booleans; not a flag service) ---
+    enable_reviews: bool = False
 
     # --- S3 / uploads (Phase 7) ---
     s3_bucket: str | None = None

@@ -1,0 +1,36 @@
+{
+  "realm": "ecommerce",
+  "enabled": true,
+  "sslRequired": "none",
+  "accessTokenLifespan": 300,
+  "roles": {
+    "realm": [
+      { "name": "consumer", "description": "Default customer role" },
+      { "name": "merchant", "description": "Seller/vendor role" },
+      { "name": "admin", "description": "Administrator role" }
+    ]
+  },
+  "defaultRoles": ["consumer"],
+  "clients": [
+    {
+      "clientId": "ecommerce-spa",
+      "name": "E-commerce SPA (public, Auth Code + PKCE)",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "redirectUris": ["http://localhost:3000/*"],
+      "webOrigins": ["http://localhost:3000"],
+      "attributes": { "pkce.code.challenge.method": "S256" }
+    },
+    {
+      "clientId": "ecommerce-admin",
+      "name": "E-commerce Admin service account (Admin API)",
+      "enabled": true,
+      "publicClient": false,
+      "secret": "change-me-local-only",
+      "standardFlowEnabled": false,
+      "serviceAccountsEnabled": true
+    }
+  ]
+}

@@ -1,9 +1,9 @@
 # Architecture
 
 Async, API-first FastAPI e-commerce backend. **Monolith-with-replicas**: one
-deployable service with a shared auth dependency across routers, run as multiple
-identical ECS Fargate tasks behind an ALB. RS256 JWT keeps a future auth-service
-split free.
+deployable service with a shared token-validation dependency across routers, run
+as multiple identical ECS Fargate tasks behind an ALB. Identity is externalized
+to **Keycloak (OIDC)**, so a future auth-service split is essentially free.
 
 ## Layered layout (`src/`)
 
@@ -33,19 +33,23 @@ flowchart TD
     Service["Services<br/>business logic · returns schemas"]
     Repo["Repositories<br/>all DB queries · pagination · soft-delete"]
     Model["SQLAlchemy Models<br/>version_id · CHECK/UNIQUE"]
-    Auth["Auth dependency<br/>RS256 JWT · require_role"]
+    Auth["Auth dependency<br/>OIDC token validation · require_role"]
     Errors["Errors<br/>RFC 9457 Problem Details"]
     Log["Logging<br/>ECS JSON · trace-id · redaction"]
   end
   PG[("PostgreSQL<br/>asyncpg")]
-  VK[("Valkey<br/>rate-limit · idempotency · jti denylist")]
+  VK[("Valkey<br/>rate-limit · idempotency")]
   S3[("S3 / MinIO<br/>aioboto3")]
   SQS[["SQS / ElasticMQ<br/>email worker"]]
+  KC[("Keycloak (OIDC IdP)<br/>token issuance · JWKS · Admin API")]
 
   Client --> MW --> Route
   Route --> Schema --> Service
   Route -.->|Depends| Auth
-  Auth -.-> VK
+  Auth -.->|verify JWT · JWKS| KC
+  Service -.->|admin: manage users/roles| KC
+  MW -.->|rate-limit| VK
+  Service -.->|idempotency| VK
   Service --> Repo --> Model --> PG
   Service --> S3
   Service -->|order committed| SQS
@@ -58,31 +62,45 @@ flowchart TD
 Every route, service, and repository is `async def`. A single blocking sync call
 in an async path silently serializes that endpoint under load. Offload
 unavoidable blocking/CPU-bound work with `run_in_threadpool` /
-`asyncio.to_thread`: Argon2 hashing (Phase 5), Pillow re-encode + `python-magic`
-sniff (Phase 7), sync `boto3`. Use `asyncio.sleep()`, never `time.sleep()`.
+`asyncio.to_thread`: Pillow re-encode + `python-magic` sniff (Phase 7), sync
+`boto3`. Use `asyncio.sleep()`, never `time.sleep()`.
 **Alembic stays sync** (sync `psycopg` driver in `env.py`).
 
-## Auth / JWT model
+## Auth model (OIDC resource server)
 
-- Short-lived **access token** (10–15 min) in an **httpOnly + Secure + SameSite
-  cookie**; longer-lived **refresh token, rotated on every `/refresh`** (old
-  `jti` revoked).
-- **RS256**, verify algorithm hardcoded (`alg:none` guard), verified with the
-  **public key** only. Issuer holds the private key.
-- Roles/scopes (`customer`, `vendor`, `admin`) live in the token payload → RBAC
-  is a cheap `Depends(require_role(...))`, not a DB hit.
-- Revocation via **Valkey `jti` denylist** (TTL = token remaining life) + a
-  per-instance in-memory LRU shortcut. Add `jti`s on logout, password change,
-  role change.
-- **Privilege guard:** registration never accepts `role` from input (default
-  `customer`); OAuth logins auto-create a `customer`.
+The app is a **pure OIDC resource server** — it never handles credentials or
+login flows. **Keycloak** is the Identity Provider (free/OSS; a container locally,
+a deployed service in any env). A separate frontend/SPA runs Authorization Code +
+PKCE against Keycloak; the API only validates the tokens Keycloak issues. See
+[`adr/0001-oidc-keycloak-resource-server.md`](adr/0001-oidc-keycloak-resource-server.md).
+
+- **Validate-only**: verify the Keycloak **RS256** access token against Keycloak's
+  cached **JWKS** (`iss`/`aud`/`exp`), algorithm hardcoded (`alg:none` guard),
+  public key only. Bearer token in the `Authorization` header → **no auth cookie,
+  no CSRF surface**.
+- **Roles** (`consumer` / `merchant` / `admin`) are **Keycloak realm roles** in
+  the token (`realm_access.roles`) → RBAC is a cheap `Depends(require_role(...))`,
+  not a DB hit. Keycloak is the single source of truth for roles.
+- **Local `users` row keyed by the OIDC `sub`**, JIT-provisioned on first
+  authenticated request, anchors FK ownership (`products.merchant_id`,
+  `orders.user_id`) + an `is_active` mirror — not the identity/role source.
+- **Row-level ownership**: a `merchant` may mutate/soft-remove only items where
+  `merchant_id == user.id`; `admin` acts on any item; `consumer` reads + orders.
+- **Admin identity management** via Keycloak's **Admin API** (`python-keycloak`):
+  create/disable users, grant/revoke the `merchant` role. The app stores no
+  passwords.
+- **Revocation = short access-token TTL (~5 min)** — a disabled user's token
+  expires fast; no app-side denylist/introspection. Keycloak owns login, refresh,
+  logout, password reset, email verification, MFA, and social federation.
+- **Privilege guard is automatic**: new users get the default `consumer` realm
+  role from Keycloak; the app cannot be asked to mint a role.
 
 ## Valkey usage
 
-Ephemeral shared state **only**: rate-limit counters, idempotency keys, JWT
-`jti` denylist. Prod = ElastiCache for Valkey replication group (Multi-AZ) so the
-one shared dependency isn't a SPOF. Not for sessions/caching (product-listing
-read cache is a later watch-item).
+Ephemeral shared state **only**: rate-limit counters and idempotency keys (no JWT
+`jti` denylist — Keycloak + short token TTL own revocation). Prod = ElastiCache
+for Valkey replication group (Multi-AZ) so the one shared dependency isn't a SPOF.
+Not for sessions/caching (product-listing read cache is a later watch-item).
 
 ## Domain events
 
@@ -109,15 +127,16 @@ adjust stays inside the transaction; email confirmation is **enqueued to SQS**
 - Logging: ECS JSON to stdout, `contextvars` trace-id, `RedactFilter` scrubs
   secrets/PII. Never log passwords/tokens/JWT claims/PII.
 - Security headers via custom ASGI middleware (HSTS, CSP, `X-Content-Type-Options`,
-  `X-Frame-Options`). CSRF = `SameSite` cookie + double-submit token on
-  state-changing routes. CORS = explicit allow-list with `allow_credentials=True`.
+  `X-Frame-Options`). **No CSRF** — the Bearer token isn't an ambient cookie
+  credential. CORS = explicit allow-list (the SPA origin); `allow_credentials`
+  stays false with bearer-token auth.
 
 ## Extension points
 
 - New resource = add model → repository → service → router, wired in
   `container.py`. Layers keep the change local.
-- Auth-service split: RS256 verification needs only the public key, so a separate
-  issuer can be introduced without touching verifiers.
+- Auth-service split: identity already lives in Keycloak and the app only
+  validates tokens against JWKS, so a separate issuer is a non-event.
 - Read cache / search / additional workers are additive behind the existing
   service boundary.
 

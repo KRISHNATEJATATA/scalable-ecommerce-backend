@@ -16,15 +16,14 @@ psycopg2-binary==2.9.10          # Alembic migrations only (sync driver)
 pydantic==2.10.4
 pydantic-settings==2.7.1
 
-# --- Auth (Phase 5) ---
-pyjwt==2.10.1
-pwdlib[argon2]==0.2.1
-authlib==1.4.0
+# --- Auth: OIDC resource server against Keycloak ---
+pyjwt==2.10.1                    # validate-only, via PyJWKClient
+python-keycloak==4.7.3           # Admin API (user/role management)
 
 # --- Ephemeral shared state ---
 valkey==6.0.2
 
-# --- Object storage + upload validation (Phase 7) ---
+# --- Object storage + upload validation ---
 aioboto3==13.3.0
 pillow==11.0.0
 python-magic==0.4.27
