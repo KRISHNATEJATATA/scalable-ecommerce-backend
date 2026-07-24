@@ -28,6 +28,7 @@ class Inventory(Base, ManualVersionMixin):
     __tablename__ = "inventory"
     __table_args__ = (
         CheckConstraint("on_hand >= 0", name="ck_inventory_on_hand_non_negative"),
+        CheckConstraint("reserved >= 0", name="ck_inventory_reserved_non_negative"),
         CheckConstraint("reserved <= on_hand", name="ck_inventory_reserved_lte_on_hand"),
         {"schema": SCHEMA},
     )
@@ -41,7 +42,10 @@ class Reservation(Base, TimestampMixin):
     """A hold against ``Inventory`` for one order line, released by the reaper on expiry."""
 
     __tablename__ = "reservations"
-    __table_args__ = {"schema": SCHEMA}
+    __table_args__ = (
+        CheckConstraint("qty > 0", name="ck_reservations_qty_positive"),
+        {"schema": SCHEMA},
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     sku: Mapped[str] = mapped_column(ForeignKey(f"{SCHEMA}.inventory.sku", ondelete="CASCADE"), nullable=False)

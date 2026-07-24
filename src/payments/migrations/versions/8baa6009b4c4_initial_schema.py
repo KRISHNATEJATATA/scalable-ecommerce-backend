@@ -42,11 +42,14 @@ def upgrade() -> None:
         "payments",
         sa.Column("id", sa.UUID(), nullable=False),
         sa.Column("order_id", sa.UUID(), nullable=False),
+        sa.Column("idempotency_key", sa.String(length=255), nullable=False),
+        sa.Column("gateway_ref", sa.String(length=255), nullable=True),
         sa.Column("amount", sa.Numeric(precision=12, scale=2), nullable=False),
         sa.Column("status", sa.String(length=32), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
         sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("idempotency_key", name="uq_payments_idempotency_key"),
         schema="payments",
     )
     # ### end Alembic commands ###

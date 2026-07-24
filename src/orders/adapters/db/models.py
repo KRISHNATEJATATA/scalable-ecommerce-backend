@@ -20,22 +20,21 @@ class Base(DeclarativeBase):
 class OrderStatus(enum.StrEnum):
     PENDING = "pending"
     PAID = "paid"
-    FULFILLED = "fulfilled"
+    SHIPPED = "shipped"
     CANCELLED = "cancelled"
-    FAILED = "failed"
 
 
 class Order(Base, TimestampMixin):
     """Checkout aggregate root. ``user_id`` is an id-value ref to ``identity.users``.
 
-    ``UNIQUE(user_id, idempotency_key)`` is the durable guard for idempotent
-    checkout: a replay with the same key returns the stored response; the
-    same key with a different body is rejected (409) at the service layer.
+    ``UNIQUE(idempotency_key)`` is the durable guard for idempotent checkout: a
+    replay with the same key returns the stored response; the same key with a
+    different body is rejected (409) at the service layer.
     """
 
     __tablename__ = "orders"
     __table_args__ = (
-        UniqueConstraint("user_id", "idempotency_key", name="uq_orders_user_idempotency_key"),
+        UniqueConstraint("idempotency_key", name="uq_orders_idempotency_key"),
         Index("ix_orders_user_id_status", "user_id", "status"),
         {"schema": SCHEMA},
     )
@@ -44,7 +43,14 @@ class Order(Base, TimestampMixin):
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[OrderStatus] = mapped_column(
-        Enum(OrderStatus, name="order_status", schema=SCHEMA), nullable=False, default=OrderStatus.PENDING
+        Enum(
+            OrderStatus,
+            name="order_status",
+            schema=SCHEMA,
+            values_callable=lambda enum_cls: [e.value for e in enum_cls],
+        ),
+        nullable=False,
+        default=OrderStatus.PENDING,
     )
     total: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
 

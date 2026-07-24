@@ -1,7 +1,7 @@
 # GENERATED FILE — do not edit by hand.
 # Source: scripts/alembic_env.py.tmpl — edit that, then run:
 #     python scripts/generate_alembic_env.py
-"""Alembic environment for the ``inventory`` schema — one sync chain per module.
+"""Alembic environment for the ``$module`` schema — one sync chain per module.
 
 Deliberately separate from every other module's chain (own alembic.ini, own
 migrations/, own ``alembic_version`` table living in this schema): see
@@ -14,7 +14,7 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import create_engine, pool, text
 
-from src.inventory.adapters.db.models import SCHEMA, Base
+from src.$module.adapters.db.models import SCHEMA, Base
 from src.shared.config.setting import get_settings
 
 config = context.config

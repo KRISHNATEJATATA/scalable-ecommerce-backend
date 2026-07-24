@@ -71,8 +71,7 @@ unavoidable blocking/CPU-bound work with `run_in_threadpool` /
 The app is a **pure OIDC resource server** — it never handles credentials or
 login flows. **Keycloak** is the Identity Provider (free/OSS; a container locally,
 a deployed service in any env). A separate frontend/SPA runs Authorization Code +
-PKCE against Keycloak; the API only validates the tokens Keycloak issues. See
-[`adr/0001-oidc-keycloak-resource-server.md`](adr/0001-oidc-keycloak-resource-server.md).
+PKCE against Keycloak; the API only validates the tokens Keycloak issues.
 
 - **Validate-only**: verify the Keycloak **RS256** access token against Keycloak's
   cached **JWKS** (`iss`/`aud`/`exp`), algorithm hardcoded (`alg:none` guard),

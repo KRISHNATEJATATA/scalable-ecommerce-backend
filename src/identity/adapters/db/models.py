@@ -1,7 +1,7 @@
 """SQLAlchemy models for the ``identity`` schema.
 
 Own declarative ``Base`` (own metadata) so this module's Alembic chain only
-ever sees its own tables — see ``docs/adr/0002-per-module-alembic-chains.md``.
+ever sees its own tables.
 """
 
 import uuid
@@ -24,7 +24,7 @@ class User(Base, TimestampMixin):
 
     Keyed by the OIDC ``sub`` claim. Anchors FKs from other modules
     (``catalog.merchant_id``, ``orders.user_id``) as an id value only —
-    Keycloak remains the identity/role authority (see ADR 0001).
+    Keycloak remains the identity/role authority.
     """
 
     __tablename__ = "users"

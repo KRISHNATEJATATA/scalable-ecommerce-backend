@@ -27,6 +27,7 @@ def upgrade() -> None:
         sa.Column("reserved", sa.Integer(), nullable=False),
         sa.Column("version", sa.Integer(), nullable=False),
         sa.CheckConstraint("on_hand >= 0", name="ck_inventory_on_hand_non_negative"),
+        sa.CheckConstraint("reserved >= 0", name="ck_inventory_reserved_non_negative"),
         sa.CheckConstraint("reserved <= on_hand", name="ck_inventory_reserved_lte_on_hand"),
         sa.PrimaryKeyConstraint("sku"),
         schema="inventory",
@@ -60,6 +61,7 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
         sa.ForeignKeyConstraint(["sku"], ["inventory.inventory.sku"], ondelete="CASCADE"),
+        sa.CheckConstraint("qty > 0", name="ck_reservations_qty_positive"),
         sa.PrimaryKeyConstraint("id"),
         schema="inventory",
     )

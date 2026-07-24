@@ -1,9 +1,11 @@
+# GENERATED FILE — do not edit by hand.
+# Source: scripts/alembic_env.py.tmpl — edit that, then run:
+#     python scripts/generate_alembic_env.py
 """Alembic environment for the ``catalog`` schema — one sync chain per module.
 
 Deliberately separate from every other module's chain (own alembic.ini, own
 migrations/, own ``alembic_version`` table living in this schema): see
-``docs/adr/0002-per-module-alembic-chains.md``. Alembic stays sync (psycopg2)
-even though the app is async everywhere else.
+Alembic stays sync (psycopg2) even though the app is async everywhere else.
 """
 
 import re

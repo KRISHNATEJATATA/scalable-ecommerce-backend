@@ -1,8 +1,7 @@
 """SQLAlchemy declarative mixins shared across module schemas.
 
 Each module owns its own declarative ``Base`` (own metadata, own schema, own
-Alembic chain) — see ``docs/adr/0002-per-module-alembic-chains.md``. These
-mixins just keep the recurring columns (timestamps, soft-delete, optimistic
+Alembic chain). These mixins just keep the recurring columns (timestamps, soft-delete, optimistic
 locking) consistent across modules without sharing a metadata object.
 
 Two distinct optimistic-lock mechanisms exist on purpose:

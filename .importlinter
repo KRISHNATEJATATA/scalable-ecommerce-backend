@@ -18,12 +18,18 @@ root_packages =
 name = Modules are independent (schema-per-module, no cross-module domain/db imports)
 type = independence
 modules =
-    src.catalog
-    src.inventory
-    src.orders
-    src.payments
-    src.identity
-    src.cart
+    src.catalog.domain
+    src.catalog.adapters
+    src.inventory.domain
+    src.inventory.adapters
+    src.orders.domain
+    src.orders.adapters
+    src.payments.domain
+    src.payments.adapters
+    src.identity.domain
+    src.identity.adapters
+    src.cart.domain
+    src.cart.adapters
 
 [importlinter:contract:catalog-layers]
 name = catalog: api -> application -> domain (ports/adapters at the edges only)
@@ -36,11 +42,12 @@ containers =
     src.catalog
 
 [importlinter:contract:catalog-domain-forbidden]
-name = catalog.domain never imports adapters (wiring happens in src/shared/container.py)
+name = catalog.domain never imports ports/adapters (wiring happens in src/shared/container.py)
 type = forbidden
 source_modules =
     src.catalog.domain
 forbidden_modules =
+    src.catalog.ports
     src.catalog.adapters
 
 [importlinter:contract:inventory-layers]
@@ -54,11 +61,12 @@ containers =
     src.inventory
 
 [importlinter:contract:inventory-domain-forbidden]
-name = inventory.domain never imports adapters (wiring happens in src/shared/container.py)
+name = inventory.domain never imports ports/adapters (wiring happens in src/shared/container.py)
 type = forbidden
 source_modules =
     src.inventory.domain
 forbidden_modules =
+    src.inventory.ports
     src.inventory.adapters
 
 [importlinter:contract:orders-layers]
@@ -72,11 +80,12 @@ containers =
     src.orders
 
 [importlinter:contract:orders-domain-forbidden]
-name = orders.domain never imports adapters (wiring happens in src/shared/container.py)
+name = orders.domain never imports ports/adapters (wiring happens in src/shared/container.py)
 type = forbidden
 source_modules =
     src.orders.domain
 forbidden_modules =
+    src.orders.ports
     src.orders.adapters
 
 [importlinter:contract:payments-layers]
@@ -90,11 +99,12 @@ containers =
     src.payments
 
 [importlinter:contract:payments-domain-forbidden]
-name = payments.domain never imports adapters (wiring happens in src/shared/container.py)
+name = payments.domain never imports ports/adapters (wiring happens in src/shared/container.py)
 type = forbidden
 source_modules =
     src.payments.domain
 forbidden_modules =
+    src.payments.ports
     src.payments.adapters
 
 [importlinter:contract:identity-layers]
@@ -108,11 +118,12 @@ containers =
     src.identity
 
 [importlinter:contract:identity-domain-forbidden]
-name = identity.domain never imports adapters (wiring happens in src/shared/container.py)
+name = identity.domain never imports ports/adapters (wiring happens in src/shared/container.py)
 type = forbidden
 source_modules =
     src.identity.domain
 forbidden_modules =
+    src.identity.ports
     src.identity.adapters
 
 [importlinter:contract:cart-layers]
@@ -126,10 +137,11 @@ containers =
     src.cart
 
 [importlinter:contract:cart-domain-forbidden]
-name = cart.domain never imports adapters (wiring happens in src/shared/container.py)
+name = cart.domain never imports ports/adapters (wiring happens in src/shared/container.py)
 type = forbidden
 source_modules =
     src.cart.domain
 forbidden_modules =
+    src.cart.ports
     src.cart.adapters
 

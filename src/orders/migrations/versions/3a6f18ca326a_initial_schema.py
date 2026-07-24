@@ -27,14 +27,14 @@ def upgrade() -> None:
         sa.Column("idempotency_key", sa.String(length=255), nullable=False),
         sa.Column(
             "status",
-            sa.Enum("PENDING", "PAID", "FULFILLED", "CANCELLED", "FAILED", name="order_status", schema="orders"),
+            sa.Enum("pending", "paid", "shipped", "cancelled", name="order_status", schema="orders"),
             nullable=False,
         ),
         sa.Column("total", sa.Numeric(precision=12, scale=2), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("user_id", "idempotency_key", name="uq_orders_user_idempotency_key"),
+        sa.UniqueConstraint("idempotency_key", name="uq_orders_idempotency_key"),
         schema="orders",
     )
     op.create_index("ix_orders_user_id_status", "orders", ["user_id", "status"], unique=False, schema="orders")
