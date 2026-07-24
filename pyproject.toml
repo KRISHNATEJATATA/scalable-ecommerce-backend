@@ -42,6 +42,7 @@ dev = [
     "testcontainers[postgres]",
     "moto",
     "ruff",
+    "import-linter",
 ]
 
 [tool.setuptools.packages.find]

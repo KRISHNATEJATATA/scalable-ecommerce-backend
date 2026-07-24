@@ -216,3 +216,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+skills-lock.json
+CONTEXT-MAP.md
+AGENTS.md
+temp/
+plans/
+.scratch/
+.github/memory.md
+.github/copilot-instructions.md
+docs/adr/
+docs/agents/
+docs/glossary.md
+.agents/
+.github/shared
+.github/skills
+**/CONTEXT.md

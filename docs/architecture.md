@@ -123,7 +123,7 @@ adjust stays inside the transaction; email confirmation is **enqueued to SQS**
 
 ## Errors, logging, security
 
-- Errors: **RFC 9457 Problem Details** built via `src/errors/error_builder.py`.
+- Errors: **RFC 9457 Problem Details** built via `src/shared/errors/error_builder.py`.
 - Logging: ECS JSON to stdout, `contextvars` trace-id, `RedactFilter` scrubs
   secrets/PII. Never log passwords/tokens/JWT claims/PII.
 - Security headers via custom ASGI middleware (HSTS, CSP, `X-Content-Type-Options`,

@@ -1,0 +1,135 @@
+; import-linter contract: module boundaries for the modular monolith.
+;
+; Two contract types:
+; 1. independence  — no module's domain/adapters may import another module's
+;    domain/adapters. Cross-module references are id values only, never
+;    direct imports (see CONTEXT-MAP.md "Relationships").
+; 2. layers        — within a module: api -> application -> domain, with
+;    domain never importing ports/adapters (ports/adapters sit at the edges,
+;    wired by src/shared/container.py).
+;
+; Run: lint-imports (or `python -m importlinter.cli`).
+
+[importlinter]
+root_packages =
+    src
+
+[importlinter:contract:module-independence]
+name = Modules are independent (schema-per-module, no cross-module domain/db imports)
+type = independence
+modules =
+    src.catalog
+    src.inventory
+    src.orders
+    src.payments
+    src.identity
+    src.cart
+
+[importlinter:contract:catalog-layers]
+name = catalog: api -> application -> domain (ports/adapters at the edges only)
+type = layers
+layers =
+    api
+    application
+    domain
+containers =
+    src.catalog
+
+[importlinter:contract:catalog-domain-forbidden]
+name = catalog.domain never imports adapters (wiring happens in src/shared/container.py)
+type = forbidden
+source_modules =
+    src.catalog.domain
+forbidden_modules =
+    src.catalog.adapters
+
+[importlinter:contract:inventory-layers]
+name = inventory: api -> application -> domain (ports/adapters at the edges only)
+type = layers
+layers =
+    api
+    application
+    domain
+containers =
+    src.inventory
+
+[importlinter:contract:inventory-domain-forbidden]
+name = inventory.domain never imports adapters (wiring happens in src/shared/container.py)
+type = forbidden
+source_modules =
+    src.inventory.domain
+forbidden_modules =
+    src.inventory.adapters
+
+[importlinter:contract:orders-layers]
+name = orders: api -> application -> domain (ports/adapters at the edges only)
+type = layers
+layers =
+    api
+    application
+    domain
+containers =
+    src.orders
+
+[importlinter:contract:orders-domain-forbidden]
+name = orders.domain never imports adapters (wiring happens in src/shared/container.py)
+type = forbidden
+source_modules =
+    src.orders.domain
+forbidden_modules =
+    src.orders.adapters
+
+[importlinter:contract:payments-layers]
+name = payments: api -> application -> domain (ports/adapters at the edges only)
+type = layers
+layers =
+    api
+    application
+    domain
+containers =
+    src.payments
+
+[importlinter:contract:payments-domain-forbidden]
+name = payments.domain never imports adapters (wiring happens in src/shared/container.py)
+type = forbidden
+source_modules =
+    src.payments.domain
+forbidden_modules =
+    src.payments.adapters
+
+[importlinter:contract:identity-layers]
+name = identity: api -> application -> domain (ports/adapters at the edges only)
+type = layers
+layers =
+    api
+    application
+    domain
+containers =
+    src.identity
+
+[importlinter:contract:identity-domain-forbidden]
+name = identity.domain never imports adapters (wiring happens in src/shared/container.py)
+type = forbidden
+source_modules =
+    src.identity.domain
+forbidden_modules =
+    src.identity.adapters
+
+[importlinter:contract:cart-layers]
+name = cart: api -> application -> domain (ports/adapters at the edges only)
+type = layers
+layers =
+    api
+    application
+    domain
+containers =
+    src.cart
+
+[importlinter:contract:cart-domain-forbidden]
+name = cart.domain never imports adapters (wiring happens in src/shared/container.py)
+type = forbidden
+source_modules =
+    src.cart.domain
+forbidden_modules =
+    src.cart.adapters
+

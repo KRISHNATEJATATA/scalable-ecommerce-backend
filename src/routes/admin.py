@@ -1,1 +1,0 @@
-# admin endpoint lives here

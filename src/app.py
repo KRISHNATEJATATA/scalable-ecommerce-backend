@@ -12,12 +12,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
-from src.clients import postgres_client, valkey_client
-from src.config.logging import setup_logging
-from src.config.setting import AppSettings, get_settings
-from src.errors.exception_handlers import register_exception_handlers
-from src.middleware.security import RequestIDMiddleware, SecurityHeadersMiddleware
-from src.routes import health, metrics
+from src.shared.api import health, metrics
+from src.shared.clients import postgres_client, valkey_client
+from src.shared.config.logging import setup_logging
+from src.shared.config.setting import AppSettings, get_settings
+from src.shared.errors.exception_handlers import register_exception_handlers
+from src.shared.middleware.security import RequestIDMiddleware, SecurityHeadersMiddleware
 
 
 @asynccontextmanager

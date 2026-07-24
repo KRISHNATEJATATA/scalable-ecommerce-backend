@@ -5,25 +5,29 @@ import importlib
 import pytest
 from pydantic import ValidationError
 
-from src.config.setting import AppSettings
+from src.shared.config.setting import AppSettings
+
+_MODULES = ["catalog", "inventory", "orders", "payments", "identity", "cart"]
+_LAYERS = ["api", "application", "domain", "ports", "adapters"]
+_DB_MODULES = ["catalog", "inventory", "orders", "payments", "identity"]  # cart has no DB schema (Valkey-only)
 
 SRC_MODULES = [
     "src",
-    "src.admin",
-    "src.clients",
-    "src.clients.valkey_client",
-    "src.clients.s3_client",
-    "src.config",
-    "src.config.setting",
-    "src.errors",
-    "src.middleware",
-    "src.middleware.security",
-    "src.models",
-    "src.models.base",
-    "src.repositories",
-    "src.routes",
-    "src.services",
-    "src.container",
+    "src.shared",
+    "src.shared.clients",
+    "src.shared.clients.valkey_client",
+    "src.shared.clients.s3_client",
+    "src.shared.config",
+    "src.shared.config.setting",
+    "src.shared.errors",
+    "src.shared.middleware",
+    "src.shared.middleware.security",
+    "src.shared.db",
+    "src.shared.db.mixins",
+    "src.shared.container",
+    *[f"src.{m}.{layer}" for m in _MODULES for layer in _LAYERS],
+    *[f"src.{m}.adapters.db.models" for m in _DB_MODULES],
+    "src.cart.adapters.valkey",
 ]
 
 
@@ -34,7 +38,7 @@ def test_settings_fail_fast_when_database_url_missing(monkeypatch):
 
 
 def test_settings_load_when_database_url_present(monkeypatch):
-    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@localhost:5432/db")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost:5432/db")
     s = AppSettings(_env_file=None)
     assert s.jwt_algorithm == "RS256"
     assert s.keycloak_realm == "ecommerce"

@@ -7,7 +7,7 @@ so ``/v1/ready`` sees no wired pools and must report 503.
 import httpx
 
 from src.app import create_app
-from src.config.setting import AppSettings
+from src.shared.config.setting import AppSettings
 
 SETTINGS = AppSettings(
     _env_file=None,
