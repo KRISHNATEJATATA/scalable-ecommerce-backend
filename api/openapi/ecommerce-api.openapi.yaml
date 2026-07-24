@@ -13,7 +13,66 @@ servers:
 tags:
   - name: health
     description: Liveness and readiness probes
-paths: {}
+  - name: metrics
+    description: Prometheus metrics exposition
+paths:
+  /v1/health:
+    get:
+      tags: [health]
+      operationId: getHealth
+      summary: Liveness probe
+      description: Returns 200 while the process is alive. Performs no dependency checks.
+      responses:
+        "200":
+          description: Process is alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                required: [status]
+  /v1/ready:
+    get:
+      tags: [health]
+      operationId: getReady
+      summary: Readiness probe
+      description: Pings Postgres and Valkey; 200 when both are reachable, 503 otherwise.
+      responses:
+        "200":
+          description: All critical dependencies are reachable.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  checks:
+                    type: object
+                    additionalProperties:
+                      type: boolean
+                required: [status, checks]
+        "503":
+          description: One or more critical dependencies are unreachable.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /metrics:
+    get:
+      tags: [metrics]
+      operationId: getMetrics
+      summary: Prometheus metrics
+      description: Prometheus text exposition of the default registry.
+      responses:
+        "200":
+          description: Metrics in Prometheus text exposition format.
+          content:
+            text/plain:
+              schema:
+                type: string
 components:
   schemas:
     Problem:

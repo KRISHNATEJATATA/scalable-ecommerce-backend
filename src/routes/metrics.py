@@ -1,3 +1,0 @@
-"""
-Metrics endpoint - Prometheus metrics.
-"""

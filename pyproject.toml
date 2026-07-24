@@ -23,8 +23,7 @@ dependencies = [
     "pydantic",
     "pydantic-settings",
     "pyjwt",
-    "pwdlib[argon2]",
-    "authlib",
+    "python-keycloak",
     "valkey",
     "aioboto3",
     "pillow",
@@ -43,6 +42,7 @@ dev = [
     "testcontainers[postgres]",
     "moto",
     "ruff",
+    "import-linter",
 ]
 
 [tool.setuptools.packages.find]
