@@ -57,6 +57,16 @@ class Page[T]:
     next_cursor: str | None
 
 
+class PageResponse[T](BaseModel):
+    """Wire envelope for a keyset page. Services build it from the internal
+    :class:`Page` by mapping each item to its response schema and passing
+    ``next_cursor`` through unchanged.
+    """
+
+    items: list[T]
+    next_cursor: str | None = None
+
+
 def encode_cursor(sort_value: Any, id_value: Any) -> str:
     """Opaque, unsigned base64url JSON of the last row's ``(sort_value, id)`` keyset tuple."""
     raw = json.dumps([str(sort_value), str(id_value)]).encode()

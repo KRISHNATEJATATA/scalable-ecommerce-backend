@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 if TYPE_CHECKING:
     from src.shared.db.pagination import Page, PageParams
 
-# ponytail: return type is the adapter's ORM Order row (with items eager-loaded),
+# return type is the adapter's ORM Order row (with items eager-loaded),
 # typed as Any because ports must not import adapters (ports <- adapters); the
 # ``status`` filter is similarly untyped here. Upgrade to a domain schema type
 # once orders gets a real domain layer.

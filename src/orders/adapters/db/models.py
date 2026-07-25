@@ -1,6 +1,5 @@
 """SQLAlchemy models for the ``orders`` schema."""
 
-import enum
 import uuid
 from decimal import Decimal
 
@@ -8,20 +7,19 @@ from sqlalchemy import Enum, ForeignKey, Index, Integer, Numeric, String, Unique
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+# OrderStatus is owned by the domain (innermost layer); imported inward here for
+# the Enum column. Re-exported so existing `from ...models import OrderStatus`
+# callers (e.g. the repository) keep working.
+from src.orders.domain.order import OrderStatus
 from src.shared.db.mixins import OutboxMixin, TimestampMixin, outbox_unpublished_index
 
 SCHEMA = "orders"
 
+__all__ = ["SCHEMA", "Base", "Order", "OrderItem", "OrderStatus", "Outbox", "SagaLog"]
+
 
 class Base(DeclarativeBase):
     pass
-
-
-class OrderStatus(enum.StrEnum):
-    PENDING = "pending"
-    PAID = "paid"
-    SHIPPED = "shipped"
-    CANCELLED = "cancelled"
 
 
 class Order(Base, TimestampMixin):

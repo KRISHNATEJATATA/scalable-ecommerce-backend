@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 if TYPE_CHECKING:
     from src.shared.db.pagination import Page, PageParams
 
-# ponytail: return type is the adapter's ORM Payment row, typed as Any because ports
+# return type is the adapter's ORM Payment row, typed as Any because ports
 # must not import adapters (ports <- adapters). Upgrade to a domain schema type once
 # payments gets a real domain layer.
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-# ponytail: return type is the adapter's ORM Inventory row, typed as Any because
+# return type is the adapter's ORM Inventory row, typed as Any because
 # ports must not import adapters (ports <- adapters). Upgrade to a domain schema
 # type once inventory gets a real domain layer.
 
