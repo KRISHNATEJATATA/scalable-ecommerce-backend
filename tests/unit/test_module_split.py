@@ -5,7 +5,7 @@ in CI; see ``tests/unit/conftest.py`` if one is added later). Skips cleanly
 when no Postgres is reachable, so this file doesn't fail collection in
 environments without a DB.
 
-ponytail: the skip-if-unreachable fixture is a stand-in until ticket 17
+the skip-if-unreachable fixture is a stand-in until ticket 17
 (crown-jewel-risk-tests) wires a shared Testcontainers-Postgres fixture for
 the whole suite (see .scratch/distributed-ecommerce-backend/issues/17-crown-
 jewel-risk-tests.md) — that ticket is the one that makes this DB coverage
