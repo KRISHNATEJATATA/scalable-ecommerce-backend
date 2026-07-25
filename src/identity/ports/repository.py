@@ -10,7 +10,7 @@ from __future__ import annotations
 import uuid
 from typing import Any, Protocol
 
-# ponytail: return type is the adapter's ORM User row, typed as Any because ports
+# return type is the adapter's ORM User row, typed as Any because ports
 # must not import adapters (ports <- adapters). Upgrade to a domain schema type once
 # identity gets a real domain layer.
 

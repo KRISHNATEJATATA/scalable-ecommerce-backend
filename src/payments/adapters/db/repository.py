@@ -4,7 +4,7 @@ Returns a keyset page of attempts for an order, oldest first (retries share
 ``order_id``; ``idempotency_key`` is the unique guard) — reconciliation
 decides which is authoritative.
 
-ponytail: returns ORM ``Payment`` rows, not domain entities. Upgrade to a
+returns ORM ``Payment`` rows, not domain entities. Upgrade to a
 domain schema once payments gets a real domain layer.
 """
 
