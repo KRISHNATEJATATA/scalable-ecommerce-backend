@@ -24,7 +24,7 @@ import ecs_logging
 # Per-request trace id, set by the request-id middleware; empty until then.
 request_id_ctx: ContextVar[str] = ContextVar("request_id", default="")
 
-# ponytail: minimal boundary redaction. Full key/PII scrubbing hardens in Phase 9.
+# minimal boundary redaction. Full key/PII scrubbing hardens in Phase 9.
 _REDACT_KEYS = ("password", "token", "authorization", "secret", "cookie", "jwt")
 
 

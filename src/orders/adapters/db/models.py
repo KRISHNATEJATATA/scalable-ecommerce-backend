@@ -6,7 +6,7 @@ from decimal import Decimal
 
 from sqlalchemy import Enum, ForeignKey, Index, Integer, Numeric, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from src.shared.db.mixins import OutboxMixin, TimestampMixin, outbox_unpublished_index
 
@@ -53,6 +53,10 @@ class Order(Base, TimestampMixin):
         default=OrderStatus.PENDING,
     )
     total: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+
+    # lazy="raise": accessing items without an explicit selectinload/joinedload
+    # raises instead of firing a lazy N+1 query — the list path must eager-load.
+    items: Mapped[list["OrderItem"]] = relationship("OrderItem", lazy="raise")
 
 
 class OrderItem(Base):
