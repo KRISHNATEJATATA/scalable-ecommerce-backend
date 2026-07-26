@@ -12,7 +12,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
+from src.identity.adapters.keycloak.admin_client import KeycloakIdentityAdmin
+from src.identity.api import routes as identity_routes
 from src.shared.api import health, metrics
+from src.shared.auth.jwks import build_jwks_client
 from src.shared.clients import postgres_client, valkey_client
 from src.shared.config.logging import setup_logging
 from src.shared.config.setting import AppSettings, get_settings
@@ -22,11 +25,15 @@ from src.shared.middleware.security import RequestIDMiddleware, SecurityHeadersM
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """Own the shared connection pools for the app's lifetime."""
+    """Own the shared connection pools + auth clients for the app's lifetime."""
     settings: AppSettings = app.state.settings
     app.state.db_engine = postgres_client.create_engine(settings)
     app.state.db_sessionmaker = postgres_client.create_sessionmaker(app.state.db_engine)
     app.state.valkey = valkey_client.create_client(settings)
+    # Process-wide JWKS client (reuses PyJWT's kid cache) + Keycloak admin adapter
+    # (constructed lazily-connecting: no network at startup).
+    app.state.jwks_client = build_jwks_client(settings)
+    app.state.identity_admin = KeycloakIdentityAdmin(settings)
     try:
         yield
     finally:
@@ -66,6 +73,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     register_exception_handlers(app)
 
     app.include_router(health.router, prefix=settings.api_v1_prefix)
+    app.include_router(identity_routes.router, prefix=settings.api_v1_prefix)
     app.include_router(metrics.router)
 
     return app

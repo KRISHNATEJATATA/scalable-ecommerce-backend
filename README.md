@@ -2,8 +2,10 @@
 
 Async, **API-first FastAPI** e-commerce backend (JSON only, no server-rendered
 HTML) targeting **AWS ECS Fargate**. Topology is **monolith-with-replicas**: one
-service, one shared auth dependency across routers. Stateless **RS256 JWT** keeps
-a future auth-service split free.
+service, one shared auth dependency across routers. The app is a pure **OIDC
+resource server against Keycloak** — it only validates Keycloak-issued RS256
+access tokens (JWKS), never handles credentials/refresh, which keeps a future
+auth-service split free.
 
 ## Architecture (summary)
 
@@ -20,7 +22,8 @@ Route → Schema → Service → Repository → Model
   Pydantic schemas, never ORM models**.
 - Errors are **RFC 9457 Problem Details** (one flat shape).
 - **Valkey** holds ephemeral state only (rate-limit counters, idempotency keys,
-  JWT `jti` denylist).
+  event-dedup keys, JWKS cache, cache-aside, cart state). Revocation is a short
+  access-token TTL owned by Keycloak, not a `jti` denylist.
 
 See [`docs/architecture.md`](docs/architecture.md) for the full picture.
 
@@ -31,7 +34,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the full picture.
 | Runtime | Python 3.13, FastAPI, Uvicorn/Gunicorn |
 | Data | PostgreSQL (async SQLAlchemy 2.x + `asyncpg`); Alembic (sync) |
 | Ephemeral state | Valkey (redis-py-compatible) |
-| Auth | RS256 JWT (PyJWT) + pwdlib[argon2]; OAuth via Authlib |
+| Auth | OIDC resource server against Keycloak — validate-only RS256 (PyJWT `PyJWKClient`); `python-keycloak` for the Admin API |
 | Config/validation | Pydantic v2 + pydantic-settings |
 | Storage | S3 via `aioboto3` (MinIO locally) |
 | Async worker | SQS (ElasticMQ locally) |

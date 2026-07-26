@@ -77,14 +77,25 @@ PKCE against Keycloak; the API only validates the tokens Keycloak issues.
   cached **JWKS** (`iss`/`aud`/`exp`), algorithm hardcoded (`alg:none` guard),
   public key only. Bearer token in the `Authorization` header → **no auth cookie,
   no CSRF surface**.
-- **Roles** (`consumer` / `merchant` / `admin`) are **Keycloak realm roles** in
-  the token (`realm_access.roles`) → RBAC is a cheap `Depends(require_role(...))`,
-  not a DB hit. Keycloak is the single source of truth for roles.
-- **Local `users` row keyed by the OIDC `sub`**, JIT-provisioned on first
+- **Two-tier principal**: `get_current_user` verifies the
+  token and returns a claims-only `Principal(sub, email, roles)` — **no DB hit**;
+  `get_current_db_user` does JIT + `is_active` and is wired only into routes needing
+  the local `users.id`. A process-wide `PyJWKClient` (built in the lifespan) caches
+  keys; its blocking fetch runs via `run_in_threadpool`. JWKS unreachable → **503**;
+  bad/expired/tampered token → **401** (`WWW-Authenticate: Bearer`).
+- **Roles** (`consumer` / `merchant` / `admin`, plus a `service` machine role) are
+  **Keycloak realm roles** in the token (`realm_access.roles`) → RBAC is a cheap
+  `Depends(require_role(...))` claim check on `Principal`, not a DB hit. Keycloak is
+  the single source of truth for roles.
+- **Local `users` row keyed by the OIDC `sub`**, JIT-provisioned race-safely
+  (`INSERT ... ON CONFLICT (oidc_sub) DO UPDATE ... RETURNING`) on first
   authenticated request, anchors FK ownership (`products.merchant_id`,
-  `orders.user_id`) + an `is_active` mirror — not the identity/role source.
-- **Row-level ownership**: a `merchant` may mutate/soft-remove only items where
-  `merchant_id == user.id`; `admin` acts on any item; `consumer` reads + orders.
+  `orders.user_id`) + an `is_active` mirror — not the identity/role source. A
+  disabled local row → **403**.
+- **Row-level ownership** is enforced in the **service layer**: a `merchant` may
+  mutate/soft-remove only items where `merchant_id == user.id`; the `admin` role
+  **bypasses ownership** (but does not auto-satisfy an explicit `require_role`
+  gate); `consumer` reads + orders.
 - **Admin identity management** via Keycloak's **Admin API** (`python-keycloak`):
   create/disable users, grant/revoke the `merchant` role. The app stores no
   passwords.

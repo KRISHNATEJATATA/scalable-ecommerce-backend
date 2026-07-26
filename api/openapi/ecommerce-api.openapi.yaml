@@ -15,7 +15,143 @@ tags:
     description: Liveness and readiness probes
   - name: metrics
     description: Prometheus metrics exposition
+  - name: identity
+    description: OIDC resource-server identity — the local user mirror and Keycloak admin management
 paths:
+  /v1/me:
+    get:
+      tags: [identity]
+      operationId: getMe
+      summary: Get the authenticated caller
+      description: >-
+        Returns the caller's JIT-provisioned local `users` mirror. First
+        authenticated request provisions the row; subsequent calls reuse it.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: The caller's local user mirror.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "401":
+          description: Missing, invalid, expired, or malformed bearer token.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: The local account is disabled.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /v1/admin/users:
+    post:
+      tags: [identity]
+      operationId: createUser
+      summary: Create a Keycloak user (admin only)
+      description: >-
+        Provisions a brand-new Keycloak account. Keycloak defaults new users to
+        the `consumer` realm role — the app never accepts a role from input.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateUserRequest"
+      responses:
+        "201":
+          description: The new account's Keycloak `sub`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateUserResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /v1/admin/users/{sub}/roles/merchant:
+    post:
+      tags: [identity]
+      operationId: grantMerchantRole
+      summary: Grant the merchant realm role (admin only)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/UserSub"
+      responses:
+        "204":
+          description: Role granted.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    delete:
+      tags: [identity]
+      operationId: revokeMerchantRole
+      summary: Revoke the merchant realm role (admin only)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/UserSub"
+      responses:
+        "204":
+          description: Role revoked.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /v1/admin/users/{sub}/disable:
+    post:
+      tags: [identity]
+      operationId: disableUser
+      summary: Disable a user (admin only)
+      description: >-
+        Disables the account in Keycloak and mirrors `is_active=false` locally
+        (provisioning the local row first if the user never authenticated).
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/UserSub"
+      responses:
+        "204":
+          description: Account disabled.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /v1/internal/whoami:
+    get:
+      tags: [identity]
+      operationId: internalWhoami
+      summary: Machine-to-machine identity check (service role only)
+      description: >-
+        Exercised by relay/worker clients authenticating with a Keycloak
+        `service` machine-account token; confirms the role gate resolves
+        end-to-end with no DB hit.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: The caller's `sub` and role.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sub:
+                    type: string
+                  role:
+                    type: string
+                required: [sub, role]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
   /v1/health:
     get:
       tags: [health]
@@ -74,7 +210,72 @@ paths:
               schema:
                 type: string
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Keycloak-issued RS256 access token, validated against the realm's JWKS.
+  parameters:
+    UserSub:
+      name: sub
+      in: path
+      required: true
+      description: The target user's Keycloak OIDC `sub`.
+      schema:
+        type: string
+  responses:
+    Unauthorized:
+      description: Missing, invalid, expired, or malformed bearer token.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Forbidden:
+      description: Authenticated but not permitted (missing role / not owner).
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
   schemas:
+    User:
+      description: The local `identity.users` mirror (JIT-provisioned, no `role` field).
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        oidc_sub:
+          type: string
+        email:
+          type: string
+        is_active:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required: [id, oidc_sub, email, is_active, created_at, updated_at]
+    CreateUserRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          minLength: 3
+          maxLength: 320
+        temporary_password:
+          type: string
+          minLength: 8
+          maxLength: 128
+      required: [email, temporary_password]
+    CreateUserResponse:
+      type: object
+      properties:
+        sub:
+          type: string
+      required: [sub]
     Problem:
       description: RFC 9457 Problem Details (the one flat error shape).
       type: object

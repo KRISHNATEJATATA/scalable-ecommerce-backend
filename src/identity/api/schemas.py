@@ -10,7 +10,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class UserResponse(BaseModel):
@@ -24,3 +24,20 @@ class UserResponse(BaseModel):
     is_active: bool
     created_at: datetime
     updated_at: datetime
+
+
+class CreateUserRequest(BaseModel):
+    """Admin request to provision a brand-new Keycloak account.
+
+    No ``role`` field: Keycloak defaults new users to ``consumer`` — the app
+    never accepts a role from request input (privilege-escalation guard).
+    """
+
+    email: str = Field(min_length=3, max_length=320)
+    temporary_password: str = Field(min_length=8, max_length=128)
+
+
+class CreateUserResponse(BaseModel):
+    """The Keycloak ``sub`` of the newly created account."""
+
+    sub: str

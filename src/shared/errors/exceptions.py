@@ -21,3 +21,27 @@ class InvalidQueryParamError(ValueError):
         super().__init__(f"Unknown {kind} field: {value!r}")
         self.kind = kind
         self.value = value
+
+
+class AuthenticationError(Exception):
+    """The caller could not be authenticated (missing/invalid/expired token) → 401."""
+
+    def __init__(self, detail: str = "authentication required") -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+class AuthorizationError(Exception):
+    """The caller is authenticated but not permitted (role/ownership) → 403."""
+
+    def __init__(self, detail: str = "not permitted") -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+class DependencyUnavailableError(Exception):
+    """An upstream dependency (e.g. Keycloak JWKS) is unreachable → 503, our failure."""
+
+    def __init__(self, detail: str = "a required dependency is unavailable") -> None:
+        super().__init__(detail)
+        self.detail = detail

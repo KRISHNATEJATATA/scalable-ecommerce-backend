@@ -13,14 +13,16 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import Depends
+from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.catalog.adapters.db.repository import CatalogRepository
 from src.catalog.application.service import CatalogService
 from src.catalog.ports.repository import CatalogRepositoryPort
 from src.identity.adapters.db.repository import IdentityRepository
-from src.identity.application.service import IdentityService
+from src.identity.api.schemas import UserResponse
+from src.identity.application.service import IdentityAdminService, IdentityService
+from src.identity.ports.admin import IdentityAdminPort
 from src.identity.ports.repository import IdentityRepositoryPort
 from src.inventory.adapters.db.repository import InventoryRepository
 from src.inventory.application.service import InventoryService
@@ -31,7 +33,9 @@ from src.orders.ports.repository import OrdersRepositoryPort
 from src.payments.adapters.db.repository import PaymentsRepository
 from src.payments.application.service import PaymentsService
 from src.payments.ports.repository import PaymentsRepositoryPort
+from src.shared.auth.dependencies import PrincipalDep
 from src.shared.db.session import get_session
+from src.shared.errors.exceptions import AuthenticationError, AuthorizationError
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
@@ -80,6 +84,41 @@ def get_identity_repository(session: SessionDep) -> IdentityRepositoryPort:
 def get_identity_service(repo: Annotated[IdentityRepositoryPort, Depends(get_identity_repository)]) -> IdentityService:
     """Provide the identity service over its repository port."""
     return IdentityService(repo)
+
+
+def get_identity_admin(request: Request) -> IdentityAdminPort:
+    """Provide the shared Keycloak admin adapter (built once in the app lifespan)."""
+    return request.app.state.identity_admin
+
+
+def get_identity_admin_service(
+    repo: Annotated[IdentityRepositoryPort, Depends(get_identity_repository)],
+    admin: Annotated[IdentityAdminPort, Depends(get_identity_admin)],
+) -> IdentityAdminService:
+    """Provide the admin identity service (Keycloak role/enablement management)."""
+    return IdentityAdminService(repo, admin)
+
+
+async def get_current_db_user(
+    principal: PrincipalDep,
+    service: Annotated[IdentityService, Depends(get_identity_service)],
+) -> UserResponse:
+    """Resolve the caller's local ``users`` row, JIT-provisioning on first sight.
+
+    Depends on :func:`get_current_user` (token already verified) and is wired
+    only into routes that need the local ``users.id`` (writes/ownership). A
+    disabled local row is rejected with 403 — short token TTL + this flip is the
+    revocation story (no Valkey denylist).
+    """
+    if principal.email is None:
+        raise AuthenticationError("token is missing the required 'email' claim")
+    user = await service.get_or_create_by_sub(principal.sub, principal.email)
+    if not user.is_active:
+        raise AuthorizationError("account disabled")
+    return user
+
+
+CurrentUserDep = Annotated[UserResponse, Depends(get_current_db_user)]
 
 
 # --- payments -------------------------------------------------------------

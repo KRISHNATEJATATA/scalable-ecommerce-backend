@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import func
 
 from src.identity.adapters.db.models import User
 
@@ -29,3 +31,28 @@ class IdentityRepository:
     async def get_by_id(self, user_id: uuid.UUID) -> User | None:
         stmt = select(User).where(User.id == user_id)
         return (await self._session.execute(stmt)).scalar_one_or_none()
+
+    async def get_or_create(self, oidc_sub: str, email: str) -> User:
+        """JIT-provision the local mirror, idempotent & race-safe.
+
+        A single ``INSERT ... ON CONFLICT (oidc_sub) DO UPDATE`` survives the
+        concurrent-first-request race on the ``UNIQUE(oidc_sub)`` constraint:
+        the loser's insert conflicts and the ``DO UPDATE`` returns the existing
+        row instead of raising. Commits in the request session.
+        """
+        stmt = (
+            pg_insert(User)
+            .values(oidc_sub=oidc_sub, email=email)
+            .on_conflict_do_update(index_elements=["oidc_sub"], set_={"updated_at": func.now()})
+            .returning(User)
+        )
+        row = (await self._session.execute(stmt)).scalar_one()
+        await self._session.commit()
+        return row
+
+    async def set_active(self, oidc_sub: str, is_active: bool) -> User | None:
+        """Flip the local ``is_active`` mirror; returns the row (``None`` if absent)."""
+        stmt = update(User).where(User.oidc_sub == oidc_sub).values(is_active=is_active).returning(User)
+        row = (await self._session.execute(stmt)).scalar_one_or_none()
+        await self._session.commit()
+        return row
