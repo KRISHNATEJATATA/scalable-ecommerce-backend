@@ -17,7 +17,152 @@ tags:
     description: Prometheus metrics exposition
   - name: identity
     description: OIDC resource-server identity — the local user mirror and Keycloak admin management
+  - name: catalog
+    description: Product catalog — merchant product CRUD and the shopper listing
 paths:
+  /v1/products:
+    get:
+      tags: [catalog]
+      operationId: listProducts
+      summary: List products (keyset-paginated, filterable)
+      description: >-
+        Keyset-paginated listing of live (non-deleted) products. `sort` is a
+        whitelisted field (`created_at`/`price`/`name`) with an optional leading
+        `-` for descending; `category`/`merchant_id` filter the result.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: sort
+          in: query
+          schema: { type: string, default: "-created_at" }
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: category
+          in: query
+          schema: { type: string }
+        - name: merchant_id
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: One keyset page of products.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProductPage"
+        "400":
+          description: Unknown sort/filter field or an undecodable cursor.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [catalog]
+      operationId: createProduct
+      summary: Create a product (merchant only)
+      description: >-
+        Creates a product owned by the authenticated merchant. `merchant_id` is
+        never accepted from input — it is bound from the caller. Emits
+        `ProductCreated` via the transactional outbox.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProductCreate"
+      responses:
+        "201":
+          description: The created product.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Product"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          description: Invalid request body (e.g. non-positive price).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /v1/products/{product_id}:
+    parameters:
+      - $ref: "#/components/parameters/ProductId"
+    get:
+      tags: [catalog]
+      operationId: getProduct
+      summary: Get one product
+      description: Returns one live (non-deleted) product by id, or 404.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: The product.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Product"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [catalog]
+      operationId: updateProduct
+      summary: Update a product (owner merchant only)
+      description: >-
+        Partial update of an owned product. A merchant mutating another
+        merchant's product → 403 (admin bypasses ownership). Emits
+        `ProductUpdated` via the outbox.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProductUpdate"
+      responses:
+        "200":
+          description: The updated product.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Product"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [catalog]
+      operationId: deleteProduct
+      summary: Soft-delete a product (owner merchant only)
+      description: >-
+        Soft-deletes an owned product (cross-merchant → 403, admin bypasses).
+        Emits `ProductDeleted` via the outbox.
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: Product soft-deleted.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
   /v1/me:
     get:
       tags: [identity]
@@ -224,6 +369,14 @@ components:
       description: The target user's Keycloak OIDC `sub`.
       schema:
         type: string
+    ProductId:
+      name: product_id
+      in: path
+      required: true
+      description: The product's UUID.
+      schema:
+        type: string
+        format: uuid
   responses:
     Unauthorized:
       description: Missing, invalid, expired, or malformed bearer token.
@@ -233,6 +386,12 @@ components:
             $ref: "#/components/schemas/Problem"
     Forbidden:
       description: Authenticated but not permitted (missing role / not owner).
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    NotFound:
+      description: The requested resource does not exist (or was soft-deleted).
       content:
         application/problem+json:
           schema:
@@ -276,6 +435,87 @@ components:
         sub:
           type: string
       required: [sub]
+    Product:
+      description: A merchant's product listing.
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        merchant_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        description:
+          type: [string, "null"]
+        category:
+          type: [string, "null"]
+        price:
+          type: string
+          description: Decimal (money) serialized as a string.
+        image_key:
+          type: [string, "null"]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required: [id, merchant_id, name, description, category, price, image_key, created_at, updated_at]
+    ProductCreate:
+      description: Merchant create payload. `merchant_id` is bound from the caller, never from input.
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        description:
+          type: [string, "null"]
+        category:
+          type: [string, "null"]
+          maxLength: 255
+        price:
+          type: string
+          description: Positive decimal money value (> 0).
+        image_key:
+          type: [string, "null"]
+          maxLength: 1024
+      required: [name, price]
+    ProductUpdate:
+      description: Partial merchant update — every field optional; unset fields are untouched.
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 255
+        description:
+          type: [string, "null"]
+        category:
+          type: [string, "null"]
+          maxLength: 255
+        price:
+          type: [string, "null"]
+          description: Positive decimal money value (> 0).
+        image_key:
+          type: [string, "null"]
+          maxLength: 1024
+    ProductPage:
+      description: One keyset page of products.
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Product"
+        next_cursor:
+          type: [string, "null"]
+          description: Opaque cursor for the next page; `null` on the last page.
+      required: [items]
     Problem:
       description: RFC 9457 Problem Details (the one flat error shape).
       type: object

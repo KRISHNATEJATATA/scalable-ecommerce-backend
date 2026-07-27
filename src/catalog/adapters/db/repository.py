@@ -15,14 +15,14 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from sqlalchemy import String, bindparam, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import text
 
-from src.catalog.adapters.db.models import SCHEMA, Product
+from src.catalog.adapters.db.models import SCHEMA, Outbox, Product
 from src.shared.db.pagination import Page, PageParams, build_page, check_filters, decode_cursor
 from src.shared.errors.exceptions import InvalidQueryParamError
 
@@ -100,3 +100,58 @@ class CatalogRepository:
         stmt = select(Product).where(Product.id == product_id, Product.deleted_at.is_(None))
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
+
+    # --- writes: state change + outbox row committed in ONE transaction -------
+
+    async def create_product(
+        self,
+        *,
+        product_id: uuid.UUID,
+        merchant_id: uuid.UUID,
+        name: str,
+        description: str | None,
+        category: str | None,
+        price: Decimal,
+        image_key: str | None,
+        outbox: tuple[str, str],
+    ) -> Product:
+        """Insert a product and its ``ProductCreated`` outbox row atomically."""
+        product = Product(
+            id=product_id,
+            merchant_id=merchant_id,
+            name=name,
+            description=description,
+            category=category,
+            price=price,
+            image_key=image_key,
+        )
+        self._session.add(product)
+        self._session.add(self._outbox_row(outbox))
+        await self._session.commit()
+        await self._session.refresh(product)
+        return product
+
+    async def update_product(self, product: Product, changes: dict[str, object], outbox: tuple[str, str]) -> Product:
+        """Apply ``changes`` to an already-loaded product + emit its outbox row.
+
+        The product is mutated through the ORM so ``version_id`` auto-bumps
+        (optimistic lock): a concurrent edit that already advanced the version
+        makes this commit raise ``StaleDataError`` instead of silently clobbering.
+        """
+        for field, value in changes.items():
+            setattr(product, field, value)
+        self._session.add(self._outbox_row(outbox))
+        await self._session.commit()
+        await self._session.refresh(product)
+        return product
+
+    async def soft_delete_product(self, product: Product, outbox: tuple[str, str]) -> None:
+        """Soft-delete (``deleted_at``) + emit the ``ProductDeleted`` outbox row."""
+        product.deleted_at = datetime.now(UTC)
+        self._session.add(self._outbox_row(outbox))
+        await self._session.commit()
+
+    @staticmethod
+    def _outbox_row(outbox: tuple[str, str]) -> Outbox:
+        event_type, payload = outbox
+        return Outbox(event_type=event_type, payload=payload)

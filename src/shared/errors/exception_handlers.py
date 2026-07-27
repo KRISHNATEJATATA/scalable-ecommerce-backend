@@ -17,6 +17,8 @@ from src.shared.errors.exceptions import (
     AuthenticationError,
     AuthorizationError,
     DependencyUnavailableError,
+    InvalidCursorError,
+    InvalidQueryParamError,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,12 @@ async def _authentication_error_handler(_: Request, exc: AuthenticationError) ->
 
 async def _authorization_error_handler(_: Request, exc: AuthorizationError) -> JSONResponse:
     return _problem_response(403, title="Forbidden", detail=exc.detail)
+
+
+async def _bad_request_handler(_: Request, exc: InvalidQueryParamError | InvalidCursorError) -> JSONResponse:
+    # Client-supplied sort/filter/cursor that fails the repo whitelist/codec is a
+    # 400 (bad input), never a 500 — these surface via the list routes' query params.
+    return _problem_response(400, title="Bad Request", detail=str(exc))
 
 
 async def _dependency_unavailable_handler(_: Request, exc: DependencyUnavailableError) -> JSONResponse:
@@ -69,6 +77,8 @@ def register_exception_handlers(app: FastAPI) -> None:
     """Wire the RFC 9457 handlers onto the app (called from the app factory)."""
     app.add_exception_handler(AuthenticationError, _authentication_error_handler)
     app.add_exception_handler(AuthorizationError, _authorization_error_handler)
+    app.add_exception_handler(InvalidQueryParamError, _bad_request_handler)
+    app.add_exception_handler(InvalidCursorError, _bad_request_handler)
     app.add_exception_handler(DependencyUnavailableError, _dependency_unavailable_handler)
     app.add_exception_handler(StarletteHTTPException, _http_exception_handler)
     app.add_exception_handler(RequestValidationError, _validation_exception_handler)

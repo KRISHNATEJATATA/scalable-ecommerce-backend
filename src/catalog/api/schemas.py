@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ProductResponse(BaseModel):
@@ -27,3 +27,29 @@ class ProductResponse(BaseModel):
     image_key: str | None
     created_at: datetime
     updated_at: datetime
+
+
+class ProductCreate(BaseModel):
+    """Merchant create payload. ``merchant_id`` is never accepted from input —
+    it is bound from the authenticated caller (ownership can't be spoofed).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=255)
+    description: str | None = None
+    category: str | None = Field(default=None, max_length=255)
+    price: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    image_key: str | None = Field(default=None, max_length=1024)
+
+
+class ProductUpdate(BaseModel):
+    """Partial merchant update — every field optional; unset fields are untouched."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = None
+    category: str | None = Field(default=None, max_length=255)
+    price: Decimal | None = Field(default=None, gt=0, max_digits=12, decimal_places=2)
+    image_key: str | None = Field(default=None, max_length=1024)

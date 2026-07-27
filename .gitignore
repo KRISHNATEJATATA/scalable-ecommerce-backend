@@ -232,3 +232,4 @@ docs/glossary.md
 .github/shared
 .github/skills
 **/CONTEXT.md
+node_modules/
