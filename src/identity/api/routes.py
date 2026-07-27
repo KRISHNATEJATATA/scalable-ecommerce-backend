@@ -50,6 +50,7 @@ async def create_user(
 @router.post(
     "/admin/users/{sub}/roles/merchant",
     status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
     dependencies=[_require_admin],
 )
 async def grant_merchant(sub: str, service: AdminServiceDep, _admin_user: CurrentUserDep) -> None:
@@ -60,6 +61,7 @@ async def grant_merchant(sub: str, service: AdminServiceDep, _admin_user: Curren
 @router.delete(
     "/admin/users/{sub}/roles/merchant",
     status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
     dependencies=[_require_admin],
 )
 async def revoke_merchant(sub: str, service: AdminServiceDep, _admin_user: CurrentUserDep) -> None:
@@ -70,6 +72,7 @@ async def revoke_merchant(sub: str, service: AdminServiceDep, _admin_user: Curre
 @router.post(
     "/admin/users/{sub}/disable",
     status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
     dependencies=[_require_admin],
 )
 async def disable_user(sub: str, service: AdminServiceDep, _admin_user: CurrentUserDep) -> None:
