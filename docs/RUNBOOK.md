@@ -52,6 +52,29 @@ not cleanly reversible.
 4. Run the Alembic one-off task to `upgrade head` (usually a no-op).
 5. Cut DNS/ALB over; verify `/v1/health` and `/v1/ready`.
 
+### 4. DLQ replay (poison messages)
+
+A consumer queue routes a message to its per-subscription DLQ after `maxReceiveCount`
+receives. Consumers are idempotent, so replay is safe once the underlying fault is fixed.
+
+```bash
+# Move messages from the DLQ back to the source queue (SQS-native redrive)
+aws sqs start-message-move-task \
+  --source-arn arn:aws:sqs:<region>:<acct>:<consumer>-dlq \
+  --destination-arn arn:aws:sqs:<region>:<acct>:<consumer>
+```
+
+Watch the CloudWatch alarm on the DLQ's `ApproximateNumberOfMessagesVisible` return to 0.
+If a message is genuinely un-processable, inspect the payload, fix the consumer/data, then
+redrive — never delete blindly.
+
+### 5. Outbox stuck (relay down / lagging)
+
+Symptom: `outbox lag` metric (age of oldest `published_at IS NULL` row) climbing. The relay is
+publish-then-mark, so events are not lost — they ship once the relay recovers. Restart the
+`service`-role relay task; if lag persists, scale relay replicas (safe — `FOR UPDATE SKIP
+LOCKED` prevents double-claim).
+
 ## Post-incident
 
 - Re-enable automated backups on the promoted instance.

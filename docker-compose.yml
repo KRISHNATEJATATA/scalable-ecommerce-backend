@@ -14,6 +14,10 @@ services:
       S3_BUCKET: ecommerce-uploads
       SQS_ENDPOINT_URL: http://elasticmq:9324
       SQS_QUEUE_URL: http://elasticmq:9324/queue/emails
+      BUS_ENDPOINT_URL: http://localstack:4566
+      BUS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
       KEYCLOAK_ISSUER: http://keycloak:8080/realms/ecommerce
       KEYCLOAK_JWKS_URL: http://keycloak:8080/realms/ecommerce/protocol/openid-connect/certs
       CORS_ALLOW_ORIGINS: '["http://localhost:3000"]'
@@ -24,6 +28,23 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # One-shot: run every module's Alembic chain to head once Postgres is ready,
+  # before app/relay start serving. PYTHONPATH=/app so alembic env.py can import `src`.
+  migrate:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ecommerce:ecommerce@postgres:5432/ecommerce
+      PYTHONPATH: /app
+    command:
+      - sh
+      - -c
+      - "for m in identity catalog inventory orders payments; do alembic -c src/$$m/alembic.ini upgrade head; done"
 
   postgres:
     image: postgres:16
@@ -58,7 +79,7 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
-      - "9000:9000"
+      - "9002:9000"
       - "9001:9001"
     volumes:
       - minio-data:/data
@@ -85,6 +106,55 @@ services:
     ports:
       - "9324:9324"
       - "9325:9325"
+
+  # SNS + SQS for the transactional-outbox event bus. ElasticMQ above
+  # is SQS-only; the bus needs SNS fan-out, so it runs on LocalStack.
+  localstack:
+    image: localstack/localstack:3.8
+    environment:
+      SERVICES: sns,sqs
+    ports:
+      - "4566:4566"
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal sqs list-queues || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  # One-shot: create SNS topics (one per event type) + consumer queues/DLQs/subs.
+  bus-setup:
+    build: .
+    depends_on:
+      localstack:
+        condition: service_healthy
+    environment:
+      BUS_ENDPOINT_URL: http://localstack:4566
+      BUS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      DATABASE_URL: postgresql+asyncpg://ecommerce:ecommerce@postgres:5432/ecommerce
+    command: ["python", "-m", "scripts.bus_bootstrap"]
+
+  # The `service`-role outbox relay: polls unpublished outbox rows → SNS.
+  relay:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      bus-setup:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ecommerce:ecommerce@postgres:5432/ecommerce
+      VALKEY_URL: redis://valkey:6379/0
+      BUS_ENDPOINT_URL: http://localstack:4566
+      BUS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    command: ["python", "-m", "src.shared.bus.relay"]
 
   # IdP: imports the ecommerce realm (consumer/merchant/admin roles + clients) on boot.
   keycloak:

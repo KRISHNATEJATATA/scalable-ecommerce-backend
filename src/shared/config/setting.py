@@ -73,6 +73,19 @@ class AppSettings(BaseSettings):
     sqs_queue_url: str | None = None
     sqs_endpoint_url: str | None = None  # ElasticMQ locally
 
+    # --- Event bus: transactional outbox → SNS/SQS ---
+    # Relay publishes outbox rows to per-event-type SNS topics; consumers read
+    # per-subscription SQS queues with DLQs. LocalStack locally; None → real AWS
+    # (ECS task role supplies credentials, no keys in code).
+    bus_endpoint_url: str | None = None
+    bus_region: str = "us-east-1"
+    bus_topic_prefix: str = "ecommerce-"  # SNS topic name = f"{prefix}{EventType}"
+    relay_batch_size: int = 100
+    relay_poll_interval_seconds: float = 1.0
+    consumer_max_messages: int = 10  # SQS receive batch (max 10)
+    consumer_wait_time_seconds: int = 10  # SQS long-poll seconds
+    consumer_dedup_ttl_seconds: int = 86400  # event-dedup TTL (~24h; the DB write is the real guard)
+
 
 @lru_cache
 def get_settings() -> AppSettings:

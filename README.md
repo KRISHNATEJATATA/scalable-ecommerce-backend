@@ -37,6 +37,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the full picture.
 | Auth | OIDC resource server against Keycloak — validate-only RS256 (PyJWT `PyJWKClient`); `python-keycloak` for the Admin API |
 | Config/validation | Pydantic v2 + pydantic-settings |
 | Storage | S3 via `aioboto3` (MinIO locally) |
+| Event bus | Transactional outbox → SNS/SQS relay + idempotent consumers + DLQs (LocalStack locally) |
 | Async worker | SQS (ElasticMQ locally) |
 | Observability | `ecs-logging` + `python-json-logger`, Prometheus `/metrics` |
 | Testing | pytest + pytest-asyncio, `httpx.AsyncClient`, Testcontainers-Postgres |
@@ -48,7 +49,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the full picture.
 ```bash
 cp .env.example .env          # DATABASE_URL is required (app fails fast if unset)
 make install                  # pip install -r requirements.txt && pip install -e ".[dev]"
-make compose-up               # Postgres + Valkey + MinIO + ElasticMQ (Phase 1+)
+make compose-up               # Postgres + Valkey + MinIO + ElasticMQ + LocalStack + relay
 make run                      # uvicorn main:app --reload
 make lint                     # ruff check + ruff format --check
 make test                     # pytest tests/unit/ (coverage reported, not gated)

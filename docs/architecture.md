@@ -40,8 +40,9 @@ flowchart TD
   PG[("PostgreSQL<br/>asyncpg")]
   VK[("Valkey<br/>rate-limit · idempotency")]
   S3[("S3 / MinIO<br/>aioboto3")]
-  SQS[["SQS / ElasticMQ<br/>email worker"]]
+  SQS[["SNS/SQS · ElasticMQ/LocalStack<br/>event bus · DLQs"]]
   KC[("Keycloak (OIDC IdP)<br/>token issuance · JWKS · Admin API")]
+  Relay["Relay (service role)<br/>outbox → SNS · SKIP LOCKED"]
 
   Client --> MW --> Route
   Route --> Schema --> Service
@@ -52,7 +53,9 @@ flowchart TD
   Service -.->|idempotency| VK
   Service --> Repo --> Model --> PG
   Service --> S3
-  Service -->|order committed| SQS
+  Service -->|state + outbox row in one txn| PG
+  Relay -->|poll unpublished| PG
+  Relay -->|publish| SQS
   Route -.-> Errors
   App -.-> Log
 ```
@@ -114,11 +117,17 @@ Not for sessions/caching (product-listing read cache is a later watch-item).
 
 ## Domain events
 
-In-process `async def` handlers invoked with `await handler(order)` on order
-commit — **not blinker** (sync, can't await an async SQS enqueue). Inventory
-adjust stays inside the transaction; email confirmation is **enqueued to SQS**
-(ElasticMQ locally) and drained by one small worker with retry. **Never
-`BackgroundTasks` for durable work.**
+Published through a **transactional outbox → SNS/SQS bus** (see ADR 0007), never
+`BackgroundTasks` and never a direct SNS publish from the request path. The domain writes state
+and an `outbox` row in **one transaction**; a `service`-role **relay** claims unpublished rows
+(`FOR UPDATE SKIP LOCKED`), publishes them to SNS (**topic per event type**, **standard**
+queues), then marks them published — publish-then-mark, so a crash re-ships (at-least-once).
+
+Each consumer reads its own SQS subscription and is **idempotent**: it dedupes on the envelope
+`event_id` in Valkey (best-effort, ~24h TTL) backed by an idempotent DB write, giving
+**effectively-once** processing. Poison messages land in a **per-subscription DLQ** after N
+retries (replay via SQS redrive — see RUNBOOK). W3C `traceparent` rides as an SQS message
+attribute so one trace spans the queue hop.
 
 ## Correctness invariants (never simplify away)
 

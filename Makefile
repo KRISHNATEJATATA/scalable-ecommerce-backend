@@ -29,6 +29,12 @@ migrate: ## Run every module's independent Alembic chain to head
 		alembic -c src/$$m/alembic.ini upgrade head; \
 	done
 
+relay: ## Run the transactional-outbox relay worker (service role; outbox → SNS)
+	python -m src.shared.bus.relay
+
+bus-setup: ## Create local SNS topics + consumer queues/DLQs/subscriptions on LocalStack
+	python -m scripts.bus_bootstrap
+
 gen-alembic-env: ## Regenerate each module's env.py from scripts/alembic_env.py.tmpl
 	python scripts/generate_alembic_env.py
 
