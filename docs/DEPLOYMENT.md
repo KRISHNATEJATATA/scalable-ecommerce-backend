@@ -62,14 +62,27 @@ Alembic uses the **sync** `psycopg2` driver; the app uses async `asyncpg`.
 | Prod | Local |
 |---|---|
 | RDS Postgres | Postgres container |
-| S3 | MinIO (`S3_ENDPOINT_URL`) |
+| S3 | LocalStack S3 (`S3_ENDPOINT_URL`) |
 | ElastiCache for Valkey | Valkey container |
-| SQS | ElasticMQ |
+| SQS / SNS | LocalStack (bus); ElasticMQ (relay dev) |
 | Secrets Manager / SSM | `.env` + env vars |
 
-## MinIO vs real S3 caveat
+## LocalStack S3 vs real S3 caveat
 
-Locally, uploads go to **MinIO** via `S3_ENDPOINT_URL`. In AWS, leave
-`S3_ENDPOINT_URL` unset so `aioboto3` targets real S3 and uses the ECS task role.
-Store the **object key** (not a full URL); build public/CDN URLs for product
-images and presigned URLs for private assets.
+Locally, uploads go to **LocalStack S3** via `S3_ENDPOINT_URL` (not MinIO —
+LocalStack can emit S3 `ObjectCreated` → SQS notifications, which the image
+worker consumes to mirror prod). In AWS, leave `S3_ENDPOINT_URL` unset so
+`aioboto3` targets real S3 and uses the ECS task role. Store the **object key**
+(not a full URL); public product images are served unsigned via the CDN base
+(`S3_PUBLIC_BASE_URL`), private assets via short-TTL presigned GET URLs.
+
+### Image upload pipeline
+
+Merchant calls `POST /products/{id}/image:presign` (ownership + content-type +
+size validated) → uploads raw bytes to a presigned S3 POST under
+`uploads/{product_id}/…` → S3 `ObjectCreated` → SQS `image-uploads` → the
+**image worker** sniffs the real bytes (`python-magic`), re-encodes to WebP
+(stripping EXIF) and generates thumbnails off the event loop, writes
+`public/{product_id}/…`, and flips `products.image_status` to `ready`
+(spoofed/oversize → `failed`, poison messages → DLQ). Bootstrap the local bucket,
+queue and notification with `make s3-setup` (or the `s3-setup` compose service).

@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
+from src.catalog.domain.image_status import ImageStatus
+
 
 @dataclass(frozen=True, slots=True)
 class Product:
@@ -23,5 +25,6 @@ class Product:
     category: str | None
     price: Decimal
     image_key: str | None
+    image_status: ImageStatus
     created_at: datetime
     updated_at: datetime

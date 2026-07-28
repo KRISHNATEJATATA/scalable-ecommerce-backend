@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from src.catalog.domain.image_status import ImageStatus
 from src.catalog.domain.product import Product
 
 
@@ -22,6 +23,7 @@ def to_domain(row: Any) -> Product:
         category=row.category,
         price=row.price,
         image_key=row.image_key,
+        image_status=ImageStatus(row.image_status),
         created_at=row.created_at,
         updated_at=row.updated_at,
     )

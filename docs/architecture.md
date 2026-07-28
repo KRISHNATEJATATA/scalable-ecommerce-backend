@@ -39,10 +39,11 @@ flowchart TD
   end
   PG[("PostgreSQL<br/>asyncpg")]
   VK[("Valkey<br/>rate-limit · idempotency")]
-  S3[("S3 / MinIO<br/>aioboto3")]
+  S3[("S3 / LocalStack S3<br/>aioboto3")]
   SQS[["SNS/SQS · ElasticMQ/LocalStack<br/>event bus · DLQs"]]
   KC[("Keycloak (OIDC IdP)<br/>token issuance · JWKS · Admin API")]
   Relay["Relay (service role)<br/>outbox → SNS · SKIP LOCKED"]
+  IMG["Image worker (service role)<br/>S3 event → sniff · re-encode · thumbnails"]
 
   Client --> MW --> Route
   Route --> Schema --> Service
@@ -56,6 +57,10 @@ flowchart TD
   Service -->|state + outbox row in one txn| PG
   Relay -->|poll unpublished| PG
   Relay -->|publish| SQS
+  Service -.->|presign upload/get| S3
+  S3 -.->|ObjectCreated → SQS| IMG
+  IMG -->|write public webp + thumbs| S3
+  IMG -->|mark image_status ready/failed| PG
   Route -.-> Errors
   App -.-> Log
 ```

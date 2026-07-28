@@ -75,6 +75,40 @@ publish-then-mark, so events are not lost — they ship once the relay recovers.
 `service`-role relay task; if lag persists, scale relay replicas (safe — `FOR UPDATE SKIP
 LOCKED` prevents double-claim).
 
+### 6. Image worker (secure upload pipeline)
+
+The `service`-role **image worker** (`python -m src.catalog.adapters.image_worker`) drains the
+**`image-uploads`** SQS queue that S3 `ObjectCreated` notifications (scoped to the `uploads/`
+prefix) land in. For each object it sniffs the real bytes (`python-magic`), rejects a type that
+doesn't match what was claimed at presign, re-encodes to WebP (stripping EXIF), writes
+thumbnails under `public/`, and flips `catalog.products.image_status` from `pending` to `ready`
+(or `failed`). Processed objects under `public/` are world-readable (CloudFront/OAC in prod);
+raw `uploads/` stay private.
+
+**Queues & DLQ.** `image-uploads` has a redrive policy (`maxReceiveCount=5`) → **`image-uploads-dlq`**.
+A message that repeatedly raises (e.g. S3 fetch error, worker bug) lands on the DLQ — replay it
+with the SQS redrive in **§4** once the fault is fixed (the worker is idempotent + token-guarded,
+so replay is safe). A *validation* failure (spoofed/oversized bytes) is **not** a poison message:
+it terminally sets `image_status='failed'` and the message is acked normally.
+
+**Stale-event safety.** `mark_image_ready/failed` are conditioned on the product's
+`image_upload_token`, so a late event for a **superseded** upload updates zero rows and is
+logged as `superseded (stale event)` — it can never overwrite newer image state.
+
+**Failure recovery.**
+
+| Symptom | Likely cause | Action |
+|---|---|---|
+| Products stuck `pending` | worker down, or `image-uploads` not draining | check the worker task is running + healthy; inspect queue depth |
+| `image_status='failed'` | spoofed/oversized/corrupt upload | expected — the merchant re-presigns + re-uploads a valid image |
+| `image-uploads-dlq` non-empty | repeated processing errors | inspect a DLQ message, fix the fault, redrive (§4) |
+| `image_url` null on a `ready`-looking image | `public/` not world-readable | re-run `make s3-setup` (ensures the public-read bucket policy) |
+
+**Monitoring.** Alarm on `image-uploads-dlq` `ApproximateNumberOfMessagesVisible > 0`; watch
+`image-uploads` queue depth + oldest-message age (worker liveness) and the worker task health
+check. To reprocess a specific product, the merchant simply re-presigns — there is no manual
+re-enqueue path (the presigned upload is the only trusted entry point).
+
 ## Post-incident
 
 - Re-enable automated backups on the promoted instance.

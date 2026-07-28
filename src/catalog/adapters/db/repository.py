@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import text
 
 from src.catalog.adapters.db.models import SCHEMA, Outbox, Product
+from src.catalog.domain.image_status import ImageStatus
 from src.shared.db.pagination import Page, PageParams, build_page, check_filters, decode_cursor
 from src.shared.errors.exceptions import InvalidQueryParamError
 
@@ -35,7 +36,7 @@ _SORT_COLUMNS: dict[str, tuple[str, str]] = {
 }
 _FILTERS: frozenset[str] = frozenset({"category", "merchant_id"})
 
-_SELECT_COLS = "id, merchant_id, name, description, category, price, image_key, created_at, updated_at"
+_SELECT_COLS = "id, merchant_id, name, description, category, price, image_key, image_status, created_at, updated_at"
 
 
 @dataclass(slots=True)
@@ -49,6 +50,7 @@ class ProductRow:
     category: str | None
     price: Decimal
     image_key: str | None
+    image_status: str
     created_at: datetime
     updated_at: datetime
 
@@ -150,6 +152,55 @@ class CatalogRepository:
         product.deleted_at = datetime.now(UTC)
         self._session.add(self._outbox_row(outbox))
         await self._session.commit()
+
+    # --- image pipeline state (presign sets pending; the worker marks ready/failed) ---
+
+    async def set_image_pending(self, product: Product, upload_token: str) -> None:
+        """Mark an owned product's image as awaiting upload and record which upload.
+
+        ``upload_token`` is the freshly-minted upload's token; storing it lets the
+        worker reject a late event for a **superseded** upload (only the token that
+        matches the current pending upload may flip the image state).
+        """
+        product.image_status = ImageStatus.PENDING.value
+        product.image_upload_token = upload_token
+        await self._session.commit()
+
+    async def mark_image_ready(self, product_id: uuid.UUID, upload_token: str, image_key: str) -> bool:
+        """Worker path: attach the processed key and flip to ``ready`` (idempotent).
+
+        Raw UPDATE (not the ORM unit-of-work) because the worker owns its own
+        session and re-processing the same object must be safe to repeat. Guarded
+        on ``image_upload_token`` so a stale event for a superseded upload updates
+        zero rows (returns ``False``) instead of clobbering newer image state.
+        """
+        result = await self._session.execute(
+            text(
+                f"UPDATE {SCHEMA}.products "
+                "SET image_key = :key, image_status = :ready, updated_at = now() "
+                "WHERE id = :id AND image_upload_token = :token AND deleted_at IS NULL"
+            ),
+            {"key": image_key, "id": product_id, "token": upload_token, "ready": ImageStatus.READY.value},
+        )
+        await self._session.commit()
+        return result.rowcount > 0
+
+    async def mark_image_failed(self, product_id: uuid.UUID, upload_token: str) -> bool:
+        """Worker path: flip to ``failed`` when the upload doesn't pass sniff/re-encode.
+
+        Token-guarded like :meth:`mark_image_ready` — a stale failure can't
+        overwrite a newer pending/ready image.
+        """
+        result = await self._session.execute(
+            text(
+                f"UPDATE {SCHEMA}.products "
+                "SET image_status = :failed, updated_at = now() "
+                "WHERE id = :id AND image_upload_token = :token AND deleted_at IS NULL"
+            ),
+            {"id": product_id, "token": upload_token, "failed": ImageStatus.FAILED.value},
+        )
+        await self._session.commit()
+        return result.rowcount > 0
 
     @staticmethod
     def _outbox_row(outbox: tuple[str, str]) -> Outbox:

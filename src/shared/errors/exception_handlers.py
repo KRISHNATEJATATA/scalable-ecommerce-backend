@@ -19,6 +19,7 @@ from src.shared.errors.exceptions import (
     DependencyUnavailableError,
     InvalidCursorError,
     InvalidQueryParamError,
+    InvalidUploadError,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,11 @@ async def _bad_request_handler(_: Request, exc: InvalidQueryParamError | Invalid
     # Client-supplied sort/filter/cursor that fails the repo whitelist/codec is a
     # 400 (bad input), never a 500 — these surface via the list routes' query params.
     return _problem_response(400, title="Bad Request", detail=str(exc))
+
+
+async def _invalid_upload_handler(_: Request, exc: InvalidUploadError) -> JSONResponse:
+    # Content-type/size rejected BEFORE a presigned URL is issued (not an open uploader).
+    return _problem_response(400, title="Bad Request", detail=exc.detail)
 
 
 async def _dependency_unavailable_handler(_: Request, exc: DependencyUnavailableError) -> JSONResponse:
@@ -79,6 +85,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(AuthorizationError, _authorization_error_handler)
     app.add_exception_handler(InvalidQueryParamError, _bad_request_handler)
     app.add_exception_handler(InvalidCursorError, _bad_request_handler)
+    app.add_exception_handler(InvalidUploadError, _invalid_upload_handler)
     app.add_exception_handler(DependencyUnavailableError, _dependency_unavailable_handler)
     app.add_exception_handler(StarletteHTTPException, _http_exception_handler)
     app.add_exception_handler(RequestValidationError, _validation_exception_handler)

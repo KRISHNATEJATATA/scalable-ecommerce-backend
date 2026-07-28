@@ -1,55 +1,36 @@
 """Catalog wire schemas — the public HTTP response shape for a product.
 
-``from_attributes`` lets the service build this straight off the domain
-``Product`` dataclass (attribute read, no dict round-trip).
+The request/response DTOs shared with the service layer (``ProductResponse``,
+``ProductCreate``, ``ProductUpdate``) live in ``application.dto`` (layers
+contract: application must not depend on api) and are re-exported here for
+route type hints / OpenAPI.
 """
 
 from __future__ import annotations
 
-import uuid
-from datetime import datetime
-from decimal import Decimal
-
 from pydantic import BaseModel, ConfigDict, Field
 
-
-class ProductResponse(BaseModel):
-    """The public HTTP response shape for a product."""
-
-    model_config = ConfigDict(from_attributes=True)
-
-    id: uuid.UUID
-    merchant_id: uuid.UUID
-    name: str
-    description: str | None
-    category: str | None
-    price: Decimal
-    image_key: str | None
-    created_at: datetime
-    updated_at: datetime
+from src.catalog.application.dto import ProductCreate as ProductCreate
+from src.catalog.application.dto import ProductResponse as ProductResponse
+from src.catalog.application.dto import ProductUpdate as ProductUpdate
 
 
-class ProductCreate(BaseModel):
-    """Merchant create payload. ``merchant_id`` is never accepted from input —
-    it is bound from the authenticated caller (ownership can't be spoofed).
+class ImagePresignResponse(BaseModel):
+    """Presigned-POST envelope a merchant uses to upload one product image directly
+    to S3. ``fields`` already carry the content-type + ``content-length-range``
+    policy conditions, so an upload violating them is rejected by S3 itself.
     """
 
-    model_config = ConfigDict(extra="forbid")
-
-    name: str = Field(min_length=1, max_length=255)
-    description: str | None = None
-    category: str | None = Field(default=None, max_length=255)
-    price: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
-    image_key: str | None = Field(default=None, max_length=1024)
+    url: str
+    fields: dict[str, str]
+    key: str
+    expires_in: int
 
 
-class ProductUpdate(BaseModel):
-    """Partial merchant update — every field optional; unset fields are untouched."""
+class ImagePresignRequest(BaseModel):
+    """Merchant declares the intended upload; validated BEFORE a URL is issued."""
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str | None = Field(default=None, min_length=1, max_length=255)
-    description: str | None = None
-    category: str | None = Field(default=None, max_length=255)
-    price: Decimal | None = Field(default=None, gt=0, max_digits=12, decimal_places=2)
-    image_key: str | None = Field(default=None, max_length=1024)
+    content_type: str = Field(description="claimed image MIME type (jpeg/png/webp)")
+    content_length: int = Field(gt=0, description="declared byte size; capped by policy")

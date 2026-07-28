@@ -7,6 +7,9 @@ info:
     design source of truth (Spectral-linted). Paths are filled in per phase.
   license:
     name: MIT
+  contact:
+    name: Scalable E-commerce Backend
+    url: https://github.com/KRISHNATEJATATA/scalable-ecommerce-backend
 servers:
   - url: http://localhost:8000
     description: Local development
@@ -163,6 +166,43 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+  /v1/products/{product_id}/image:presign:
+    parameters:
+      - $ref: "#/components/parameters/ProductId"
+    post:
+      tags: [catalog]
+      operationId: presignProductImage
+      summary: Presign an image upload (owner merchant only)
+      description: >-
+        Issues a short-TTL presigned S3 POST for an owned product image, but only
+        AFTER validating ownership + content-type + declared size — the endpoint is
+        never an open uploader. The upload lands under a private `uploads/` key; an
+        S3-event worker then sniffs the real bytes, re-encodes (stripping EXIF),
+        writes thumbnails, and marks the product image `ready` only if it passes
+        (spoofed/oversized → `failed`). Cross-merchant → 403, missing → 404.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImagePresignRequest"
+      responses:
+        "200":
+          description: The presigned-POST envelope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImagePresignResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
   /v1/me:
     get:
       tags: [identity]
@@ -224,6 +264,9 @@ paths:
       tags: [identity]
       operationId: grantMerchantRole
       summary: Grant the merchant realm role (admin only)
+      description: >-
+        Adds the Keycloak `merchant` realm role to the given user. Idempotent:
+        granting a role the user already has still returns `204`.
       security:
         - bearerAuth: []
       parameters:
@@ -239,6 +282,9 @@ paths:
       tags: [identity]
       operationId: revokeMerchantRole
       summary: Revoke the merchant realm role (admin only)
+      description: >-
+        Removes the Keycloak `merchant` realm role from the given user.
+        Idempotent: revoking a role the user doesn't have still returns `204`.
       security:
         - bearerAuth: []
       parameters:
@@ -396,6 +442,12 @@ components:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/Problem"
+    BadRequest:
+      description: The request was malformed or failed validation (e.g. unsupported image type or size).
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
   schemas:
     User:
       description: The local `identity.users` mirror (JIT-provisioned, no `role` field).
@@ -456,15 +508,23 @@ components:
           description: Decimal (money) serialized as a string.
         image_key:
           type: [string, "null"]
+          description: Processed public object key; set by the image worker only after the upload passes.
+        image_status:
+          type: string
+          enum: [none, pending, ready, failed]
+          description: Image pipeline state (worker-owned; never accepted from input).
+        image_url:
+          type: [string, "null"]
+          description: Unsigned CDN URL for a `ready` image, else `null`.
         created_at:
           type: string
           format: date-time
         updated_at:
           type: string
           format: date-time
-      required: [id, merchant_id, name, description, category, price, image_key, created_at, updated_at]
+      required: [id, merchant_id, name, description, category, price, image_key, image_status, image_url, created_at, updated_at]
     ProductCreate:
-      description: Merchant create payload. `merchant_id` is bound from the caller, never from input.
+      description: Merchant create payload. `merchant_id` is bound from the caller, never from input. `image_key`/`image_status` are worker-owned and not accepted here.
       type: object
       additionalProperties: false
       properties:
@@ -480,12 +540,9 @@ components:
         price:
           type: string
           description: Positive decimal money value (> 0).
-        image_key:
-          type: [string, "null"]
-          maxLength: 1024
       required: [name, price]
     ProductUpdate:
-      description: Partial merchant update — every field optional; unset fields are untouched.
+      description: Partial merchant update — every field optional; unset fields are untouched. `image_key` is not updatable here (use the presign endpoint).
       type: object
       additionalProperties: false
       properties:
@@ -501,9 +558,41 @@ components:
         price:
           type: [string, "null"]
           description: Positive decimal money value (> 0).
-        image_key:
-          type: [string, "null"]
-          maxLength: 1024
+    ImagePresignRequest:
+      description: Merchant declares the intended upload; validated BEFORE a URL is issued.
+      type: object
+      additionalProperties: false
+      properties:
+        content_type:
+          type: string
+          description: Claimed image MIME type (image/jpeg, image/png, image/webp).
+        content_length:
+          type: integer
+          minimum: 1
+          description: Declared byte size; capped by the presigned-POST policy.
+      required: [content_type, content_length]
+    ImagePresignResponse:
+      description: >-
+        Presigned-POST envelope for a direct-to-S3 upload. `fields` already carry
+        the content-type + `content-length-range` policy conditions, so an upload
+        violating them is rejected by S3 itself.
+      type: object
+      properties:
+        url:
+          type: string
+          description: S3 POST endpoint the client uploads to.
+        fields:
+          type: object
+          additionalProperties:
+            type: string
+          description: Form fields (policy, signature, key, content-type) to POST alongside the file.
+        key:
+          type: string
+          description: The private upload object key the file lands at.
+        expires_in:
+          type: integer
+          description: Seconds until the presigned POST expires.
+      required: [url, fields, key, expires_in]
     ProductPage:
       description: One keyset page of products.
       type: object

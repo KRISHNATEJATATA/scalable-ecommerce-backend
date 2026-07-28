@@ -18,6 +18,7 @@ from src.identity.api import routes as identity_routes
 from src.shared.api import health, metrics
 from src.shared.auth.jwks import build_jwks_client
 from src.shared.clients import postgres_client, valkey_client
+from src.shared.clients.s3_client import s3_client
 from src.shared.config.logging import setup_logging
 from src.shared.config.setting import AppSettings, get_settings
 from src.shared.errors.exception_handlers import register_exception_handlers
@@ -35,11 +36,19 @@ async def _lifespan(app: FastAPI):
     # (constructed lazily-connecting: no network at startup).
     app.state.jwks_client = build_jwks_client(settings)
     app.state.identity_admin = KeycloakIdentityAdmin(settings)
+    # Process-wide aioboto3 S3 client (entered once) for presigned uploads +
+    # serving private assets. None if S3 isn't configured (e.g. bare test app).
+    app.state.s3 = None
+    s3_cm = s3_client(settings) if settings.s3_bucket else None
+    if s3_cm is not None:
+        app.state.s3 = await s3_cm.__aenter__()
     try:
         yield
     finally:
         await app.state.db_engine.dispose()
         await app.state.valkey.aclose()
+        if s3_cm is not None:
+            await s3_cm.__aexit__(None, None, None)
 
 
 def create_app(settings: AppSettings | None = None) -> FastAPI:

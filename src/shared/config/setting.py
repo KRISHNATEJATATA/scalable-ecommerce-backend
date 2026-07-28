@@ -64,10 +64,20 @@ class AppSettings(BaseSettings):
     # --- Feature flags (plain env booleans; not a flag service) ---
     enable_reviews: bool = False
 
-    # --- S3 / uploads (Phase 7) ---
+    # --- S3 / uploads (Phase 7-8) ---
     s3_bucket: str | None = None
     s3_region: str = "us-east-1"
-    s3_endpoint_url: str | None = None  # MinIO locally; None → real AWS S3
+    s3_endpoint_url: str | None = None  # LocalStack S3 locally; None → real AWS S3
+    # Public CDN base (CloudFront in prod; LocalStack path locally) for serving
+    # product images UNSIGNED. None → fall back to f"{s3_endpoint_url}/{s3_bucket}".
+    s3_public_base_url: str | None = None
+
+    # --- Secure image uploads + worker (Phase 8) ---
+    image_max_upload_bytes: int = 5 * 1024 * 1024  # presign policy ceiling (5 MiB)
+    image_max_dimension: int = 2048  # worker re-encode clamp (px, longest side)
+    image_upload_ttl_seconds: int = 300  # presigned-POST validity (~5 min)
+    # SQS queue the ImageWorker drains (S3 ObjectCreated → SQS). LocalStack locally.
+    image_queue_url: str | None = None
 
     # --- SQS async worker (Phase 8) ---
     sqs_queue_url: str | None = None

@@ -18,18 +18,17 @@ root_packages =
 name = Modules are independent (schema-per-module, no cross-module domain/db imports)
 type = independence
 modules =
-    src.catalog.domain
-    src.catalog.adapters
-    src.inventory.domain
-    src.inventory.adapters
-    src.orders.domain
-    src.orders.adapters
-    src.payments.domain
-    src.payments.adapters
-    src.identity.domain
-    src.identity.adapters
-    src.cart.domain
-    src.cart.adapters
+    src.catalog
+    src.inventory
+    src.orders
+    src.payments
+    src.identity
+    src.cart
+; the composition root (src/shared/container.py) is the one place allowed to
+; wire every module together for DI — routes depending on it isn't a
+; cross-module import, so exclude that edge from the independence check.
+ignore_imports =
+    src.*.api.routes -> src.shared.container
 
 [importlinter:contract:catalog-layers]
 name = catalog: api -> application -> domain (ports/adapters at the edges only)

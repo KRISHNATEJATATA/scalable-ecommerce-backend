@@ -23,6 +23,15 @@ class InvalidQueryParamError(ValueError):
         self.value = value
 
 
+class InvalidUploadError(ValueError):
+    """A requested upload fails server-side validation before a presigned URL is issued
+    (claimed content-type not allowed, or declared size over the policy cap) → 400."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
 class AuthenticationError(Exception):
     """The caller could not be authenticated (missing/invalid/expired token) → 401."""
 

@@ -1,8 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help install run lint test migrate compose-up compose-down hooks gen-alembic-env
-
-MODULES := identity catalog inventory orders payments
+.PHONY: help install run lint test migrate compose-up compose-down hooks gen-alembic-env relay bus-setup s3-setup image-worker
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS=":.*?## "}; {printf "%-14s %s\n", $$1, $$2}'
@@ -23,11 +21,12 @@ lint: ## Ruff check + format check + import-linter (module boundaries)
 test: ## Run the unit test suite (coverage reported, not gated)
 	pytest tests/unit/
 
-migrate: ## Run every module's independent Alembic chain to head
-	@for m in $(MODULES); do \
-		echo "=== $$m ==="; \
-		alembic -c src/$$m/alembic.ini upgrade head; \
-	done
+migrate: ## Run every module's independent Alembic chain to head (portable: one line per module)
+	python -m alembic -c src/identity/alembic.ini upgrade head
+	python -m alembic -c src/catalog/alembic.ini upgrade head
+	python -m alembic -c src/inventory/alembic.ini upgrade head
+	python -m alembic -c src/orders/alembic.ini upgrade head
+	python -m alembic -c src/payments/alembic.ini upgrade head
 
 relay: ## Run the transactional-outbox relay worker (service role; outbox → SNS)
 	python -m src.shared.bus.relay
@@ -35,10 +34,16 @@ relay: ## Run the transactional-outbox relay worker (service role; outbox → SN
 bus-setup: ## Create local SNS topics + consumer queues/DLQs/subscriptions on LocalStack
 	python -m scripts.bus_bootstrap
 
+s3-setup: ## Create local S3 bucket + image-uploads queue/DLQ + ObjectCreated→SQS notification on LocalStack
+	python -m scripts.s3_bootstrap
+
+image-worker: ## Run the image worker (service role; S3 ObjectCreated → sniff/re-encode/thumbnails)
+	python -m src.catalog.adapters.image_worker
+
 gen-alembic-env: ## Regenerate each module's env.py from scripts/alembic_env.py.tmpl
 	python scripts/generate_alembic_env.py
 
-compose-up: ## Start local backing services (Postgres, Valkey, MinIO, ElasticMQ) + app
+compose-up: ## Start local backing services (Postgres, Valkey, LocalStack S3/SNS/SQS, ElasticMQ) + app + workers
 	docker compose up -d
 
 compose-down: ## Stop local backing services

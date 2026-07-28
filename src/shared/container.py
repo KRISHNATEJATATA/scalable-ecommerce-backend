@@ -17,10 +17,12 @@ from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.catalog.adapters.db.repository import CatalogRepository
+from src.catalog.adapters.s3_images import ImageStore
 from src.catalog.application.service import CatalogService
 from src.catalog.ports.repository import CatalogRepositoryPort
+from src.catalog.ports.storage import ImageStorePort
 from src.identity.adapters.db.repository import IdentityRepository
-from src.identity.api.schemas import UserResponse
+from src.identity.application.dto import UserResponse
 from src.identity.application.service import IdentityAdminService, IdentityService
 from src.identity.ports.admin import IdentityAdminPort
 from src.identity.ports.repository import IdentityRepositoryPort
@@ -46,9 +48,20 @@ def get_catalog_repository(session: SessionDep) -> CatalogRepositoryPort:
     return CatalogRepository(session)
 
 
-def get_catalog_service(repo: Annotated[CatalogRepositoryPort, Depends(get_catalog_repository)]) -> CatalogService:
-    """Provide the catalog service over its repository port."""
-    return CatalogService(repo)
+def get_image_store(request: Request) -> ImageStorePort | None:
+    """Provide the shared S3 image store (entered once in the app lifespan)."""
+    s3 = getattr(request.app.state, "s3", None)
+    if s3 is None:
+        return None
+    return ImageStore(s3, request.app.state.settings.s3_bucket)
+
+
+def get_catalog_service(
+    repo: Annotated[CatalogRepositoryPort, Depends(get_catalog_repository)],
+    image_store: Annotated[ImageStorePort | None, Depends(get_image_store)],
+) -> CatalogService:
+    """Provide the catalog service over its repository + image-store ports."""
+    return CatalogService(repo, image_store)
 
 
 # --- orders ---------------------------------------------------------------

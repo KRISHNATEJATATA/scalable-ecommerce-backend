@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import uuid
 
-from src.identity.api.schemas import UserResponse
+from src.identity.application.dto import UserResponse
 from src.identity.application.mappers import to_domain
 from src.identity.ports.admin import IdentityAdminPort
 from src.identity.ports.repository import IdentityRepositoryPort

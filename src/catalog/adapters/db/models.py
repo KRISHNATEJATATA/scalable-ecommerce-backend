@@ -7,9 +7,12 @@ from sqlalchemy import CheckConstraint, Index, Numeric, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, declared_attr, mapped_column
 
+from src.catalog.domain.image_status import IMAGE_STATUS_VALUES, ImageStatus
 from src.shared.db.mixins import OutboxMixin, SoftDeleteMixin, TimestampMixin, VersionIdMixin, outbox_unpublished_index
 
 SCHEMA = "catalog"
+
+_IMAGE_STATUS_IN = ", ".join(f"'{v}'" for v in IMAGE_STATUS_VALUES)
 
 
 class Base(DeclarativeBase):
@@ -25,6 +28,10 @@ class Product(Base, TimestampMixin, SoftDeleteMixin, VersionIdMixin):
     __tablename__ = "products"
     __table_args__ = (
         CheckConstraint("price > 0", name="ck_products_price_positive"),
+        CheckConstraint(
+            f"image_status IN ({_IMAGE_STATUS_IN})",
+            name="ck_products_image_status",
+        ),
         Index("ix_products_name", "name"),
         Index("ix_products_category", "category"),
         Index("ix_products_merchant_id", "merchant_id"),
@@ -44,7 +51,15 @@ class Product(Base, TimestampMixin, SoftDeleteMixin, VersionIdMixin):
     description: Mapped[str | None] = mapped_column(String, nullable=True)
     category: Mapped[str | None] = mapped_column(String(255), nullable=True)
     price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    # ``image_key`` is the PROCESSED, public object key (set by the image worker
+    # only after the upload passes sniff + re-encode). ``image_status`` tracks the
+    # pipeline: none → pending (presigned, awaiting upload) → ready | failed.
+    # ``image_upload_token`` is the token of the CURRENTLY-pending upload — the
+    # worker only applies a result whose token matches, so a late/stale event for
+    # a superseded upload can't clobber newer image state.
     image_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    image_status: Mapped[str] = mapped_column(String(16), nullable=False, server_default=ImageStatus.NONE.value)
+    image_upload_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class Outbox(Base, OutboxMixin):

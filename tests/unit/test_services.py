@@ -104,6 +104,7 @@ def _product_row_orm():
         category="c",
         price=Decimal("9.99"),
         image_key=None,
+        image_status="none",
         created_at=_NOW,
         updated_at=_NOW,
     )
@@ -166,6 +167,7 @@ def test_catalog_mapper_orm_and_productrow_map_equal():
         category=orm.category,
         price=orm.price,
         image_key=orm.image_key,
+        image_status=orm.image_status,
         created_at=orm.created_at,
         updated_at=orm.updated_at,
     )

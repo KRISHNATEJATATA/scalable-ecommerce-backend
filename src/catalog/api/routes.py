@@ -15,7 +15,13 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from src.catalog.api.schemas import ProductCreate, ProductResponse, ProductUpdate
+from src.catalog.api.schemas import (
+    ImagePresignRequest,
+    ImagePresignResponse,
+    ProductCreate,
+    ProductResponse,
+    ProductUpdate,
+)
 from src.catalog.application.service import CatalogService
 from src.shared.auth.dependencies import PrincipalDep, require_role
 from src.shared.auth.principal import Principal
@@ -98,3 +104,31 @@ async def delete_product(
     deleted = await service.delete_product(product_id=product_id, merchant_id=caller.id, is_admin=principal.is_admin)
     if not deleted:
         raise _NOT_FOUND
+
+
+@router.post("/{product_id}/image:presign", response_model=ImagePresignResponse)
+async def presign_product_image(
+    product_id: uuid.UUID,
+    body: ImagePresignRequest,
+    service: CatalogServiceDep,
+    caller: CurrentUserDep,
+    principal: MerchantPrincipalDep,
+) -> ImagePresignResponse:
+    """Issue a short-TTL presigned upload for an owned product image.
+
+    Validates ownership + content-type + size before minting the URL (not an open
+    uploader); the image worker marks the product image usable only after the
+    uploaded bytes pass sniff + re-encode. Cross-merchant → 403, missing → 404.
+    """
+    presigned = await service.presign_image_upload(
+        product_id=product_id,
+        merchant_id=caller.id,
+        is_admin=principal.is_admin,
+        content_type=body.content_type,
+        content_length=body.content_length,
+    )
+    if presigned is None:
+        raise _NOT_FOUND
+    return ImagePresignResponse(
+        url=presigned.url, fields=presigned.fields, key=presigned.key, expires_in=presigned.expires_in
+    )

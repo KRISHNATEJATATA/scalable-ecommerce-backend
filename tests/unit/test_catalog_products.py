@@ -30,6 +30,7 @@ from testcontainers.postgres import PostgresContainer
 
 from src.app import create_app
 from src.shared.config.setting import AppSettings, get_settings
+from src.shared.container import get_image_store
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULES = ["identity", "catalog"]
@@ -149,7 +150,7 @@ async def _outbox(sessionmaker) -> list[dict]:
     return [{"event_type": r.event_type, "payload": json.loads(r.payload)} for r in rows]
 
 
-_PRODUCT = {"name": "widget", "description": "d", "category": "tools", "price": "9.99", "image_key": None}
+_PRODUCT = {"name": "widget", "description": "d", "category": "tools", "price": "9.99"}
 
 
 # --- create ---------------------------------------------------------------
@@ -301,3 +302,155 @@ async def test_cross_merchant_delete_403(app_ctx, rsa_key):
         created = (await client.post("/v1/products", headers=_auth(owner), json=_PRODUCT)).json()
         resp = await client.delete(f"/v1/products/{created['id']}", headers=_auth(other))
     assert resp.status_code == 403
+
+
+# --- image upload presign -------------------------------------
+
+
+class _FakeImageStore:
+    """Records the presign call and returns a canned POST envelope (no real S3)."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def presign_upload(self, product_id, *, content_type, max_bytes, ttl_seconds):
+        self.calls.append({"content_type": content_type, "max_bytes": max_bytes, "ttl": ttl_seconds})
+        token = "deadbeef"
+        key = f"uploads/{product_id}/{token}.bin"
+        return {
+            "url": "http://s3.test/ecommerce-uploads",
+            "fields": {"key": key, "Content-Type": content_type, "policy": "x", "x-amz-signature": "y"},
+            "key": key,
+            "token": token,
+        }
+
+
+@pytest.fixture
+def image_store(app_ctx):
+    store = _FakeImageStore()
+    app_ctx.dependency_overrides[get_image_store] = lambda: store
+    yield store
+    app_ctx.dependency_overrides.pop(get_image_store, None)
+
+
+_PRESIGN = {"content_type": "image/jpeg", "content_length": 100_000}
+
+
+async def test_presign_issued_after_validation_and_marks_pending(app_ctx, rsa_key, image_store, sessionmaker):
+    token = _make_token(rsa_key, roles=["merchant"])
+    async with _client(app_ctx) as client:
+        created = (await client.post("/v1/products", headers=_auth(token), json=_PRODUCT)).json()
+        resp = await client.post(f"/v1/products/{created['id']}/image:presign", headers=_auth(token), json=_PRESIGN)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["url"] and body["fields"] and body["key"].startswith(f"uploads/{created['id']}/")
+    assert body["expires_in"] > 0
+    assert image_store.calls == [
+        {"content_type": "image/jpeg", "max_bytes": 5 * 1024 * 1024, "ttl": body["expires_in"]}
+    ]
+    async with sessionmaker() as s:
+        status = (
+            await s.execute(text("SELECT image_status FROM catalog.products WHERE id = :id"), {"id": created["id"]})
+        ).scalar_one()
+    assert status == "pending"  # worker flips to ready/failed later
+
+
+async def test_presign_rejects_disallowed_content_type_400(app_ctx, rsa_key, image_store):
+    token = _make_token(rsa_key, roles=["merchant"])
+    async with _client(app_ctx) as client:
+        created = (await client.post("/v1/products", headers=_auth(token), json=_PRODUCT)).json()
+        resp = await client.post(
+            f"/v1/products/{created['id']}/image:presign",
+            headers=_auth(token),
+            json={"content_type": "application/pdf", "content_length": 100},
+        )
+    assert resp.status_code == 400, resp.text
+    assert image_store.calls == []  # rejected BEFORE any URL is minted (not an open uploader)
+
+
+async def test_presign_rejects_oversize_400(app_ctx, rsa_key, image_store):
+    token = _make_token(rsa_key, roles=["merchant"])
+    async with _client(app_ctx) as client:
+        created = (await client.post("/v1/products", headers=_auth(token), json=_PRODUCT)).json()
+        resp = await client.post(
+            f"/v1/products/{created['id']}/image:presign",
+            headers=_auth(token),
+            json={"content_type": "image/png", "content_length": 50 * 1024 * 1024},
+        )
+    assert resp.status_code == 400
+    assert image_store.calls == []
+
+
+async def test_presign_consumer_forbidden_403(app_ctx, rsa_key, image_store):
+    owner = _make_token(rsa_key, roles=["merchant"])
+    consumer = _make_token(rsa_key, roles=["consumer"])
+    async with _client(app_ctx) as client:
+        created = (await client.post("/v1/products", headers=_auth(owner), json=_PRODUCT)).json()
+        resp = await client.post(f"/v1/products/{created['id']}/image:presign", headers=_auth(consumer), json=_PRESIGN)
+    assert resp.status_code == 403
+
+
+async def test_presign_cross_merchant_403(app_ctx, rsa_key, image_store):
+    owner = _make_token(rsa_key, roles=["merchant"])
+    other = _make_token(rsa_key, roles=["merchant"])
+    async with _client(app_ctx) as client:
+        created = (await client.post("/v1/products", headers=_auth(owner), json=_PRODUCT)).json()
+        resp = await client.post(f"/v1/products/{created['id']}/image:presign", headers=_auth(other), json=_PRESIGN)
+    assert resp.status_code == 403
+
+
+async def test_presign_missing_product_404(app_ctx, rsa_key, image_store):
+    token = _make_token(rsa_key, roles=["merchant"])
+    async with _client(app_ctx) as client:
+        resp = await client.post(f"/v1/products/{uuid.uuid4()}/image:presign", headers=_auth(token), json=_PRESIGN)
+    assert resp.status_code == 404
+
+
+# --- image worker state (token-guarded, stale-event safe) -----------------
+
+
+async def _seed_pending(sessionmaker, upload_token: str) -> uuid.UUID:
+    pid = uuid.uuid4()
+    async with sessionmaker() as s:
+        await s.execute(
+            text(
+                "INSERT INTO catalog.products "
+                "(id, merchant_id, name, price, version_id, image_status, image_upload_token) "
+                "VALUES (:id, :m, 'p', 9.99, 1, 'pending', :tok)"
+            ),
+            {"id": pid, "m": uuid.uuid4(), "tok": upload_token},
+        )
+        await s.commit()
+    return pid
+
+
+async def test_mark_image_ready_is_token_guarded(sessionmaker):
+    """A stale event (superseded upload token) updates zero rows; the current one wins."""
+    from src.catalog.adapters.db.repository import CatalogRepository
+
+    pid = await _seed_pending(sessionmaker, "tokB")
+    async with sessionmaker() as s:
+        repo = CatalogRepository(s)
+        assert await repo.mark_image_ready(pid, "tokA", "public/stale.webp") is False  # stale → no-op
+        assert await repo.mark_image_ready(pid, "tokB", "public/current.webp") is True  # current → applied
+    async with sessionmaker() as s:
+        row = (
+            await s.execute(text("SELECT image_status, image_key FROM catalog.products WHERE id = :id"), {"id": pid})
+        ).one()
+    assert row.image_status == "ready"
+    assert row.image_key == "public/current.webp"  # the stale event never clobbered it
+
+
+async def test_mark_image_failed_is_token_guarded(sessionmaker):
+    from src.catalog.adapters.db.repository import CatalogRepository
+
+    pid = await _seed_pending(sessionmaker, "tokB")
+    async with sessionmaker() as s:
+        repo = CatalogRepository(s)
+        assert await repo.mark_image_failed(pid, "tokA") is False  # stale failure ignored
+        assert await repo.mark_image_failed(pid, "tokB") is True
+    async with sessionmaker() as s:
+        status = (
+            await s.execute(text("SELECT image_status FROM catalog.products WHERE id = :id"), {"id": pid})
+        ).scalar_one()
+    assert status == "failed"

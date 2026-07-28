@@ -1,5 +1,26 @@
-"""Async S3 client (aioboto3).
+"""aioboto3 S3 client factory.
 
-Single async upload/serve path. MinIO locally via ``S3_ENDPOINT_URL``; real S3
-in the cloud using the ECS task role (no keys in code). Wired in Phase 7.
+Async-native to keep the presign (request path) and the image worker's
+download/upload loops off the blocking path. ``s3_endpoint_url`` points at
+LocalStack locally and is ``None`` in the cloud, where the ECS task role
+supplies credentials (no keys in code).
+
+Returns an async context manager: ``async with s3_client(settings) as s3``.
 """
+
+from __future__ import annotations
+
+import aioboto3
+
+from src.shared.config.setting import AppSettings
+
+_session = aioboto3.Session()
+
+
+def s3_client(settings: AppSettings):
+    """Async S3 client context manager (presign + worker download/upload)."""
+    return _session.client(
+        "s3",
+        endpoint_url=settings.s3_endpoint_url,
+        region_name=settings.s3_region,
+    )

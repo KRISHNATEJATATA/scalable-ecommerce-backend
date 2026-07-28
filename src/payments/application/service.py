@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import uuid
 
-from src.payments.api.schemas import PaymentResponse
+from src.payments.application.dto import PaymentResponse
 from src.payments.application.mappers import to_domain
 from src.payments.ports.repository import PaymentsRepositoryPort
 from src.shared.db.pagination import PageParams, PageResponse

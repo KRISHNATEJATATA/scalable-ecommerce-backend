@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import uuid
 
-from src.orders.api.schemas import OrderResponse
+from src.orders.application.dto import OrderResponse
 from src.orders.application.mappers import to_domain
 from src.orders.domain.order import OrderStatus
 from src.orders.ports.repository import OrdersRepositoryPort

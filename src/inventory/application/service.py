@@ -7,7 +7,7 @@ so the ORM row never crosses the service boundary. No service method for
 
 from __future__ import annotations
 
-from src.inventory.api.schemas import InventoryResponse
+from src.inventory.application.dto import InventoryResponse
 from src.inventory.application.mappers import to_domain
 from src.inventory.ports.repository import InventoryRepositoryPort
 
