@@ -16,10 +16,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from decimal import Decimal
 from enum import StrEnum
+from types import SimpleNamespace
 from typing import Any, Protocol
 
 from src.catalog.application.image_processing import UnsupportedImageError, process_image
+from src.catalog.application.outbox import product_updated_outbox
 from src.catalog.domain.image_keys import parse_upload_key, public_main_key, public_thumb_key
 from src.catalog.ports.repository import CatalogRepositoryPort
 from src.catalog.ports.storage import ImageStorePort
@@ -58,6 +61,7 @@ class ImageIngestService:
         *,
         max_dimension: int,
         max_bytes: int,
+        max_pixels: int,
         dedup_ttl_seconds: int,
     ) -> None:
         self._repo = repo
@@ -65,6 +69,7 @@ class ImageIngestService:
         self._dedup = dedup
         self._max_dimension = max_dimension
         self._max_bytes = max_bytes
+        self._max_pixels = max_pixels
         self._ttl = dedup_ttl_seconds
 
     async def ingest(self, key: str, etag: str) -> IngestOutcome:
@@ -93,12 +98,17 @@ class ImageIngestService:
                 raw,
                 max_dimension=self._max_dimension,
                 max_bytes=self._max_bytes,
+                max_pixels=self._max_pixels,
                 claimed_mime=claimed_mime,
             )
         except UnsupportedImageError as exc:
             log.warning("rejected upload for product %s: %s", product_id, exc)
-            await self._repo.mark_image_failed(product_id, token)
+            outbox = await self._product_updated_outbox(product_id)
+            failed = await self._repo.mark_image_failed(product_id, token, outbox=outbox)
             await self._dedup.set(dedup_key, "1", ex=self._ttl)
+            if not failed:  # token no longer current → a newer upload superseded this reject
+                log.info("product %s failed-upload %s superseded (stale event)", product_id, token)
+                return IngestOutcome.STALE
             return IngestOutcome.FAILED
 
         main_key = public_main_key(product_id, token)
@@ -106,13 +116,36 @@ class ImageIngestService:
         for name, data in processed.thumbnails.items():
             await self._store.put_bytes(public_thumb_key(product_id, token, name), data, content_type=_WEBP)
 
-        applied = await self._repo.mark_image_ready(product_id, token, main_key)
+        outbox = await self._product_updated_outbox(product_id)
+        applied = await self._repo.mark_image_ready(product_id, token, main_key, outbox=outbox)
         await self._dedup.set(dedup_key, "1", ex=self._ttl)
         if not applied:  # a newer upload superseded this one between download and write
             log.info("product %s image %s superseded (stale event)", product_id, token)
             return IngestOutcome.STALE
         log.info("product %s image ready: %s", product_id, main_key)
         return IngestOutcome.READY
+
+    async def _product_updated_outbox(self, product_id: uuid.UUID) -> tuple[str, str] | None:
+        """Build the ``ProductUpdated`` outbox row for an image-state change.
+
+        The image flip only changes ``image_key``/``image_status`` but that alters
+        the cached product response (``image_url``/``image_status``), so it must
+        publish ``ProductUpdated`` to invalidate the read-cache — event-driven, same
+        as an ordinary edit. Product fields are unchanged by the flip, so the
+        current row supplies them; ``None`` if the product is gone (the guarded
+        UPDATE will then also be a no-op, so nothing is emitted).
+        """
+        product = await self._repo.get_product(product_id)
+        if product is None:
+            return None
+        event = product_updated_outbox(
+            product_id=product_id,
+            merchant_id=product.merchant_id,
+            name=product.name,
+            price=product.price,
+            category=product.category,
+        )
+        return event
 
 
 def _self_check() -> None:  # pragma: no cover - runnable smoke test
@@ -133,10 +166,17 @@ def _self_check() -> None:  # pragma: no cover - runnable smoke test
             self._apply = apply_ready
             self.failed: list[uuid.UUID] = []
 
-        async def mark_image_ready(self, product_id: uuid.UUID, token: str, image_key: str) -> bool:
+        async def get_product(self, product_id: uuid.UUID):
+            return None
+
+        async def mark_image_ready(
+            self, product_id: uuid.UUID, token: str, image_key: str, outbox: tuple[str, str] | None = None
+        ) -> bool:
             return self._apply
 
-        async def mark_image_failed(self, product_id: uuid.UUID, token: str) -> bool:
+        async def mark_image_failed(
+            self, product_id: uuid.UUID, token: str, outbox: tuple[str, str] | None = None
+        ) -> bool:
             self.failed.append(product_id)
             return True
 
@@ -154,14 +194,33 @@ def _self_check() -> None:  # pragma: no cover - runnable smoke test
         # Duplicate event → DUPLICATE, no processing.
         dedup = _Dedup()
         dedup.seen.add(f"image:{valid_key}:etag")
-        svc = ImageIngestService(_Repo(True), _Store(), dedup, max_dimension=64, max_bytes=1000, dedup_ttl_seconds=60)
+        svc = ImageIngestService(
+            _Repo(True), _Store(), dedup, max_dimension=64, max_bytes=1000, max_pixels=1_000_000, dedup_ttl_seconds=60
+        )
         assert await svc.ingest(valid_key, "etag") is IngestOutcome.DUPLICATE
 
         # Non-product key → SKIPPED.
         svc2 = ImageIngestService(
-            _Repo(True), _Store(), _Dedup(), max_dimension=64, max_bytes=1000, dedup_ttl_seconds=60
+            _Repo(True),
+            _Store(),
+            _Dedup(),
+            max_dimension=64,
+            max_bytes=1000,
+            max_pixels=1_000_000,
+            dedup_ttl_seconds=60,
         )
         assert await svc2.ingest("something/else.txt", "e") is IngestOutcome.SKIPPED
+
+        # An image-state change emits ProductUpdated so the read-cache is invalidated.
+        class _RowRepo(_Repo):
+            async def get_product(self, product_id: uuid.UUID):
+                return SimpleNamespace(merchant_id=uuid.uuid4(), name="Widget", price=Decimal("9.99"), category="misc")
+
+        svc3 = ImageIngestService(
+            _RowRepo(True), _Store(), _Dedup(), max_dimension=64, max_bytes=1, max_pixels=1, dedup_ttl_seconds=60
+        )
+        outbox = await svc3._product_updated_outbox(pid)
+        assert outbox is not None and outbox[0] == "ProductUpdated" and str(pid) in outbox[1]
 
     asyncio.run(_run())
     print("OK image_ingest self-check passed")

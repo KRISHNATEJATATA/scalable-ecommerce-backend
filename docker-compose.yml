@@ -14,6 +14,7 @@ services:
       S3_BUCKET: ecommerce-uploads
       S3_PUBLIC_BASE_URL: http://localhost:4566/ecommerce-uploads
       IMAGE_QUEUE_URL: http://localstack:4566/000000000000/image-uploads
+      CATALOG_CACHE_QUEUE_URL: http://localstack:4566/000000000000/catalog-cache
       SQS_ENDPOINT_URL: http://elasticmq:9324
       SQS_QUEUE_URL: http://elasticmq:9324/queue/emails
       BUS_ENDPOINT_URL: http://localstack:4566
@@ -172,6 +173,31 @@ services:
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
     command: ["python", "-m", "src.catalog.adapters.image_worker"]
+
+  # The `service`-role catalog cache worker: drains ProductUpdated/ProductDeleted
+  # from the catalog-cache queue → evicts the product from the Valkey read-cache.
+  cache-worker:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      bus-setup:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ecommerce:ecommerce@postgres:5432/ecommerce
+      VALKEY_URL: redis://valkey:6379/0
+      CATALOG_CACHE_QUEUE_URL: http://localstack:4566/000000000000/catalog-cache
+      BUS_ENDPOINT_URL: http://localstack:4566
+      BUS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    command: ["python", "-m", "src.catalog.adapters.cache_worker"]
 
   # IdP: imports the ecommerce realm (consumer/merchant/admin roles + clients) on boot.
   keycloak:

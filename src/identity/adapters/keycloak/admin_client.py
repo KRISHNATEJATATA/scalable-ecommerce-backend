@@ -11,6 +11,8 @@ passed straight through as the admin ``user_id``.
 
 from __future__ import annotations
 
+import asyncio
+
 from keycloak.exceptions import KeycloakGetError
 
 from keycloak import KeycloakAdmin, KeycloakOpenIDConnection
@@ -65,18 +67,42 @@ class KeycloakIdentityAdmin:
             return None
         return user.get("email")
 
-    async def create_user(self, email: str, temporary_password: str) -> str:
+    async def create_user(self, email: str) -> str:
         """Create a new Keycloak account (``consumer`` default role, per Keycloak realm
-        config) and return its ``sub``. The caller sets a temporary password; Keycloak
-        owns the credential/refresh story from here on.
+        config), email it a set-up link, and return its ``sub``.
+
+        No credential is passed through this API — the spec forbids the app ever
+        seeing passwords. The account is created with ``UPDATE_PASSWORD`` (and
+        ``VERIFY_EMAIL``, since the address is unverified) required actions, and we
+        immediately send Keycloak's **execute-actions email** so the user actually
+        receives the link to set their password. Without that email a
+        credentialless account can never authenticate. Keycloak (the credential
+        authority) owns the password/refresh story from there on.
+
+        Create + email are made effectively atomic: if the email send fails **or
+        the call is cancelled**, the just-created (credentialless, unauthenticatable)
+        account is deleted, so a retry starts clean instead of colliding with an
+        orphaned half-provisioned user on the ``UNIQUE(email)`` constraint. The
+        compensating delete is shielded so a cancellation can't abort the cleanup
+        itself.
         """
         kc = await self._client()
-        return await kc.a_create_user(
+        actions = ["UPDATE_PASSWORD", "VERIFY_EMAIL"]
+        user_sub = await kc.a_create_user(
             {
                 "email": email,
                 "username": email,
                 "enabled": True,
                 "emailVerified": False,
-                "credentials": [{"type": "password", "value": temporary_password, "temporary": True}],
+                "requiredActions": actions,
             }
         )
+        try:
+            await kc.a_send_update_account(user_id=user_sub, payload=actions)
+        except BaseException:
+            # BaseException (not Exception) so a cancellation during the email send
+            # also triggers compensation; shield the delete so the cancellation
+            # can't abort the rollback and re-orphan the account.
+            await asyncio.shield(kc.a_delete_user(user_sub))
+            raise
+        return user_sub

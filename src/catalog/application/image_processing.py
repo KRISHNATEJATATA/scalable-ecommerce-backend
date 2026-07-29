@@ -64,7 +64,9 @@ def _encode_webp(img: Image.Image, max_dimension: int) -> tuple[bytes, int, int]
     return buf.getvalue(), clamped.width, clamped.height
 
 
-def process_image(raw: bytes, *, max_dimension: int, max_bytes: int, claimed_mime: str | None = None) -> ProcessedImage:
+def process_image(
+    raw: bytes, *, max_dimension: int, max_bytes: int, max_pixels: int, claimed_mime: str | None = None
+) -> ProcessedImage:
     """Sniff + re-encode + thumbnail. Raises ``UnsupportedImageError`` on any reject.
 
     The image is marked usable by the caller ONLY if this returns — a spoofed or
@@ -73,6 +75,11 @@ def process_image(raw: bytes, *, max_dimension: int, max_bytes: int, claimed_mim
     type must match it: bytes whose actual type differs from what was claimed are
     rejected even if they are themselves a valid image (spoof defense — AC "real
     bytes don't match its claimed type").
+
+    ``max_pixels`` is the decompression-bomb guard: the source ``width * height``
+    is checked from the **header** (``Image.open`` reads dimensions without
+    decoding pixels) and rejected BEFORE ``load()`` allocates the full raster, so
+    a small file declaring huge dimensions can't exhaust memory.
     """
     if len(raw) > max_bytes:  # defense in depth; the S3 presign policy is the first gate
         raise UnsupportedImageError(f"upload exceeds {max_bytes} bytes")
@@ -85,8 +92,15 @@ def process_image(raw: bytes, *, max_dimension: int, max_bytes: int, claimed_mim
 
     try:
         with Image.open(io.BytesIO(raw)) as opened:
+            # Header-only dimension check: reject a decompression bomb BEFORE load()
+            # allocates the raster (width/height are known without decoding pixels).
+            width, height = opened.size
+            if width * height > max_pixels:
+                raise UnsupportedImageError(f"image {width}x{height} exceeds {max_pixels} source pixels")
             opened.load()
             rgb = opened.convert("RGB")
+    except UnsupportedImageError:
+        raise
     except Exception as exc:  # boundary: any decode failure is a rejected upload
         raise UnsupportedImageError("could not decode image") from exc
 
@@ -106,7 +120,7 @@ def _self_check() -> None:  # pragma: no cover - runnable smoke test
     jpeg_bytes = buf.getvalue()
 
     try:
-        out = process_image(jpeg_bytes, max_dimension=2048, max_bytes=5_000_000)
+        out = process_image(jpeg_bytes, max_dimension=2048, max_bytes=5_000_000, max_pixels=40_000_000)
     except ImportError:
         # No libmagic on this host (e.g. Windows dev box): skip magic-dependent asserts.
         print("SKIP magic asserts (libmagic unavailable); run inside the Docker image to exercise sniffing")
@@ -122,15 +136,26 @@ def _self_check() -> None:  # pragma: no cover - runnable smoke test
 
     # Spoofed / non-image bytes are rejected.
     try:
-        process_image(b"not an image at all" * 10, max_dimension=2048, max_bytes=5_000_000)
+        process_image(b"not an image at all" * 10, max_dimension=2048, max_bytes=5_000_000, max_pixels=40_000_000)
     except UnsupportedImageError:
         pass
     else:
         raise AssertionError("non-image bytes were not rejected")
 
+    # Decompression-bomb guard: source pixels over the cap are rejected from the
+    # header, before the raster is decoded (here forced via a tiny max_pixels).
+    try:
+        process_image(jpeg_bytes, max_dimension=2048, max_bytes=5_000_000, max_pixels=1000)
+    except UnsupportedImageError:
+        pass
+    else:
+        raise AssertionError("oversized-dimension image was not rejected")
+
     # Real JPEG bytes but a mismatched CLAIMED type → rejected (spoof defense).
     try:
-        process_image(jpeg_bytes, max_dimension=2048, max_bytes=5_000_000, claimed_mime="image/png")
+        process_image(
+            jpeg_bytes, max_dimension=2048, max_bytes=5_000_000, max_pixels=40_000_000, claimed_mime="image/png"
+        )
     except UnsupportedImageError:
         pass
     else:

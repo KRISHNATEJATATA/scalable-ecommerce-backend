@@ -476,11 +476,7 @@ components:
           type: string
           minLength: 3
           maxLength: 320
-        temporary_password:
-          type: string
-          minLength: 8
-          maxLength: 128
-      required: [email, temporary_password]
+      required: [email]
     CreateUserResponse:
       type: object
       properties:

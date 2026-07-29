@@ -25,7 +25,7 @@ from src.catalog.application.image_processing import (  # noqa: E402
     sniff_mime,
 )
 
-_LIMITS = {"max_dimension": 2048, "max_bytes": 5_000_000}
+_LIMITS = {"max_dimension": 2048, "max_bytes": 5_000_000, "max_pixels": 40_000_000}
 
 
 def _jpeg_with_exif() -> bytes:
@@ -72,7 +72,14 @@ def test_claimed_type_match_is_accepted():
 
 def test_oversize_rejected_before_decode():
     with pytest.raises(UnsupportedImageError):
-        process_image(b"x" * 10, max_dimension=2048, max_bytes=5)
+        process_image(b"x" * 10, max_dimension=2048, max_bytes=5, max_pixels=40_000_000)
+
+
+def test_decompression_bomb_rejected_before_decode():
+    # A valid image whose source dimensions exceed the pixel cap is rejected from
+    # the header, before load() allocates the full raster (memory-exhaustion guard).
+    with pytest.raises(UnsupportedImageError):
+        process_image(_jpeg_with_exif(), max_dimension=2048, max_bytes=5_000_000, max_pixels=1000)
 
 
 def test_sniff_reads_real_bytes():

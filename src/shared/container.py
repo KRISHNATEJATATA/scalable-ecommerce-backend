@@ -16,9 +16,11 @@ from typing import Annotated
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.catalog.adapters.cache import ValkeyProductCache
 from src.catalog.adapters.db.repository import CatalogRepository
 from src.catalog.adapters.s3_images import ImageStore
 from src.catalog.application.service import CatalogService
+from src.catalog.ports.cache import ProductCachePort
 from src.catalog.ports.repository import CatalogRepositoryPort
 from src.catalog.ports.storage import ImageStorePort
 from src.identity.adapters.db.repository import IdentityRepository
@@ -56,12 +58,40 @@ def get_image_store(request: Request) -> ImageStorePort | None:
     return ImageStore(s3, request.app.state.settings.s3_bucket)
 
 
+def get_product_cache(request: Request) -> ProductCachePort | None:
+    """Provide the Valkey product read-cache, or ``None`` if disabled/unavailable.
+
+    ``None`` (feature flag off, or no Valkey on a bare test app) makes the catalog
+    service fall straight through to the DB, so cache wiring never breaks reads.
+    """
+    settings = request.app.state.settings
+    if not settings.product_cache_enabled:
+        return None
+    valkey = getattr(request.app.state, "valkey", None)
+    if valkey is None:
+        return None
+    return ValkeyProductCache(
+        valkey,
+        ttl_seconds=settings.product_cache_ttl_seconds,
+        ttl_jitter_seconds=settings.product_cache_ttl_jitter_seconds,
+        lock_ttl_seconds=settings.product_cache_lock_ttl_seconds,
+        negative_ttl_seconds=settings.product_cache_negative_ttl_seconds,
+    )
+
+
 def get_catalog_service(
+    request: Request,
     repo: Annotated[CatalogRepositoryPort, Depends(get_catalog_repository)],
     image_store: Annotated[ImageStorePort | None, Depends(get_image_store)],
+    cache: Annotated[ProductCachePort | None, Depends(get_product_cache)],
 ) -> CatalogService:
-    """Provide the catalog service over its repository + image-store ports."""
-    return CatalogService(repo, image_store)
+    """Provide the catalog service over its repository + image-store + cache ports."""
+    return CatalogService(
+        repo,
+        image_store,
+        cache,
+        lock_ttl_seconds=request.app.state.settings.product_cache_lock_ttl_seconds,
+    )
 
 
 # --- orders ---------------------------------------------------------------

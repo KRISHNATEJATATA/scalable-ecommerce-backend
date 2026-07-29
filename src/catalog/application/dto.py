@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 from src.catalog.domain.image_status import ImageStatus
 from src.shared.config.setting import get_settings
@@ -22,7 +22,14 @@ def _public_image_url(image_key: str | None, image_status: ImageStatus) -> str |
     if image_status != ImageStatus.READY or not image_key:
         return None
     settings = get_settings()
-    base = settings.s3_public_base_url or f"{settings.s3_endpoint_url}/{settings.s3_bucket}"
+    base = settings.s3_public_base_url or (
+        f"{settings.s3_endpoint_url}/{settings.s3_bucket}" if settings.s3_endpoint_url else None
+    )
+    if not base:
+        # No public base configured → refuse to emit a broken ``None/<bucket>/<key>``
+        # URL. Startup validation (AppSettings) fails-fast in prod; this guards any
+        # remaining misconfiguration rather than serving a malformed link.
+        raise RuntimeError("s3_public_base_url (or s3_endpoint_url) must be configured to serve product image URLs")
     return f"{base.rstrip('/')}/{image_key}"
 
 
@@ -74,3 +81,16 @@ class ProductUpdate(BaseModel):
     description: str | None = None
     category: str | None = Field(default=None, max_length=255)
     price: Decimal | None = Field(default=None, gt=0, max_digits=12, decimal_places=2)
+
+    @model_validator(mode="after")
+    def _reject_explicit_null(self) -> ProductUpdate:
+        """A NOT-NULL column may be omitted (untouched) but never set to ``null``.
+
+        ``name``/``price`` back NOT-NULL columns: an explicit ``null`` in the body
+        would otherwise pass through ``exclude_unset`` and hit the DB as a NOT-NULL
+        violation (500). Reject it at the trust boundary as a 422 instead.
+        """
+        for field in ("name", "price"):
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(f"{field} may be omitted but not null")
+        return self

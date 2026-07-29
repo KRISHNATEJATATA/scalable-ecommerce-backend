@@ -13,7 +13,7 @@ latter would break test collection and any env without config.
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, PostgresDsn
+from pydantic import Field, PostgresDsn, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -45,6 +45,20 @@ class AppSettings(BaseSettings):
     # --- Valkey (ephemeral state: rate-limit counters, idempotency keys) ---
     valkey_url: str = "redis://localhost:6379/0"
 
+    # --- Product read-cache ---
+    # Single-product reads are cached under ``product:{id}`` and invalidated by the
+    # catalog-cache consumer on ProductUpdated/ProductDeleted. Jittered TTL + a
+    # SET NX fill-lock guard a hot key against a cache-stampede.
+    product_cache_enabled: bool = True
+    product_cache_ttl_seconds: int = Field(default=300, gt=0)  # base entry TTL
+    product_cache_ttl_jitter_seconds: int = Field(default=60, ge=0)  # random 0..N added (anti-stampede)
+    product_cache_lock_ttl_seconds: int = Field(default=5, gt=0)  # fill-lock TTL (self-heals a crashed filler)
+    product_cache_negative_ttl_seconds: int = Field(
+        default=10, gt=0
+    )  # 404 tombstone TTL (short: a later create shows up fast)
+    # SQS queue the catalog-cache invalidation consumer drains. LocalStack locally.
+    catalog_cache_queue_url: str | None = None
+
     # --- Auth: OIDC via Keycloak (app is a pure resource server, Phase 5) ---
     # The app only VALIDATES Keycloak-issued RS256 tokens (JWKS). Keycloak owns
     # login/refresh/passwords. Algorithm is hardcoded to RS256 (alg:none guard).
@@ -72,10 +86,11 @@ class AppSettings(BaseSettings):
     # product images UNSIGNED. None → fall back to f"{s3_endpoint_url}/{s3_bucket}".
     s3_public_base_url: str | None = None
 
-    # --- Secure image uploads + worker (Phase 8) ---
-    image_max_upload_bytes: int = 5 * 1024 * 1024  # presign policy ceiling (5 MiB)
-    image_max_dimension: int = 2048  # worker re-encode clamp (px, longest side)
-    image_upload_ttl_seconds: int = 300  # presigned-POST validity (~5 min)
+    # --- Secure image uploads + worker ---
+    image_max_upload_bytes: int = Field(default=5 * 1024 * 1024, gt=0)  # presign policy ceiling (5 MiB)
+    image_max_dimension: int = Field(default=2048, gt=0)  # worker re-encode clamp (px, longest side)
+    image_max_source_pixels: int = Field(default=40_000_000, gt=0)  # ~40MP decompression-bomb guard (pre-decode)
+    image_upload_ttl_seconds: int = Field(default=300, gt=0)  # presigned-POST validity (~5 min)
     # SQS queue the ImageWorker drains (S3 ObjectCreated → SQS). LocalStack locally.
     image_queue_url: str | None = None
 
@@ -90,11 +105,32 @@ class AppSettings(BaseSettings):
     bus_endpoint_url: str | None = None
     bus_region: str = "us-east-1"
     bus_topic_prefix: str = "ecommerce-"  # SNS topic name = f"{prefix}{EventType}"
-    relay_batch_size: int = 100
-    relay_poll_interval_seconds: float = 1.0
-    consumer_max_messages: int = 10  # SQS receive batch (max 10)
-    consumer_wait_time_seconds: int = 10  # SQS long-poll seconds
-    consumer_dedup_ttl_seconds: int = 86400  # event-dedup TTL (~24h; the DB write is the real guard)
+    relay_batch_size: int = Field(default=100, gt=0)
+    relay_poll_interval_seconds: float = Field(default=1.0, gt=0)
+    consumer_max_messages: int = Field(default=10, ge=1, le=10)  # SQS receive batch (max 10)
+    consumer_wait_time_seconds: int = Field(default=10, ge=0, le=20)  # SQS long-poll seconds
+    consumer_dedup_ttl_seconds: int = Field(default=86400, gt=0)  # completion-marker TTL (~24h)
+    # Short processing-lease TTL: a claim expires this fast, so a worker that
+    # crashes mid-handle releases the event for redrive instead of blocking it for
+    # the full dedup TTL. Keep it <= the SQS queue's visibility timeout (i.e. set
+    # the queue visibility >= this) so a crashed worker's lease has expired by the
+    # time SQS redelivers — otherwise the redelivery keeps finding a held lease,
+    # bounces, and prematurely hits maxReceiveCount → DLQ. bus_bootstrap sets the
+    # local queue visibility from this value.
+    consumer_lease_ttl_seconds: int = Field(default=60, gt=0)
+
+    @model_validator(mode="after")
+    def _require_public_image_base_in_cloud(self) -> "AppSettings":
+        """Fail-fast: a real-AWS deploy serving images MUST set the public CDN base.
+
+        When ``s3_bucket`` is set but ``s3_endpoint_url`` is ``None`` (real AWS S3,
+        i.e. staging/prod), ``s3_public_base_url`` is the only way to build an
+        unsigned image URL — without it product responses would emit a broken
+        ``None/<bucket>/<key>`` link. Reject the config at startup instead.
+        """
+        if self.s3_bucket and self.s3_endpoint_url is None and not self.s3_public_base_url:
+            raise ValueError("s3_public_base_url is required when s3_bucket is set without s3_endpoint_url (real AWS)")
+        return self
 
 
 @lru_cache

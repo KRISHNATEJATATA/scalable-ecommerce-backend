@@ -117,5 +117,5 @@ def test_request_dto_ignores_unexpected_privileged_field() -> None:
     """Mass-assignment guard (AC1): a body field the DTO doesn't declare is dropped, not bound."""
     from src.identity.api.schemas import CreateUserRequest
 
-    dto = CreateUserRequest.model_validate({"email": "a@b.com", "temporary_password": "pw-123456", "role": "admin"})
+    dto = CreateUserRequest.model_validate({"email": "a@b.com", "role": "admin"})
     assert not hasattr(dto, "role")

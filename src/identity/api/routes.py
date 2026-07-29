@@ -43,7 +43,7 @@ async def create_user(
     body: CreateUserRequest, service: AdminServiceDep, _admin_user: CurrentUserDep
 ) -> CreateUserResponse:
     """Create a new Keycloak account (admin only); Keycloak defaults the role to ``consumer``."""
-    sub = await service.create_user(body.email, body.temporary_password)
+    sub = await service.create_user(body.email)
     return CreateUserResponse(sub=sub)
 
 

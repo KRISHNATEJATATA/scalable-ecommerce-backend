@@ -28,6 +28,7 @@ log = logging.getLogger("bus_bootstrap")
 # end-to-end loop (relay → SNS → SQS → consumer → DLQ) is exercisable locally.
 CONSUMERS: dict[str, list[str]] = {
     "order-events": ["OrderPlaced"],
+    "catalog-cache": ["ProductUpdated", "ProductDeleted"],
 }
 MAX_RECEIVE_COUNT = 5
 
@@ -50,11 +51,21 @@ async def _queue_arn(sqs, url: str) -> str:
     return resp["Attributes"]["QueueArn"]
 
 
-async def _ensure_consumer(sqs, sns, name: str, topics: dict[str, str], event_types: list[str]) -> None:
+async def _ensure_consumer(
+    sqs, sns, name: str, topics: dict[str, str], event_types: list[str], visibility_timeout: int
+) -> None:
     dlq = (await sqs.create_queue(QueueName=f"{name}-dlq"))["QueueUrl"]
     dlq_arn = await _queue_arn(sqs, dlq)
     redrive = json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": MAX_RECEIVE_COUNT})
-    queue = (await sqs.create_queue(QueueName=name, Attributes={"RedrivePolicy": redrive}))["QueueUrl"]
+    # VisibilityTimeout >= the consumer's processing-lease TTL, so a crashed
+    # worker's lease has expired before SQS redelivers (no premature DLQ; see
+    # AppSettings.consumer_lease_ttl_seconds and docs/DEPLOYMENT.md).
+    attributes = {"RedrivePolicy": redrive, "VisibilityTimeout": str(visibility_timeout)}
+    queue = (await sqs.create_queue(QueueName=name, Attributes=attributes))["QueueUrl"]
+    # create_queue only applies Attributes when it *creates* the queue; an already
+    # existing queue keeps its old settings. Re-apply so a changed lease/visibility
+    # invariant actually lands on re-run (idempotent bootstrap).
+    await sqs.set_queue_attributes(QueueUrl=queue, Attributes=attributes)
     queue_arn = await _queue_arn(sqs, queue)
     for event_type in event_types:
         await sns.subscribe(
@@ -69,10 +80,11 @@ async def _ensure_consumer(sqs, sns, name: str, topics: dict[str, str], event_ty
 
 async def bootstrap() -> None:
     settings = get_settings()
+    visibility_timeout = settings.consumer_lease_ttl_seconds
     async with sns_client(settings) as sns, sqs_client(settings) as sqs:
         topics = await _ensure_topics(sns, settings.bus_topic_prefix)
         for name, event_types in CONSUMERS.items():
-            await _ensure_consumer(sqs, sns, name, topics, event_types)
+            await _ensure_consumer(sqs, sns, name, topics, event_types, visibility_timeout)
 
 
 if __name__ == "__main__":

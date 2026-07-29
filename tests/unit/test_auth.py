@@ -106,9 +106,9 @@ class _FakeAdmin:
     async def get_user_email(self, user_sub: str) -> str | None:
         return self.emails.get(user_sub)
 
-    async def create_user(self, email: str, temporary_password: str) -> str:
+    async def create_user(self, email: str) -> str:
         sub = str(uuid.uuid4())
-        self.created.append((email, temporary_password))
+        self.created.append(email)
         self.emails[sub] = email
         return sub
 
@@ -281,12 +281,12 @@ async def test_admin_creates_user_201(app_ctx, rsa_key):
         resp = await client.post(
             "/v1/admin/users",
             headers=_auth(token),
-            json={"email": "new-user@test.io", "temporary_password": "temp-pass-1"},
+            json={"email": "new-user@test.io"},
         )
     assert resp.status_code == 201, resp.text
     body = resp.json()
     assert "sub" in body
-    assert ("new-user@test.io", "temp-pass-1") in app_ctx.state.identity_admin.created
+    assert "new-user@test.io" in app_ctx.state.identity_admin.created
 
 
 async def test_disable_non_provisioned_user_still_blocks_future_login(app_ctx, rsa_key):

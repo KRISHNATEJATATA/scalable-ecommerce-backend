@@ -44,6 +44,7 @@ flowchart TD
   KC[("Keycloak (OIDC IdP)<br/>token issuance · JWKS · Admin API")]
   Relay["Relay (service role)<br/>outbox → SNS · SKIP LOCKED"]
   IMG["Image worker (service role)<br/>S3 event → sniff · re-encode · thumbnails"]
+  CW["Cache worker (service role)<br/>ProductUpdated/Deleted → invalidate Valkey"]
 
   Client --> MW --> Route
   Route --> Schema --> Service
@@ -61,6 +62,8 @@ flowchart TD
   S3 -.->|ObjectCreated → SQS| IMG
   IMG -->|write public webp + thumbs| S3
   IMG -->|mark image_status ready/failed| PG
+  SQS -.->|ProductUpdated/Deleted| CW
+  CW -->|invalidate product:{id}| VK
   Route -.-> Errors
   App -.-> Log
 ```
@@ -115,10 +118,43 @@ PKCE against Keycloak; the API only validates the tokens Keycloak issues.
 
 ## Valkey usage
 
-Ephemeral shared state **only**: rate-limit counters and idempotency keys (no JWT
-`jti` denylist — Keycloak + short token TTL own revocation). Prod = ElastiCache
-for Valkey replication group (Multi-AZ) so the one shared dependency isn't a SPOF.
-Not for sessions/caching (product-listing read cache is a later watch-item).
+Ephemeral shared state: rate-limit counters, idempotency keys, event-dedup keys,
+and the **product read-cache** (no JWT `jti` denylist — Keycloak + short token TTL
+own revocation). Prod = ElastiCache for Valkey replication group (Multi-AZ) so the
+one shared dependency isn't a SPOF.
+
+### Product read-cache (cache-aside)
+
+Single-product reads (`GET /products/{id}`) are cached aside under `product:{id}`
+(the serialized `ProductResponse`). On a miss, a `SET NX` **fill-lock**
+(`product:lock:{id}`, held with a unique token and released by compare-and-delete
+so a caller can never delete another's re-acquired lock) elects one caller to read
+the DB and populate the cache; that caller **re-checks the cache after acquiring
+the lock** (double-checked fill), **renews the lock while it reads the DB** so even
+a slow fill never lets the lock lapse and a second filler start, and concurrent
+callers **wait while the lock is held** rather than racing the DB — so a hot key
+never stampedes the DB, and there is no fixed waiter timeout that could permit a
+duplicate read on a legitimately slow fill. Entries carry a **jittered TTL**
+(`ttl + rand(0..jitter)`) so co-populated keys don't expire in lockstep.
+Invalidation is **event-driven**: the `catalog-cache` consumer subscribes
+`ProductUpdated`/`ProductDeleted` and evicts the key (idempotent — a `DELETE` of
+an absent key is a no-op). Product edits *and* image-state changes both feed this:
+the image worker's `mark_image_ready`/`mark_image_failed` emit `ProductUpdated`
+through the same transactional outbox (in the txn that flips the image state), and
+starting a re-upload (`ready` → `pending`) emits it too, so a newly-ready image's
+`image_url` never lingers stale behind a cached response. Image transitions are
+guarded on `image_status = 'pending'`, so a redelivered worker event can't emit a
+duplicate invalidation. Invalidation and a concurrent fill are serialized by the
+**fill lock itself**: invalidation atomically deletes the cached value *and the
+lock*, and the filler stores only while it still owns the lock (compare-and-set) —
+so a fill that began before an update finds its lock gone and its stale read is
+dropped, with no separate (expiring, hence racy) generation counter. A confirmed
+404 is **negative-cached** under a short-TTL tombstone so a burst of misses on an
+absent id doesn't stampede the DB; a cache entry that no longer deserializes is
+evicted and refilled rather than silently degrading every read. If Valkey is
+unavailable the read **degrades to a direct DB read** rather than erroring. The
+listing hot path stays uncached. Staleness is bounded by the relay poll + the
+entry TTL.
 
 ## Domain events
 

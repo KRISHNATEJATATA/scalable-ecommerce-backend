@@ -17,11 +17,12 @@ class CreateUserRequest(BaseModel):
     """Admin request to provision a brand-new Keycloak account.
 
     No ``role`` field: Keycloak defaults new users to ``consumer`` — the app
-    never accepts a role from request input (privilege-escalation guard).
+    never accepts a role from request input (privilege-escalation guard). No
+    password field either: the spec forbids credentials passing through this API;
+    Keycloak drives password setup (``UPDATE_PASSWORD`` required action).
     """
 
     email: str = Field(min_length=3, max_length=320)
-    temporary_password: str = Field(min_length=8, max_length=128)
 
 
 class CreateUserResponse(BaseModel):

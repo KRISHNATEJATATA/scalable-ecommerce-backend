@@ -1,6 +1,6 @@
 """Transactional-outbox → SNS/SQS event bus.
 
-The domain writes business state **and** an ``outbox`` row in one transaction; 
+The domain writes business state **and** an ``outbox`` row in one transaction;
 this package is everything that happens *after* that commit:
 
 - :class:`~src.shared.bus.relay.OutboxRelay` (``run_relay``) — a ``service``-role

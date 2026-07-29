@@ -47,6 +47,7 @@ class ImageWorker:
         *,
         max_dimension: int,
         max_bytes: int,
+        max_pixels: int,
         dedup_ttl_seconds: int,
         max_messages: int = 10,
         wait_time_seconds: int = 10,
@@ -58,6 +59,7 @@ class ImageWorker:
         self._queue_url = queue_url
         self._max_dimension = max_dimension
         self._max_bytes = max_bytes
+        self._max_pixels = max_pixels
         self._ttl = dedup_ttl_seconds
         self._max_messages = max_messages
         self._wait = wait_time_seconds
@@ -76,6 +78,7 @@ class ImageWorker:
                 self._valkey,
                 max_dimension=self._max_dimension,
                 max_bytes=self._max_bytes,
+                max_pixels=self._max_pixels,
                 dedup_ttl_seconds=self._ttl,
             )
             await service.ingest(key, etag)
@@ -122,6 +125,7 @@ async def run_worker(settings: AppSettings, sessionmaker: async_sessionmaker, va
             settings.image_queue_url,
             max_dimension=settings.image_max_dimension,
             max_bytes=settings.image_max_upload_bytes,
+            max_pixels=settings.image_max_source_pixels,
             dedup_ttl_seconds=settings.consumer_dedup_ttl_seconds,
             max_messages=settings.consumer_max_messages,
             wait_time_seconds=settings.consumer_wait_time_seconds,

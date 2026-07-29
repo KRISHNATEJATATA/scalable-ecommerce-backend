@@ -441,7 +441,23 @@ async def test_mark_image_ready_is_token_guarded(sessionmaker):
     assert row.image_key == "public/current.webp"  # the stale event never clobbered it
 
 
-async def test_mark_image_failed_is_token_guarded(sessionmaker):
+async def test_mark_image_ready_emits_outbox_only_when_applied(sessionmaker):
+    """A landed image-ready flip writes its ProductUpdated outbox row in the same
+    txn (so the read-cache is invalidated); a stale (superseded) flip writes none."""
+    from src.catalog.adapters.db.repository import CatalogRepository
+
+    pid = await _seed_pending(sessionmaker, "tokB")
+    outbox = ("ProductUpdated", '{"type":"ProductUpdated"}')
+    async with sessionmaker() as s:
+        repo = CatalogRepository(s)
+        assert await repo.mark_image_ready(pid, "tokA", "public/stale.webp", outbox=outbox) is False  # stale
+        assert await repo.mark_image_ready(pid, "tokB", "public/current.webp", outbox=outbox) is True  # applied
+    async with sessionmaker() as s:
+        count = (
+            await s.execute(text("SELECT count(*) FROM catalog.outbox WHERE event_type = 'ProductUpdated'"))
+        ).scalar_one()
+    assert count == 1  # exactly one outbox row — only the applied flip emitted
+
     from src.catalog.adapters.db.repository import CatalogRepository
 
     pid = await _seed_pending(sessionmaker, "tokB")

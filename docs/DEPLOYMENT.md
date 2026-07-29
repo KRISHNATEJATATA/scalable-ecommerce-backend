@@ -27,6 +27,25 @@ terraform apply -var "image_tag=$SHA"
 The ECS service runs multiple identical Fargate tasks (monolith-with-replicas)
 behind the ALB. The task role grants S3 access — **no AWS keys in code or env**.
 
+### Service-role workers (separate Fargate services)
+
+Alongside the web tasks, run each `service`-role worker as its own long-running
+ECS service (same image, different `command`, no ALB target — scaled on queue
+depth):
+
+| Worker | Command | Drains | Purpose |
+|---|---|---|---|
+| Relay | `python -m src.shared.bus.relay` | Postgres `outbox` | ships unpublished rows → SNS (SKIP LOCKED) |
+| Image worker | `python -m src.catalog.adapters.image_worker` | `image-uploads` | sniff · re-encode · thumbnails → `image_status` |
+| Cache worker | `python -m src.catalog.adapters.cache_worker` | `catalog-cache` | invalidate Valkey read-cache on `ProductUpdated`/`ProductDeleted` |
+
+Each drains a standard SQS queue with a DLQ; set the queue **visibility timeout ≥
+the consumer's processing lease** (`CONSUMER_LEASE_TTL_SECONDS`) so a crashed
+worker's in-flight message is redelivered rather than lost or double-processed.
+Losing the cache worker degrades read latency (more DB reads, staleness bounded by
+`PRODUCT_CACHE_TTL_SECONDS`) but is not a correctness incident; losing the relay or
+image worker stalls events/uploads until it recovers (both replay safely).
+
 ## Migrations (one-off task, not at app boot)
 
 Run Alembic as a dedicated one-off ECS task against RDS, before shifting traffic:

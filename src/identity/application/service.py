@@ -76,6 +76,10 @@ class IdentityAdminService:
                 await self._repo.get_or_create(oidc_sub, email)
                 await self._repo.set_active(oidc_sub, False)
 
-    async def create_user(self, email: str, temporary_password: str) -> str:
-        """Create a new Keycloak account and return its ``sub`` (admin only)."""
-        return await self._admin.create_user(email, temporary_password)
+    async def create_user(self, email: str) -> str:
+        """Create a new Keycloak account and return its ``sub`` (admin only).
+
+        No credential passes through this API (spec: the API never sees passwords) —
+        Keycloak drives password setup via an ``UPDATE_PASSWORD`` required action.
+        """
+        return await self._admin.create_user(email)

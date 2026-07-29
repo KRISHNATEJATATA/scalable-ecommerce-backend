@@ -1,8 +1,9 @@
 """Async Valkey client (redis-py-compatible).
 
-Holds ephemeral shared state only: rate-limit counters, idempotency keys, and
-the JWT ``jti`` denylist (TTL = token remaining life). Not for sessions/caching.
-Wired in a later phase.
+Holds ephemeral shared state: rate-limit counters, idempotency keys, event-dedup
+keys, and the **product read-cache** (cache-aside entries + fill-locks). Not in
+the auth path — revocation is Keycloak's short token TTL, not
+an app-side ``jti`` denylist. Wired into the app lifespan (``src/app.py``).
 """
 
 from valkey.asyncio import Valkey
