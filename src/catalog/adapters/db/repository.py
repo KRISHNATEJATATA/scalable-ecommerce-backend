@@ -7,7 +7,7 @@ read model (skips ORM hydration). It still reuses the shared cursor codec and
 
 ports/repos return ORM models / this read-model dataclass, not
 hand-mapped domain entities — those would be anemic pass-throughs today. Add a
-domain layer when real catalog behavior arrives. Services (ticket 03) map these
+domain layer when real catalog behavior arrives. Services map these
 to Pydantic response schemas.
 """
 

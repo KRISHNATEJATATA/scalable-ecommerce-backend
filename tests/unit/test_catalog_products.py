@@ -1,4 +1,4 @@
-"""Catalog product CRUD + product-event tests (ticket 07).
+"""Catalog product CRUD + product-event tests.
 
 HTTP round-trip via ``httpx.AsyncClient`` over the ASGI app, real
 Testcontainers-Postgres (identity + catalog migrations), in-process RS256 keypair

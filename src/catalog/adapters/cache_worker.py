@@ -77,9 +77,11 @@ def main() -> None:  # pragma: no cover - process entrypoint
     """`python -m src.catalog.adapters.cache_worker` — the `service`-role cache invalidator."""
     from src.shared.clients import valkey_client
     from src.shared.config.logging import setup_logging
+    from src.shared.observability.worker_metrics import serve_worker_metrics
 
     settings = get_settings()
     setup_logging(settings.log_level)
+    serve_worker_metrics(settings, job="catalog-cache-worker")
     valkey = valkey_client.create_client(settings)
     log.info("catalog cache worker starting (queue=%s)", settings.catalog_cache_queue_url)
 

@@ -1,11 +1,11 @@
-"""Service + mapper unit tests (ticket 03) — DB-free, fake repos.
+"""Service + mapper unit tests — DB-free, fake repos.
 
 Exercises the application seam without a database: a fake repo (a plain object
 implementing the port) returns canned ORM-shaped rows / ``ProductRow`` / a
 ``Page``, and we assert the service maps them through the domain to the right
 Pydantic response schema — with no ORM/``ProductRow`` leak. Each module's
 ``to_domain`` mapper is also exercised directly against an ORM-shaped row. The
-HTTP ``dependency_overrides`` round-trip rides ticket 07.
+HTTP ``dependency_overrides`` round-trip rides.
 """
 
 from __future__ import annotations
@@ -234,11 +234,11 @@ async def test_identity_returns_pydantic_user_not_orm():
 
 async def test_inventory_returns_pydantic_schema_not_orm():
     row = SimpleNamespace(sku="sku-1", on_hand=5, reserved=2, version=3)
-    svc = InventoryService(_FakeSingleRepo(row=row))
+    svc = InventoryService(_FakeSingleRepo(row=row), reservation_ttl_seconds=900)
     result = await svc.get_by_sku("sku-1")
     assert isinstance(result, InventoryResponse)
     assert (result.on_hand, result.reserved, result.version) == (5, 2, 3)
-    assert await InventoryService(_FakeSingleRepo(row=None)).get_by_sku("nope") is None
+    assert await InventoryService(_FakeSingleRepo(row=None), reservation_ttl_seconds=900).get_by_sku("nope") is None
 
 
 async def test_payments_returns_page_of_pydantic_payments():

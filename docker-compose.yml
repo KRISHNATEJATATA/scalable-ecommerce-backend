@@ -145,6 +145,9 @@ services:
       BUS_REGION: us-east-1
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
+      WORKER_METRICS_PORT: "9100"
+    ports:
+      - "9101:9100"
     command: ["python", "-m", "src.shared.bus.relay"]
 
   # The `service`-role image worker: drains S3 ObjectCreated events → sniff +
@@ -172,6 +175,9 @@ services:
       BUS_REGION: us-east-1
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
+      WORKER_METRICS_PORT: "9100"
+    ports:
+      - "9102:9100"
     command: ["python", "-m", "src.catalog.adapters.image_worker"]
 
   # The `service`-role catalog cache worker: drains ProductUpdated/ProductDeleted
@@ -197,7 +203,30 @@ services:
       BUS_REGION: us-east-1
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
+      WORKER_METRICS_PORT: "9100"
+    ports:
+      - "9103:9100"
     command: ["python", "-m", "src.catalog.adapters.cache_worker"]
+
+  # The `service`-role reservation reaper: releases stock holds whose TTL expired
+  # (a stalled checkout saga must not leak stock into a phantom oversell-block).
+  # Cron-style loop locally; an EventBridge-scheduled `--once` ECS task in prod.
+  reaper:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ecommerce:ecommerce@postgres:5432/ecommerce
+      VALKEY_URL: redis://valkey:6379/0
+      RESERVATION_TTL_SECONDS: "900"
+      RESERVATION_REAPER_POLL_INTERVAL_SECONDS: "10.0"
+      WORKER_METRICS_PORT: "9100"
+    ports:
+      - "9104:9100"
+    command: ["python", "-m", "src.inventory.adapters.reaper"]
 
   # IdP: imports the ecommerce realm (consumer/merchant/admin roles + clients) on boot.
   keycloak:

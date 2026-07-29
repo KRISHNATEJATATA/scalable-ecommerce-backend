@@ -1,0 +1,47 @@
+# Prometheus alerting rules for the reservation reaper — add to `rule_files:`.
+#
+# Three signals, because the reaper runs in two shapes:
+#   * backlog  — the authoritative one, sourced from Postgres (see
+#                postgres-exporter-queries.yaml) so it fires even when the reaper
+#                is completely dead. Covers both shapes.
+#   * up       — the always-on/compose shape, scraped via WORKER_METRICS_PORT.
+#   * push age — the EventBridge `--once` shape, which exits between scrapes and
+#                therefore pushes to a Pushgateway (METRICS_PUSHGATEWAY_URL).
+#
+# The last two say the process is gone; the backlog says it started to matter.
+# Runbook: docs/RUNBOOK.md §8.
+
+groups:
+  - name: inventory-reaper
+    rules:
+      - alert: InventoryReaperBacklog
+        # Stock held by dead sagas is stock nobody can buy — a phantom oversell-block.
+        expr: inventory_reservations_expired_holds > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Expired stock holds are not being released"
+          description: >-
+            {{ $value }} reservation(s) are past expires_at and still held. The reaper is down
+            or falling behind; that stock is invisible to buyers. Runbook: docs/RUNBOOK.md §8.
+
+      - alert: InventoryReaperDown
+        # Long-running shape only; absent() so a never-scraped target also fires.
+        expr: up{job="reservation-reaper"} == 0 or absent(up{job="reservation-reaper"})
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Reservation reaper is not being scraped"
+          description: "The looping reaper's WORKER_METRICS_PORT target is down. Backlog will start climbing."
+
+      - alert: InventoryReaperNotRunning
+        # Scheduled `--once` shape: no push in 30m means the schedule stopped firing.
+        # Keep this rule or InventoryReaperDown, whichever shape you deploy — not both.
+        expr: time() - push_time_seconds{job="reservation-reaper"} > 1800
+        labels:
+          severity: warning
+        annotations:
+          summary: "Scheduled reservation reaper has not run"
+          description: "No Pushgateway sample for 30m — check the EventBridge schedule and the ECS task."

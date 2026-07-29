@@ -1,4 +1,4 @@
-"""Auth tests (ticket 04): OIDC resource-server validation, RBAC, JIT, admin.
+"""Auth tests: OIDC resource-server validation, RBAC, JIT, admin.
 
 No Keycloak container: an RS256 keypair is generated in-process, test tokens are
 signed with it, and JWKS signing-key resolution is replaced by a fake
@@ -290,7 +290,7 @@ async def test_admin_creates_user_201(app_ctx, rsa_key):
 
 
 async def test_disable_non_provisioned_user_still_blocks_future_login(app_ctx, rsa_key):
-    """Disabling a user who never authenticated must not be a no-op (ticket 04)."""
+    """Disabling a user who never authenticated must not be a no-op."""
     sub = str(uuid.uuid4())
     admin_token = _make_token(rsa_key, roles=["admin"])
     async with _client(app_ctx) as client:

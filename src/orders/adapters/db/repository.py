@@ -5,8 +5,7 @@ client-supplied filter) and embeds line items via ``selectinload(Order.items)``
 so a page of N orders costs 2 queries, not N+1 (``selectinload`` over
 ``joinedload`` because items is a collection).
 
-returns ORM ``Order`` rows (with items eager-loaded); services
-(ticket 03) map them to Pydantic schemas.
+returns ORM ``Order`` rows (with items eager-loaded); services map them to Pydantic schemas.
 """
 
 from __future__ import annotations

@@ -1,0 +1,22 @@
+# postgres_exporter custom queries — point at it with `--extend.query-path`.
+#
+# The reservation reaper's *liveness* signal cannot come from the reaper: a
+# process that never starts increments and pushes nothing, so a flat counter
+# can't be told apart from a healthy idle one. The backlog lives in Postgres,
+# which is scraped whether or not the reaper is alive — that's why this query
+# lives here rather than as an app metric.
+#
+# Alert rules on it: ops/prometheus/inventory-reaper-alerts.yaml. Runbook: docs/RUNBOOK.md §8.
+
+inventory_reservations:
+  # Served by the partial index `ix_reservations_expiry_sweep`
+  # (expires_at WHERE status = 'held'), the reaper's own claim index — so this is cheap.
+  query: >-
+    SELECT count(*) AS expired_holds
+    FROM inventory.reservations
+    WHERE status = 'held' AND expires_at <= now()
+  master: true
+  metrics:
+    - expired_holds:
+        usage: "GAUGE"
+        description: "Reservations past expires_at still held — the reaper's backlog. Healthy = near zero."

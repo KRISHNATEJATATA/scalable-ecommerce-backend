@@ -138,9 +138,11 @@ def main() -> None:  # pragma: no cover - process entrypoint
     from src.shared.clients import valkey_client
     from src.shared.clients.postgres_client import create_engine, create_sessionmaker
     from src.shared.config.logging import setup_logging
+    from src.shared.observability.worker_metrics import serve_worker_metrics
 
     settings = get_settings()
     setup_logging(settings.log_level)
+    serve_worker_metrics(settings, job="image-worker")
     engine = create_engine(settings)
     sessionmaker = create_sessionmaker(engine)
     valkey = valkey_client.create_client(settings)

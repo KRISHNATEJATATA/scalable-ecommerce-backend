@@ -1,82 +1,28 @@
-"""Repository-layer tests (ticket 02) against Testcontainers-Postgres.
+"""Repository-layer tests against Testcontainers-Postgres.
 
 The repository is the highest seam that exists this phase — api/ has no routes
 yet — so keyset correctness, whitelist/cursor rejection, soft-delete, the N+1
 guard, and the atomic decrement are all asserted here. HTTP-seam + concurrency
 races land with tickets 07/10/13/17.
 
-Spins up a real Postgres container for the module (never SQLite — the design
-relies on Postgres CHECK constraints, ``version_id`` locking, and ``ON
-DELETE``) and runs every module's Alembic chain against it. Requires Docker;
-no environment-dependent skip.
+Uses the shared session-scoped Testcontainers-Postgres fixtures from
+``tests/unit/conftest.py`` (never SQLite — the design relies on Postgres CHECK
+constraints, ``version_id`` locking, and ``ON DELETE``). Requires Docker; no
+environment-dependent skip.
 """
 
-import os
-import subprocess
-import sys
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from pathlib import Path
 
 import pytest
 from sqlalchemy import event, text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from testcontainers.postgres import PostgresContainer
 
 from src.catalog.adapters.db.repository import CatalogRepository
 from src.inventory.adapters.db.repository import InventoryRepository
 from src.orders.adapters.db.repository import OrdersRepository
-from src.shared.config.setting import get_settings
 from src.shared.db.pagination import PageParams
 from src.shared.errors.exceptions import InvalidCursorError, InvalidQueryParamError
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-MODULES = ["identity", "catalog", "inventory", "orders", "payments"]
-
-_TRUNCATE = text(
-    "TRUNCATE catalog.products, orders.order_items, orders.orders, inventory.reservations, inventory.inventory CASCADE"
-)
-
-
-@pytest.fixture(scope="module")
-def _migrated():
-    with PostgresContainer("postgres:16-alpine") as pg:
-        async_url = pg.get_connection_url(driver="asyncpg")
-        old_url = os.environ.get("DATABASE_URL")
-        os.environ["DATABASE_URL"] = async_url
-        get_settings.cache_clear()
-        try:
-            for module in MODULES:
-                subprocess.run(
-                    [sys.executable, "-m", "alembic", "-c", f"src/{module}/alembic.ini", "upgrade", "head"],
-                    cwd=REPO_ROOT,
-                    check=True,
-                )
-            yield
-        finally:
-            if old_url is None:
-                os.environ.pop("DATABASE_URL", None)
-            else:
-                os.environ["DATABASE_URL"] = old_url
-            get_settings.cache_clear()
-
-
-@pytest.fixture
-async def async_engine(_migrated):
-    engine = create_async_engine(str(get_settings().database_url))
-    async with engine.begin() as conn:
-        await conn.execute(_TRUNCATE)
-    yield engine
-    await engine.dispose()
-
-
-@pytest.fixture
-async def session(async_engine):
-    maker = async_sessionmaker(async_engine, expire_on_commit=False)
-    async with maker() as sess:
-        yield sess
-
 
 # --- seed helpers ---------------------------------------------------------
 

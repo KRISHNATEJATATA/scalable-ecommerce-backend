@@ -112,10 +112,11 @@ def get_inventory_repository(session: SessionDep) -> InventoryRepositoryPort:
 
 
 def get_inventory_service(
+    request: Request,
     repo: Annotated[InventoryRepositoryPort, Depends(get_inventory_repository)],
 ) -> InventoryService:
     """Provide the inventory service over its repository port."""
-    return InventoryService(repo)
+    return InventoryService(repo, reservation_ttl_seconds=request.app.state.settings.reservation_ttl_seconds)
 
 
 # --- identity -------------------------------------------------------------

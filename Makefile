@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help install run lint test migrate compose-up compose-down hooks gen-alembic-env relay bus-setup s3-setup image-worker cache-worker
+.PHONY: help install run lint test migrate compose-up compose-down hooks gen-alembic-env relay bus-setup s3-setup image-worker cache-worker reaper
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS=":.*?## "}; {printf "%-14s %s\n", $$1, $$2}'
@@ -42,6 +42,9 @@ image-worker: ## Run the image worker (service role; S3 ObjectCreated → sniff/
 
 cache-worker: ## Run the catalog cache-invalidation worker (service role; ProductUpdated/Deleted → evict)
 	python -m src.catalog.adapters.cache_worker
+
+reaper: ## Run the reservation reaper (service role; releases expired stock holds)
+	python -m src.inventory.adapters.reaper
 
 gen-alembic-env: ## Regenerate each module's env.py from scripts/alembic_env.py.tmpl
 	python scripts/generate_alembic_env.py

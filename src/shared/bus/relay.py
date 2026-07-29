@@ -104,9 +104,11 @@ def main() -> None:  # pragma: no cover - process entrypoint
     """`python -m src.shared.bus.relay` — the `service`-role relay worker."""
     from src.shared.clients.postgres_client import create_engine, create_sessionmaker
     from src.shared.config.logging import setup_logging
+    from src.shared.observability.worker_metrics import serve_worker_metrics
 
     settings = get_settings()
     setup_logging(settings.log_level)
+    serve_worker_metrics(settings, job="outbox-relay")
     engine = create_engine(settings)
     sessionmaker = create_sessionmaker(engine)
     log.info("outbox relay starting (schemas=%s)", ",".join(OUTBOX_SCHEMAS))

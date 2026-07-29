@@ -38,13 +38,37 @@ depth):
 | Relay | `python -m src.shared.bus.relay` | Postgres `outbox` | ships unpublished rows → SNS (SKIP LOCKED) |
 | Image worker | `python -m src.catalog.adapters.image_worker` | `image-uploads` | sniff · re-encode · thumbnails → `image_status` |
 | Cache worker | `python -m src.catalog.adapters.cache_worker` | `catalog-cache` | invalidate Valkey read-cache on `ProductUpdated`/`ProductDeleted` |
+| Reservation reaper | `python -m src.inventory.adapters.reaper` | Postgres `reservations` | release holds past `expires_at` (SKIP LOCKED) so a stalled saga can't leak stock |
 
-Each drains a standard SQS queue with a DLQ; set the queue **visibility timeout ≥
-the consumer's processing lease** (`CONSUMER_LEASE_TTL_SECONDS`) so a crashed
-worker's in-flight message is redelivered rather than lost or double-processed.
+The reaper polls Postgres, not a queue: run it as a small always-on service, or as
+an **EventBridge-scheduled one-off task** with `--once` (it exits after a single
+sweep). Either way it is safe to run N replicas — the claim takes `FOR UPDATE SKIP
+LOCKED`. Losing it doesn't oversell (holds stay held); it means abandoned checkouts
+keep stock out of circulation until it returns, so alarm on the **expired-hold backlog**
+(`SELECT count(*) FROM inventory.reservations WHERE status = 'held' AND expires_at <= now()`)
+for liveness rather than on counter silence — a worker that never runs emits nothing. Its
+`inventory_reaper_released_total` still reaches Prometheus via `WORKER_METRICS_PORT` (looping)
+or `METRICS_PUSHGATEWAY_URL` (`--once`); see `docs/RUNBOOK.md` §8. Set
+`RESERVATION_TTL_SECONDS` **longer than the checkout saga's step timeouts**.
+
+The **image and cache workers** drain a standard SQS queue with a DLQ; set the queue
+**visibility timeout ≥ the consumer's processing lease** (`CONSUMER_LEASE_TTL_SECONDS`)
+so a crashed worker's in-flight message is redelivered rather than lost or
+double-processed. The **relay and reaper poll Postgres instead** (`outbox` and
+`reservations`, both `FOR UPDATE SKIP LOCKED`) — no queue, no visibility timeout;
+their pacing is `RELAY_POLL_INTERVAL_SECONDS` / `RESERVATION_REAPER_POLL_INTERVAL_SECONDS`.
 Losing the cache worker degrades read latency (more DB reads, staleness bounded by
 `PRODUCT_CACHE_TTL_SECONDS`) but is not a correctness incident; losing the relay or
 image worker stalls events/uploads until it recovers (both replay safely).
+
+**Worker metrics.** Only the API serves `/metrics`, so every worker above needs its own
+export or its counters are invisible. Set `WORKER_METRICS_PORT` on the long-running worker
+services and scrape it like any other target (docker-compose sets it on all four workers and
+publishes 9101–9104). Scheduled `--once` tasks (the reaper) exit
+between scrapes, so they push at exit instead — point `METRICS_PUSHGATEWAY_URL` at a
+Pushgateway. Both are opt-in; unset means no port bound and no push attempted. Alert rules
+and the postgres_exporter query behind the reaper's liveness signal ship in
+`ops/prometheus/`.
 
 ## Migrations (one-off task, not at app boot)
 

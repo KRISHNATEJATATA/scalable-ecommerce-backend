@@ -45,6 +45,17 @@ alembic downgrade -1        # or: alembic downgrade <revision>
 Prefer restoring the pre-migration snapshot if the downgrade is destructive or
 not cleanly reversible.
 
+**`d4e5f6a7b8c9` aborted with "already hold multiple committed reservations".**
+Not a bug in the migration — it refused to widen the reservation uniqueness guard
+because the data already violates it. Those order lines had stock deducted twice
+(two `committed` reservations for one `(order_id, sku)`), which no migration can
+safely undo. The error lists them. For each: decide refund or restock, then leave
+one `committed` row and set the surplus to `released`, handing their units back
+(`UPDATE inventory.inventory SET reserved = reserved - <qty> ...` only if the
+surplus row was `held`; a `committed` row already left `reserved`, so correct
+`on_hand` instead). Re-run `upgrade head`. Nothing is left half-applied — the
+migration aborts before any DDL.
+
 ### 3. Full DR restore (region loss)
 
 1. Restore RDS from the latest cross-region snapshot / PITR.
@@ -149,8 +160,58 @@ the accepted cache-aside trade-off (the write path is never blocked on cache).
 `catalog-cache` queue depth + oldest-message age (worker liveness). Losing the worker degrades
 performance (more DB reads, staleness bounded by TTL) but is **not** a correctness incident.
 
-## Post-incident
+### 8. Reservation reaper (stock leaked by a stalled checkout)
 
+The `service`-role **reaper** (`python -m src.inventory.adapters.reaper`, or a scheduled
+`--once` task) releases every reservation still `held` past its `expires_at`. It exists because a
+hold bumps `inventory.reserved` immediately: if the checkout saga dies before committing or
+compensating, those units stay counted as reserved forever — a **phantom oversell-block**, stock
+on the shelf that nobody can buy. Each pass claims a batch with `FOR UPDATE SKIP LOCKED`, gives
+the stock back, flips the rows to `released` and writes `StockReleased` outbox rows — all in one
+transaction, so N replicas are safe and a crash mid-pass simply re-runs.
+
+**Not a data-loss risk.** The reaper only *frees* stock; the failure mode of it being down is
+under-selling, not overselling. The one dangerous knob is the TTL: if
+`RESERVATION_TTL_SECONDS` drops below the checkout saga's step timeouts, the reaper will reclaim
+stock from a slow-but-alive checkout and that checkout fails at payment confirmation.
+
+| Symptom | Likely cause | Action |
+|---|---|---|
+| `available` stuck at 0 while `on_hand` is healthy | reaper down; expired holds never released | check the reaper task/schedule is running; run one manual sweep (below) |
+| Expired-hold backlog (query below) climbing fast | checkouts dying mid-saga upstream | investigate the saga/payment step — the reaper is treating a symptom |
+| `inventory_oversell_blocked_total` spiking | genuine contention on a hot SKU, or a saga retry storm | expected under contention; confirm stock levels before assuming a bug |
+| Paid orders' stock returns to the pool | `commit_reservation` not called on payment success | fix the saga's confirm step — the reaper is doing its job |
+
+```bash
+# Manual one-shot sweep (same image, service role)
+aws ecs run-task --cluster ecommerce --task-definition ecommerce-reaper \
+  --overrides '{"containerOverrides":[{"name":"app","command":["python","-m","src.inventory.adapters.reaper","--once"]}]}'
+```
+
+```sql
+-- What is currently held, and how much is past its TTL?
+SELECT status, count(*), sum(qty) FROM inventory.reservations GROUP BY status;
+-- ↓ THE reaper alert: this is the backlog. Healthy = hovers near zero.
+SELECT count(*) FROM inventory.reservations WHERE status = 'held' AND expires_at <= now();
+```
+
+**Monitoring.** `inventory_oversell_blocked_total` (rejection rate) and
+`inventory_reservation_conflict_total` (order lines retried with a changed quantity — a
+caller bug, deliberately kept out of the oversell counter) are on the API's `/metrics`.
+The reaper runs in its own process, so its `inventory_reaper_released_total` is exported
+separately — a scrape port (`WORKER_METRICS_PORT`) when it loops, a Pushgateway
+(`METRICS_PUSHGATEWAY_URL`) when it runs `--once`.
+
+That counter measures volume, **not liveness**: a reaper that never starts increments
+nothing and pushes nothing, so a flat line can't be told apart from a healthy idle one.
+Reaper liveness is alerted on the expired-hold backlog above — a sustained non-zero count
+means it is down or falling behind. Both are shipped as rules, not just as a query to run
+by hand: `ops/prometheus/inventory-reaper-alerts.yaml` (`InventoryReaperBacklog`,
+`InventoryReaperDown`, `InventoryReaperNotRunning`), fed by the postgres_exporter query in
+`ops/prometheus/postgres-exporter-queries.yaml` — which scrapes Postgres, so it keeps
+reporting when the reaper is dead.
+
+## Post-incident
 - Re-enable automated backups on the promoted instance.
 - Rotate any exposed secrets (JWT keys, DB creds) via Secrets Manager.
 - Note the incident in `.github/memory.md` (Recent zone) if it yields a lesson.

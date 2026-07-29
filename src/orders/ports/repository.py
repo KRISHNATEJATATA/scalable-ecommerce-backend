@@ -1,6 +1,6 @@
 """Port (Protocol) for the orders read repository.
 
-Implemented by ``adapters/db/repository.OrdersRepository``, wired in ticket 03.
+Implemented by ``adapters/db/repository.OrdersRepository``,
 ``user_id`` scope is repo-applied ownership, not a client filter.
 """
 

@@ -17,9 +17,12 @@ from src.shared.errors.exceptions import (
     AuthenticationError,
     AuthorizationError,
     DependencyUnavailableError,
+    InsufficientStockError,
     InvalidCursorError,
     InvalidQueryParamError,
+    InvalidReservationError,
     InvalidUploadError,
+    ReservationConflictError,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,9 +53,23 @@ async def _bad_request_handler(_: Request, exc: InvalidQueryParamError | Invalid
     return _problem_response(400, title="Bad Request", detail=str(exc))
 
 
-async def _invalid_upload_handler(_: Request, exc: InvalidUploadError) -> JSONResponse:
-    # Content-type/size rejected BEFORE a presigned URL is issued (not an open uploader).
+async def _detail_bad_request_handler(_: Request, exc: InvalidUploadError | InvalidReservationError) -> JSONResponse:
+    # Requests rejected by server-side validation before they reach durable state:
+    # an upload whose declared type/size fails policy, a reservation whose quantity
+    # is non-positive. 400 with the exception's own detail — never a 500.
     return _problem_response(400, title="Bad Request", detail=exc.detail)
+
+
+async def _insufficient_stock_handler(_: Request, exc: InsufficientStockError) -> JSONResponse:
+    # 409, not 400: the request was well-formed, the *state* refused it. A retry
+    # after the reaper frees an expired hold can legitimately succeed.
+    return _problem_response(409, title="Conflict", detail=exc.detail)
+
+
+async def _reservation_conflict_handler(_: Request, exc: ReservationConflictError) -> JSONResponse:
+    # Also 409, but a different `title`: the line already holds a different qty,
+    # so the caller must release the stale hold rather than wait for stock.
+    return _problem_response(409, title="Reservation Conflict", detail=exc.detail)
 
 
 async def _dependency_unavailable_handler(_: Request, exc: DependencyUnavailableError) -> JSONResponse:
@@ -85,7 +102,10 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(AuthorizationError, _authorization_error_handler)
     app.add_exception_handler(InvalidQueryParamError, _bad_request_handler)
     app.add_exception_handler(InvalidCursorError, _bad_request_handler)
-    app.add_exception_handler(InvalidUploadError, _invalid_upload_handler)
+    app.add_exception_handler(InvalidUploadError, _detail_bad_request_handler)
+    app.add_exception_handler(InvalidReservationError, _detail_bad_request_handler)
+    app.add_exception_handler(InsufficientStockError, _insufficient_stock_handler)
+    app.add_exception_handler(ReservationConflictError, _reservation_conflict_handler)
     app.add_exception_handler(DependencyUnavailableError, _dependency_unavailable_handler)
     app.add_exception_handler(StarletteHTTPException, _http_exception_handler)
     app.add_exception_handler(RequestValidationError, _validation_exception_handler)

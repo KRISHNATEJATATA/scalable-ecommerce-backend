@@ -7,7 +7,7 @@ in the cloud where Terraform pre-creates topics, and creates on demand on
 LocalStack) and publishes the payload as the SNS ``Message``, with the W3C
 ``traceparent`` (derived from the envelope ``trace_id``) as a message attribute.
 
-The payload is shipped **verbatim**: consumers validate it against the ticket-05
+The payload is shipped **verbatim**: consumers validate it against the
 event registry, so the wire body must be exactly what the producer stored.
 """
 

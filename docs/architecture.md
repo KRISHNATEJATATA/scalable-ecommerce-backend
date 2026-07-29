@@ -172,12 +172,23 @@ attribute so one trace spans the queue hop.
 
 ## Correctness invariants (never simplify away)
 
-- **Optimistic locking** on inventory via `Product.version_id` — prevents
-  overselling.
+- **Atomic conditional decrement** on inventory (see ADR 0010) — the single
+  `UPDATE ... WHERE on_hand - reserved >= :qty` *is* the oversell guard
+  (`rowcount = 0` = rejected). The reservation row and its `StockReserved` outbox
+  row commit in the **same transaction**. Never replace it with read-then-write,
+  a row lock held across the request, or a Valkey lock.
+- **Reservation TTL + reaper**: every hold carries `expires_at`; the `service`-role
+  reaper releases expired holds so a stalled saga can't leak stock into a phantom
+  oversell-block. Keep `RESERVATION_TTL_SECONDS` longer than the saga's step
+  timeouts. `commit_reservation` (payment succeeded) is what stops the reaper
+  releasing a *paid* order's stock.
+- **Optimistic locking**: `Inventory.version` (manual CAS) and `Product.version_id`
+  (ORM-managed) — two mechanisms on purpose, don't unify them.
 - **Idempotent checkout**: `UNIQUE(user_id, idempotency_key)` on `Order` is the
-  durable guard (Valkey only short-circuits fast retries).
+  durable guard (Valkey only short-circuits fast retries); a live hold is likewise
+  unique per `(order_id, sku)`.
 - DB constraints belong in the DB: `UNIQUE(email)`, `CHECK(price > 0)`,
-  `CHECK(stock >= 0)`, explicit `ON DELETE`.
+  `CHECK(on_hand >= 0)`, `CHECK(reserved <= on_hand)`, explicit `ON DELETE`.
 - Uploads validated at the trust boundary: sniff real bytes (`python-magic`),
   re-encode images (Pillow) to strip EXIF.
 

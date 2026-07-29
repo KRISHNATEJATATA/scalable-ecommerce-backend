@@ -119,6 +119,25 @@ class AppSettings(BaseSettings):
     # local queue visibility from this value.
     consumer_lease_ttl_seconds: int = Field(default=60, gt=0)
 
+    # --- Inventory reservations + reaper ---
+    # A reservation holds stock (bumps `reserved`) until the checkout saga commits
+    # or compensates. The TTL is the backstop for a saga that never does either:
+    # the reaper releases anything still held past `expires_at`. Keep the TTL
+    # comfortably longer than the saga's own step timeouts, or a slow-but-alive
+    # checkout gets its stock reaped out from under it.
+    reservation_ttl_seconds: int = Field(default=900, gt=0)  # 15 min hold
+    reservation_reaper_poll_interval_seconds: float = Field(default=10.0, gt=0)
+    reservation_reaper_batch_size: int = Field(default=100, gt=0)
+
+    # --- Worker metrics export ---
+    # Workers don't serve `/metrics` (that's the API process), so their counters
+    # are invisible unless exported. Long-running workers get a scrape port;
+    # short-lived `--once` runs push to a Pushgateway instead, since a scrape
+    # target that exits between scrapes is never sampled. Both opt-in: unset =
+    # off, so tests and local runs bind no port and make no network call.
+    worker_metrics_port: int | None = Field(default=None, gt=0, le=65535)
+    metrics_pushgateway_url: str | None = None
+
     @model_validator(mode="after")
     def _require_public_image_base_in_cloud(self) -> "AppSettings":
         """Fail-fast: a real-AWS deploy serving images MUST set the public CDN base.
