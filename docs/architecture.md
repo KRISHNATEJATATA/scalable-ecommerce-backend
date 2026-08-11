@@ -63,7 +63,7 @@ flowchart TD
   IMG -->|write public webp + thumbs| S3
   IMG -->|mark image_status ready/failed| PG
   SQS -.->|ProductUpdated/Deleted| CW
-  CW -->|invalidate product:{id}| VK
+  CW -->|invalidate product cache key| VK
   Route -.-> Errors
   App -.-> Log
 ```
@@ -115,6 +115,19 @@ PKCE against Keycloak; the API only validates the tokens Keycloak issues.
   logout, password reset, email verification, MFA, and social federation.
 - **Privilege guard is automatic**: new users get the default `consumer` realm
   role from Keycloak; the app cannot be asked to mint a role.
+- **Realm layout** (`keycloak/realm-export.json`, imported by compose): clients
+  `ecommerce-api` (bearer-only — exists so tokens can carry `aud: ecommerce-api`,
+  added by an `oidc-audience-mapper` on the token-issuing clients), `ecommerce-spa`
+  (public, PKCE + direct grants locally), `ecommerce-admin` (service account with
+  `realm-management` `view-realm`/`view-users`/`manage-users` for the Admin API),
+  and `ecommerce-worker` (service account holding the `service` realm role, the
+  only principal that satisfies `GET /v1/internal/whoami`). Realm roles are
+  `consumer`/`merchant`/`admin`/`service`; the defaults for a new user come from the
+  composite `default-roles-ecommerce` (KC 26 shape), which includes `consumer`.
+  `KEYCLOAK_AUDIENCE` must match the audience mapper or every request is `401`.
+  Compose pins **one canonical issuer** (`KC_HOSTNAME`) so host/browser and
+  in-network callers get the same `iss`; JWKS and the Admin API
+  (`KEYCLOAK_SERVER_URL`) use the internal hostname.
 
 ## Valkey usage
 

@@ -34,7 +34,7 @@ class KeycloakIdentityAdmin:
             ):
                 raise RuntimeError("Keycloak admin client is not configured")
             # issuer is ``<server_url>/realms/<realm>`` → strip back to the server root.
-            server_url = settings.keycloak_issuer.rsplit("/realms/", 1)[0] + "/"
+            server_url = settings.keycloak_server_url or settings.keycloak_issuer.rsplit("/realms/", 1)[0] + "/"
             connection = KeycloakOpenIDConnection(
                 server_url=server_url,
                 realm_name=settings.keycloak_realm,

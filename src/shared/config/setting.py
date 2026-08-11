@@ -68,6 +68,9 @@ class AppSettings(BaseSettings):
     keycloak_jwks_url: str | None = None
     jwt_algorithm: Literal["RS256"] = "RS256"
     # Admin service-account for user/role management via Keycloak's Admin API.
+    # server_url defaults to the issuer root; override when the issuer the tokens
+    # carry (e.g. http://localhost:8080) is not reachable from inside the app.
+    keycloak_server_url: str | None = None
     keycloak_admin_client_id: str | None = None
     keycloak_admin_client_secret: str | None = None
 

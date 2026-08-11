@@ -7,11 +7,47 @@
     "realm": [
       { "name": "consumer", "description": "Default customer role" },
       { "name": "merchant", "description": "Seller/vendor role" },
-      { "name": "admin", "description": "Administrator role" }
+      { "name": "admin", "description": "Administrator role" },
+      { "name": "service", "description": "Machine/worker role for relay, workers, and internal endpoints" },
+      { "name": "offline_access", "description": "${role_offline-access}" },
+      { "name": "uma_authorization", "description": "${role_uma_authorization}" },
+      {
+        "name": "default-roles-ecommerce",
+        "description": "Roles every new user gets (KC 26 models realm defaults as this composite, not the legacy defaultRoles array)",
+        "composite": true,
+        "composites": {
+          "realm": ["offline_access", "uma_authorization", "consumer"],
+          "client": { "account": ["view-profile", "manage-account"] }
+        }
+      }
     ]
   },
-  "defaultRoles": ["consumer"],
+  "defaultRole": {
+    "name": "default-roles-ecommerce",
+    "composite": true,
+    "clientRole": false,
+    "containerId": "ecommerce"
+  },
+  "smtpServer": {
+    "host": "mailpit",
+    "port": "1025",
+    "from": "no-reply@ecommerce.local",
+    "fromDisplayName": "E-commerce (local)",
+    "ssl": "false",
+    "starttls": "false",
+    "auth": "false"
+  },
   "clients": [
+    {
+      "clientId": "ecommerce-api",
+      "name": "E-commerce API (resource server, bearer-only)",
+      "description": "Audience only. Access tokens must carry aud=ecommerce-api (KEYCLOAK_AUDIENCE).",
+      "enabled": true,
+      "publicClient": false,
+      "bearerOnly": true,
+      "standardFlowEnabled": false,
+      "serviceAccountsEnabled": false
+    },
     {
       "clientId": "ecommerce-spa",
       "name": "E-commerce SPA (public, Auth Code + PKCE)",
@@ -21,7 +57,19 @@
       "directAccessGrantsEnabled": true,
       "redirectUris": ["http://localhost:3000/*"],
       "webOrigins": ["http://localhost:3000"],
-      "attributes": { "pkce.code.challenge.method": "S256" }
+      "attributes": { "pkce.code.challenge.method": "S256" },
+      "protocolMappers": [
+        {
+          "name": "ecommerce-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "ecommerce-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
     },
     {
       "clientId": "ecommerce-admin",
@@ -31,6 +79,43 @@
       "secret": "change-me-local-only",
       "standardFlowEnabled": false,
       "serviceAccountsEnabled": true
+    },
+    {
+      "clientId": "ecommerce-worker",
+      "name": "E-commerce worker service account (service role)",
+      "enabled": true,
+      "publicClient": false,
+      "secret": "change-me-local-only",
+      "standardFlowEnabled": false,
+      "serviceAccountsEnabled": true,
+      "protocolMappers": [
+        {
+          "name": "ecommerce-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "ecommerce-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "service-account-ecommerce-admin",
+      "enabled": true,
+      "serviceAccountClientId": "ecommerce-admin",
+      "clientRoles": {
+        "realm-management": ["view-realm", "view-users", "manage-users"]
+      }
+    },
+    {
+      "username": "service-account-ecommerce-worker",
+      "enabled": true,
+      "serviceAccountClientId": "ecommerce-worker",
+      "realmRoles": ["service"]
     }
   ]
 }

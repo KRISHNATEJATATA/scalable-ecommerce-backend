@@ -21,8 +21,15 @@ services:
       BUS_REGION: us-east-1
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
-      KEYCLOAK_ISSUER: http://keycloak:8080/realms/ecommerce
+      # Keycloak pins one canonical issuer (KC_HOSTNAME below), so tokens carry the
+      # same `iss` whether they were minted via localhost:8080 (host/browser) or
+      # keycloak:8080 (compose network). JWKS and the Admin API use the internal
+      # hostname since the canonical issuer host is not container-reachable.
+      KEYCLOAK_ISSUER: http://localhost:8080/realms/ecommerce
       KEYCLOAK_JWKS_URL: http://keycloak:8080/realms/ecommerce/protocol/openid-connect/certs
+      KEYCLOAK_SERVER_URL: http://keycloak:8080/
+      KEYCLOAK_ADMIN_CLIENT_ID: ecommerce-admin
+      KEYCLOAK_ADMIN_CLIENT_SECRET: change-me-local-only
       CORS_ALLOW_ORIGINS: '["http://localhost:3000"]'
     depends_on:
       postgres:
@@ -228,13 +235,26 @@ services:
       - "9104:9100"
     command: ["python", "-m", "src.inventory.adapters.reaper"]
 
-  # IdP: imports the ecommerce realm (consumer/merchant/admin roles + clients) on boot.
+  # Local mail catcher: Keycloak's "update account" email (admin user creation)
+  # needs an SMTP server or the create rolls back. UI on http://localhost:8025.
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "8025:8025"
+
+  # IdP: imports the ecommerce realm (consumer/merchant/admin/service roles + clients) on boot.
   keycloak:
     image: quay.io/keycloak/keycloak:26.0
     command: ["start-dev", "--import-realm"]
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      # One canonical issuer for every caller. Without this, a token fetched over
+      # the compose network gets iss=http://keycloak:8080/... while a host/browser
+      # token gets localhost, and one of the two always fails the issuer check.
+      # Backchannel stays static (not *_DYNAMIC) so internal calls keep this issuer.
+      KC_HOSTNAME: http://localhost:8080
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "false"
     ports:
       - "8080:8080"
     volumes:
