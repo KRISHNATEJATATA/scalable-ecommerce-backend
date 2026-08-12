@@ -3,7 +3,7 @@
 import uuid
 from decimal import Decimal
 
-from sqlalchemy import CheckConstraint, Index, Numeric, String
+from sqlalchemy import CheckConstraint, Index, Numeric, String, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, declared_attr, mapped_column
 
@@ -32,7 +32,17 @@ class Product(Base, TimestampMixin, SoftDeleteMixin, VersionIdMixin):
             f"image_status IN ({_IMAGE_STATUS_IN})",
             name="ck_products_image_status",
         ),
-        Index("ix_products_name", "name"),
+        # Keyset pagination sorts by ``(<sort col>, id)`` and always filters
+        # ``deleted_at IS NULL``, so each sortable column gets a partial composite
+        # index the ORDER BY can seek on instead of sort-then-discard.
+        # ponytail: filters (category/merchant_id) keep their own single-column
+        # index and are applied as a bitmap/filter on top; add
+        # ``(category, created_at, id)``-style composites only if a filtered
+        # listing shows up in slow-query logs — one per filter×sort pair is a
+        # combinatorial explosion nobody should pay for speculatively.
+        Index("ix_products_created_at_id", "created_at", "id", postgresql_where=text("deleted_at IS NULL")),
+        Index("ix_products_price_id", "price", "id", postgresql_where=text("deleted_at IS NULL")),
+        Index("ix_products_name_id", "name", "id", postgresql_where=text("deleted_at IS NULL")),
         Index("ix_products_category", "category"),
         Index("ix_products_merchant_id", "merchant_id"),
         {"schema": SCHEMA},

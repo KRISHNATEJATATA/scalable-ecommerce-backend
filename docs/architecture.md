@@ -178,7 +178,9 @@ and an `outbox` row in **one transaction**; a `service`-role **relay** claims un
 queues), then marks them published — publish-then-mark, so a crash re-ships (at-least-once).
 
 Each consumer reads its own SQS subscription and is **idempotent**: it dedupes on the envelope
-`event_id` in Valkey (best-effort, ~24h TTL) backed by an idempotent DB write, giving
+`event_id`, namespaced by its own consumer identity (`event:{consumer}:{event_id}`, so fan-out
+subscribers never dedupe each other away), in Valkey (best-effort, ~24h TTL) backed by an
+idempotent DB write, giving
 **effectively-once** processing. Poison messages land in a **per-subscription DLQ** after N
 retries (replay via SQS redrive — see RUNBOOK). W3C `traceparent` rides as an SQS message
 attribute so one trace spans the queue hop.

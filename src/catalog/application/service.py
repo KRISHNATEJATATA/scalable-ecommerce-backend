@@ -22,7 +22,6 @@ import uuid
 from dataclasses import dataclass
 
 from pydantic import ValidationError
-from sqlalchemy.exc import SQLAlchemyError
 
 from src.catalog.application.dto import ProductCreate, ProductResponse, ProductUpdate
 from src.catalog.application.image_processing import ALLOWED_MIME
@@ -33,11 +32,23 @@ from src.catalog.ports.repository import CatalogRepositoryPort
 from src.catalog.ports.storage import ImageStorePort
 from src.events.models import ProductCreated, ProductDeleted, ProductDeletedData, ProductWriteData
 from src.shared.config.logging import request_id_ctx
-from src.shared.config.setting import get_settings
+from src.shared.config.setting import AppSettings, get_settings
+from src.shared.db.outbox import OutboxMessage
 from src.shared.db.pagination import PageParams, PageResponse
 from src.shared.errors.exceptions import AuthorizationError, InvalidUploadError
 
 log = logging.getLogger(__name__)
+
+
+class _RepositoryFailure(Exception):
+    """Internal marker: a repository call failed (never a cache fault).
+
+    The cache-aside read swallows cache errors to degrade to the DB. Repository
+    errors must NOT be swallowed by that boundary — they are real 5xx and
+    re-reading would just fail again. Wrapping them here keeps the distinction
+    port-neutral (no ``SQLAlchemyError`` import in the application layer); the
+    public entrypoint unwraps and re-raises the original.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,7 +93,10 @@ class CatalogService:
         # second read of the global settings, so the renew cadence can't drift from
         # the actual lock TTL under an injected/overridden config.
         if lock_ttl_seconds is None:
-            lock_ttl_seconds = get_settings().product_cache_lock_ttl_seconds
+            # The field's declared default, not ``get_settings()``: every real call
+            # site injects the configured TTL, so building a service must not require
+            # a fully-configured environment (and can't drift from the config default).
+            lock_ttl_seconds = AppSettings.model_fields["product_cache_lock_ttl_seconds"].default
         self._lock_renew_seconds = max(0.5, lock_ttl_seconds / 2)
 
     async def get_product(self, product_id: uuid.UUID) -> ProductResponse | None:
@@ -96,8 +110,18 @@ class CatalogService:
 
         The cache is **best-effort**: any Valkey fault degrades to a direct DB read
         rather than surfacing a 5xx (the graceful-degradation contract in
-        ``docs/RUNBOOK.md``).
+        ``docs/RUNBOOK.md``). A *repository* failure is not a cache fault — it is
+        wrapped as :class:`_RepositoryFailure` at the one place the repo is called
+        and unwrapped here, so it surfaces as the real error instead of being
+        mislabelled and re-queried.
         """
+        try:
+            return await self._get_product_cached(product_id)
+        except _RepositoryFailure as wrapper:
+            raise wrapper.__cause__ from None  # type: ignore[misc]
+
+    async def _get_product_cached(self, product_id: uuid.UUID) -> ProductResponse | None:
+        """Cache-aside read; cache faults degrade to the DB, repo faults propagate."""
         if self._cache is None:
             return await self._load_product(product_id)
 
@@ -108,9 +132,7 @@ class CatalogService:
                 if hit:
                     return value  # a real hit, or a cached 404 (negative hit) → answer is None
             return await self._read_through(product_id)
-        except SQLAlchemyError:
-            # A repository/DB error is NOT a cache fault — surfacing it (a real 5xx)
-            # is correct; swallowing it here would mislabel it and re-run the query.
+        except _RepositoryFailure:
             raise
         except Exception:  # cache boundary: Valkey down / bad reply → serve from DB
             log.warning("product read-cache unavailable; serving %s from DB", product_id, exc_info=True)
@@ -136,8 +158,15 @@ class CatalogService:
             return False, None
 
     async def _load_product(self, product_id: uuid.UUID) -> ProductResponse | None:
-        """Fetch one product straight from the repository (no cache)."""
-        row = await self._repo.get_product(product_id)
+        """Fetch one product straight from the repository (no cache).
+
+        Any repository error is wrapped in :class:`_RepositoryFailure` so the
+        cache-fault boundary in :meth:`_get_product_cached` can't swallow it.
+        """
+        try:
+            row = await self._repo.get_product(product_id)
+        except Exception as exc:
+            raise _RepositoryFailure(str(exc)) from exc
         if row is None:
             return None
         return ProductResponse.model_validate(to_domain(row))
@@ -263,7 +292,7 @@ class CatalogService:
             category=data.category,
             price=data.price,
             image_key=None,  # images are attached later, only after the worker passes them
-            outbox=(event.type, event.model_dump_json()),
+            outbox=OutboxMessage(event.type, event.model_dump_json()),
         )
         return ProductResponse.model_validate(to_domain(row))
 
@@ -298,7 +327,7 @@ class CatalogService:
             trace_id=request_id_ctx.get(),
             data=ProductDeletedData(product_id=product_id, merchant_id=product.merchant_id),
         )
-        await self._repo.soft_delete_product(product, outbox=(event.type, event.model_dump_json()))
+        await self._repo.soft_delete_product(product, outbox=OutboxMessage(event.type, event.model_dump_json()))
         return True
 
     async def presign_image_upload(

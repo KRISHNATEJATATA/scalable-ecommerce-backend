@@ -88,7 +88,7 @@ class _FakePaymentsRepo:
     def __init__(self, page):
         self._page = page
 
-    async def get_by_order_id(self, order_id, params):
+    async def list_by_order_id(self, order_id, params):
         return self._page
 
 
@@ -244,7 +244,7 @@ async def test_inventory_returns_pydantic_schema_not_orm():
 async def test_payments_returns_page_of_pydantic_payments():
     rows = [_payment_row()]
     svc = PaymentsService(_FakePaymentsRepo(page=Page(items=rows, next_cursor="C")))
-    page = await svc.get_by_order_id(uuid.uuid4(), PageParams())
+    page = await svc.list_by_order_id(uuid.uuid4(), PageParams())
     assert isinstance(page, PageResponse)
     assert page.next_cursor == "C"
     assert isinstance(page.items[0], PaymentResponse)

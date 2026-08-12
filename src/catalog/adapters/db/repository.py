@@ -17,13 +17,16 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 
-from sqlalchemy import String, bindparam, select
+from sqlalchemy import Result, String, bindparam, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import text
 
 from src.catalog.adapters.db.models import SCHEMA, Outbox, Product
 from src.catalog.domain.image_status import ImageStatus
+from src.catalog.ports.repository import ImageOutboxFactory
+from src.shared.db.outbox import OutboxMessage
 from src.shared.db.pagination import Page, PageParams, build_page, check_filters, decode_cursor
 from src.shared.errors.exceptions import InvalidQueryParamError
 
@@ -37,6 +40,10 @@ _SORT_COLUMNS: dict[str, tuple[str, str]] = {
 _FILTERS: frozenset[str] = frozenset({"category", "merchant_id"})
 
 _SELECT_COLS = "id, merchant_id, name, description, category, price, image_key, image_status, created_at, updated_at"
+
+# Fields the image-flip UPDATEs return so the ``ProductUpdated`` payload is built
+# from post-update state inside the same transaction (no read-then-publish race).
+_EVENT_COLS = "id AS product_id, merchant_id, name, price, category"
 
 
 @dataclass(slots=True)
@@ -76,7 +83,7 @@ class CatalogRepository:
             where.append(f"{key} = :{key}")  # key is whitelist-validated above
             binds[key] = value
         if params.cursor:
-            cursor_sort, cursor_id = decode_cursor(params.cursor)
+            cursor_sort, cursor_id = decode_cursor(params.cursor, cast_type)
             where.append(f"({column}, id) {op} (CAST(:cursor_sort AS {cast_type}), CAST(:cursor_id AS uuid))")
             binds["cursor_sort"] = cursor_sort
             binds["cursor_id"] = cursor_id
@@ -115,7 +122,7 @@ class CatalogRepository:
         category: str | None,
         price: Decimal,
         image_key: str | None,
-        outbox: tuple[str, str],
+        outbox: OutboxMessage,
     ) -> Product:
         """Insert a product and its ``ProductCreated`` outbox row atomically."""
         product = Product(
@@ -133,7 +140,7 @@ class CatalogRepository:
         await self._session.refresh(product)
         return product
 
-    async def update_product(self, product: Product, changes: dict[str, object], outbox: tuple[str, str]) -> Product:
+    async def update_product(self, product: Product, changes: dict[str, object], outbox: OutboxMessage) -> Product:
         """Apply ``changes`` to an already-loaded product + emit its outbox row.
 
         The product is mutated through the ORM so ``version_id`` auto-bumps
@@ -147,7 +154,7 @@ class CatalogRepository:
         await self._session.refresh(product)
         return product
 
-    async def soft_delete_product(self, product: Product, outbox: tuple[str, str]) -> None:
+    async def soft_delete_product(self, product: Product, outbox: OutboxMessage) -> None:
         """Soft-delete (``deleted_at``) + emit the ``ProductDeleted`` outbox row."""
         product.deleted_at = datetime.now(UTC)
         self._session.add(self._outbox_row(outbox))
@@ -155,9 +162,7 @@ class CatalogRepository:
 
     # --- image pipeline state (presign sets pending; the worker marks ready/failed) ---
 
-    async def set_image_pending(
-        self, product: Product, upload_token: str, outbox: tuple[str, str] | None = None
-    ) -> None:
+    async def set_image_pending(self, product: Product, upload_token: str, outbox: OutboxMessage | None = None) -> None:
         """Mark an owned product's image as awaiting upload and record which upload.
 
         ``upload_token`` is the freshly-minted upload's token; storing it lets the
@@ -176,7 +181,7 @@ class CatalogRepository:
         await self._session.commit()
 
     async def mark_image_ready(
-        self, product_id: uuid.UUID, upload_token: str, image_key: str, outbox: tuple[str, str] | None = None
+        self, product_id: uuid.UUID, upload_token: str, image_key: str, outbox: ImageOutboxFactory | None = None
     ) -> bool:
         """Worker path: attach the processed key and flip to ``ready`` (idempotent).
 
@@ -185,10 +190,13 @@ class CatalogRepository:
         on ``image_upload_token`` so a stale event for a superseded upload updates
         zero rows (returns ``False``) instead of clobbering newer image state.
 
-        When the flip actually lands and ``outbox`` is supplied, its
-        (``ProductUpdated``) row is written in the **same transaction** — so the
-        image becoming ready invalidates the read-cache through the normal outbox →
-        relay → ``catalog-cache`` path, keeping cached responses from going stale.
+        When the flip actually lands and ``outbox`` is supplied, the factory is
+        called with the UPDATE's ``RETURNING`` row and its (``ProductUpdated``) row
+        is written in the **same transaction** — so the payload carries the
+        post-update state (never a value read before the write, which a concurrent
+        merchant edit could have already replaced) and the image becoming ready
+        invalidates the read-cache through the normal outbox → relay →
+        ``catalog-cache`` path.
 
         Guarded on ``image_status = 'pending'`` as well as the token, so a
         **redelivery** of the same event (the row is already ``ready``) updates zero
@@ -199,7 +207,8 @@ class CatalogRepository:
                 f"UPDATE {SCHEMA}.products "
                 "SET image_key = :key, image_status = :ready, updated_at = now() "
                 "WHERE id = :id AND image_upload_token = :token "
-                "AND image_status = :pending AND deleted_at IS NULL"
+                "AND image_status = :pending AND deleted_at IS NULL "
+                f"RETURNING {_EVENT_COLS}"
             ),
             {
                 "key": image_key,
@@ -209,29 +218,26 @@ class CatalogRepository:
                 "pending": ImageStatus.PENDING.value,
             },
         )
-        applied = result.rowcount > 0
-        if applied and outbox is not None:
-            self._session.add(self._outbox_row(outbox))
-        await self._session.commit()
-        return applied
+        return await self._commit_image_flip(result, outbox)
 
     async def mark_image_failed(
-        self, product_id: uuid.UUID, upload_token: str, outbox: tuple[str, str] | None = None
+        self, product_id: uuid.UUID, upload_token: str, outbox: ImageOutboxFactory | None = None
     ) -> bool:
         """Worker path: flip to ``failed`` when the upload doesn't pass sniff/re-encode.
 
         Token- and ``pending``-guarded like :meth:`mark_image_ready` — a stale
         failure can't overwrite a newer pending/ready image, and a redelivery of an
         already-``failed`` row updates zero rows so no duplicate outbox row is
-        emitted. A supplied ``outbox`` row is written in the same transaction when
-        the flip lands, so the status change invalidates the read-cache.
+        emitted. The ``outbox`` factory is fed the same transaction's ``RETURNING``
+        row, so the status change invalidates the read-cache with post-update state.
         """
         result = await self._session.execute(
             text(
                 f"UPDATE {SCHEMA}.products "
                 "SET image_status = :failed, updated_at = now() "
                 "WHERE id = :id AND image_upload_token = :token "
-                "AND image_status = :pending AND deleted_at IS NULL"
+                "AND image_status = :pending AND deleted_at IS NULL "
+                f"RETURNING {_EVENT_COLS}"
             ),
             {
                 "id": product_id,
@@ -240,13 +246,17 @@ class CatalogRepository:
                 "pending": ImageStatus.PENDING.value,
             },
         )
-        applied = result.rowcount > 0
-        if applied and outbox is not None:
-            self._session.add(self._outbox_row(outbox))
+        return await self._commit_image_flip(result, outbox)
+
+    async def _commit_image_flip(self, result: Result[Any], outbox: ImageOutboxFactory | None) -> bool:
+        """Commit a guarded image UPDATE, emitting the event built from its own row."""
+        row = result.mappings().first()
+        if row is not None and outbox is not None:
+            self._session.add(self._outbox_row(outbox(row)))
         await self._session.commit()
-        return applied
+        return row is not None
 
     @staticmethod
-    def _outbox_row(outbox: tuple[str, str]) -> Outbox:
+    def _outbox_row(outbox: OutboxMessage) -> Outbox:
         event_type, payload = outbox
         return Outbox(event_type=event_type, payload=payload)

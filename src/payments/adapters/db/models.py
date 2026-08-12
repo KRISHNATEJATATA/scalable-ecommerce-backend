@@ -3,7 +3,7 @@
 import uuid
 from decimal import Decimal
 
-from sqlalchemy import Numeric, String, UniqueConstraint
+from sqlalchemy import Index, Numeric, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -27,6 +27,9 @@ class Payment(Base, TimestampMixin):
     __tablename__ = "payments"
     __table_args__ = (
         UniqueConstraint("idempotency_key", name="uq_payments_idempotency_key"),
+        # ``list_by_order_id`` keyset-orders by ``(created_at, id)`` within one
+        # order — this index serves both the lookup and the ORDER BY.
+        Index("ix_payments_order_id_created_at_id", "order_id", "created_at", "id"),
         {"schema": SCHEMA},
     )
 

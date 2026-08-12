@@ -10,8 +10,10 @@ through the transactional outbox, the relay ships it, and this consumer drops th
 now-stale cache entry.
 
 Idempotent by construction: a ``DELETE`` of an already-absent key is a no-op, and
-``SqsConsumer`` additionally dedupes on ``event_id``. A handler that raises leaves
-the message for SQS redrive → DLQ (replay per ``docs/RUNBOOK.md``).
+``SqsConsumer`` additionally dedupes on ``event_id`` **within this subscription**
+(``event:catalog-cache:{event_id}``, so another subscriber to the same event still
+runs its own handler). A handler that raises leaves the message for SQS redrive →
+DLQ (replay per ``docs/RUNBOOK.md``).
 Run: ``python -m src.catalog.adapters.cache_worker``.
 """
 
@@ -65,6 +67,7 @@ async def run_worker(settings: AppSettings, valkey: Any, stop: asyncio.Event) ->
             valkey,
             settings.catalog_cache_queue_url,
             make_invalidation_handler(cache),
+            consumer_name="catalog-cache",
             dedup_ttl_seconds=settings.consumer_dedup_ttl_seconds,
             lease_ttl_seconds=settings.consumer_lease_ttl_seconds,
             max_messages=settings.consumer_max_messages,

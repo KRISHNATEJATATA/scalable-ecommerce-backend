@@ -9,6 +9,7 @@ criteria: merchant-scoped CRUD (cross-merchant → 403), keyset/filter listing, 
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -232,6 +233,25 @@ async def test_bad_sort_field_is_400(app_ctx, rsa_key):
     assert resp.status_code == 400, resp.text
 
 
+async def test_unsupported_filter_is_rejected_not_ignored(app_ctx, rsa_key):
+    """An undeclared query param would otherwise be silently ignored, answering an
+    unfiltered page to a filtered question."""
+    token = _make_token(rsa_key, roles=["consumer"])
+    async with _client(app_ctx) as client:
+        resp = await client.get("/v1/products?price=5", headers=_auth(token))
+    assert resp.status_code == 400, resp.text
+
+
+async def test_structurally_valid_but_uncastable_cursor_is_400(app_ctx, rsa_key):
+    """A cursor that decodes cleanly but carries values no column can cast must be a
+    purpose-named 400, not a 500 from a failed Postgres CAST."""
+    token = _make_token(rsa_key, roles=["consumer"])
+    bad = base64.urlsafe_b64encode(json.dumps(["invalid", "invalid"]).encode()).decode()
+    async with _client(app_ctx) as client:
+        resp = await client.get(f"/v1/products?cursor={bad}", headers=_auth(token))
+    assert resp.status_code == 400, resp.text
+
+
 # --- update ---------------------------------------------------------------
 
 
@@ -443,20 +463,35 @@ async def test_mark_image_ready_is_token_guarded(sessionmaker):
 
 async def test_mark_image_ready_emits_outbox_only_when_applied(sessionmaker):
     """A landed image-ready flip writes its ProductUpdated outbox row in the same
-    txn (so the read-cache is invalidated); a stale (superseded) flip writes none."""
+    txn (so the read-cache is invalidated); a stale (superseded) flip writes none.
+
+    The payload is built from the UPDATE's own ``RETURNING`` row, so it can't carry
+    state read before the write."""
     from src.catalog.adapters.db.repository import CatalogRepository
 
     pid = await _seed_pending(sessionmaker, "tokB")
-    outbox = ("ProductUpdated", '{"type":"ProductUpdated"}')
+    seen_rows = []
+
+    def outbox(row):
+        seen_rows.append(dict(row))
+        return ("ProductUpdated", json.dumps({"type": "ProductUpdated", "name": row["name"]}))
+
     async with sessionmaker() as s:
         repo = CatalogRepository(s)
         assert await repo.mark_image_ready(pid, "tokA", "public/stale.webp", outbox=outbox) is False  # stale
         assert await repo.mark_image_ready(pid, "tokB", "public/current.webp", outbox=outbox) is True  # applied
     async with sessionmaker() as s:
-        count = (
-            await s.execute(text("SELECT count(*) FROM catalog.outbox WHERE event_type = 'ProductUpdated'"))
-        ).scalar_one()
-    assert count == 1  # exactly one outbox row — only the applied flip emitted
+        row = (
+            await s.execute(
+                text(
+                    "SELECT count(*) AS n, min(payload) AS payload FROM catalog.outbox "
+                    "WHERE event_type = 'ProductUpdated'"
+                )
+            )
+        ).one()
+    assert row.n == 1  # exactly one outbox row — only the applied flip emitted
+    assert len(seen_rows) == 1 and seen_rows[0]["product_id"] == pid  # factory fed the updated row
+    assert json.loads(row.payload)["name"] == seen_rows[0]["name"]
 
     from src.catalog.adapters.db.repository import CatalogRepository
 

@@ -16,16 +16,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections.abc import Mapping
 from decimal import Decimal
 from enum import StrEnum
-from types import SimpleNamespace
 from typing import Any, Protocol
 
 from src.catalog.application.image_processing import UnsupportedImageError, process_image
 from src.catalog.application.outbox import product_updated_outbox
 from src.catalog.domain.image_keys import parse_upload_key, public_main_key, public_thumb_key
-from src.catalog.ports.repository import CatalogRepositoryPort
+from src.catalog.ports.repository import CatalogRepositoryPort, ImageOutboxFactory
 from src.catalog.ports.storage import ImageStorePort
+from src.shared.db.outbox import OutboxMessage
 
 log = logging.getLogger(__name__)
 
@@ -79,6 +80,10 @@ class ImageIngestService:
         (token no longer the product's pending upload) is a no-op. CPU-bound
         sniff/re-encode runs off the event loop via ``asyncio.to_thread``.
         """
+        # Not consumer-scoped like the bus dedup key (``event:{consumer}:{id}``) on
+        # purpose: this drains an S3→SQS notification **queue**, not an SNS fan-out,
+        # so the image worker is the only reader and the object+etag pair is already
+        # the unique unit of work. Namespace it if a second consumer ever subscribes.
         dedup_key = f"image:{key}:{etag}"
         if await self._dedup.exists(dedup_key):
             log.debug("duplicate upload event %s deduped", key)
@@ -103,8 +108,7 @@ class ImageIngestService:
             )
         except UnsupportedImageError as exc:
             log.warning("rejected upload for product %s: %s", product_id, exc)
-            outbox = await self._product_updated_outbox(product_id)
-            failed = await self._repo.mark_image_failed(product_id, token, outbox=outbox)
+            failed = await self._repo.mark_image_failed(product_id, token, outbox=_image_outbox)
             await self._dedup.set(dedup_key, "1", ex=self._ttl)
             if not failed:  # token no longer current → a newer upload superseded this reject
                 log.info("product %s failed-upload %s superseded (stale event)", product_id, token)
@@ -116,8 +120,7 @@ class ImageIngestService:
         for name, data in processed.thumbnails.items():
             await self._store.put_bytes(public_thumb_key(product_id, token, name), data, content_type=_WEBP)
 
-        outbox = await self._product_updated_outbox(product_id)
-        applied = await self._repo.mark_image_ready(product_id, token, main_key, outbox=outbox)
+        applied = await self._repo.mark_image_ready(product_id, token, main_key, outbox=_image_outbox)
         await self._dedup.set(dedup_key, "1", ex=self._ttl)
         if not applied:  # a newer upload superseded this one between download and write
             log.info("product %s image %s superseded (stale event)", product_id, token)
@@ -125,27 +128,23 @@ class ImageIngestService:
         log.info("product %s image ready: %s", product_id, main_key)
         return IngestOutcome.READY
 
-    async def _product_updated_outbox(self, product_id: uuid.UUID) -> tuple[str, str] | None:
-        """Build the ``ProductUpdated`` outbox row for an image-state change.
 
-        The image flip only changes ``image_key``/``image_status`` but that alters
-        the cached product response (``image_url``/``image_status``), so it must
-        publish ``ProductUpdated`` to invalidate the read-cache — event-driven, same
-        as an ordinary edit. Product fields are unchanged by the flip, so the
-        current row supplies them; ``None`` if the product is gone (the guarded
-        UPDATE will then also be a no-op, so nothing is emitted).
-        """
-        product = await self._repo.get_product(product_id)
-        if product is None:
-            return None
-        event = product_updated_outbox(
-            product_id=product_id,
-            merchant_id=product.merchant_id,
-            name=product.name,
-            price=product.price,
-            category=product.category,
-        )
-        return event
+def _image_outbox(row: Mapping[str, Any]) -> OutboxMessage:
+    """Build the ``ProductUpdated`` message from the image flip's own ``RETURNING`` row.
+
+    The flip only changes ``image_key``/``image_status``, but that alters the cached
+    product response (``image_url``/``image_status``), so it must publish
+    ``ProductUpdated`` to invalidate the read-cache — event-driven, same as an
+    ordinary edit. Built from the updated row **inside the write transaction** (not
+    from a pre-read), so a concurrent merchant edit can't make the payload stale.
+    """
+    return product_updated_outbox(
+        product_id=row["product_id"],
+        merchant_id=row["merchant_id"],
+        name=row["name"],
+        price=row["price"],
+        category=row["category"],
+    )
 
 
 def _self_check() -> None:  # pragma: no cover - runnable smoke test
@@ -165,19 +164,34 @@ def _self_check() -> None:  # pragma: no cover - runnable smoke test
         def __init__(self, apply_ready: bool) -> None:
             self._apply = apply_ready
             self.failed: list[uuid.UUID] = []
+            self.emitted: list[OutboxMessage] = []
 
-        async def get_product(self, product_id: uuid.UUID):
-            return None
+        def _emit(self, product_id: uuid.UUID, outbox: ImageOutboxFactory | None) -> None:
+            if outbox is not None:  # adapter feeds the factory the UPDATE's RETURNING row
+                self.emitted.append(
+                    outbox(
+                        {
+                            "product_id": product_id,
+                            "merchant_id": uuid.uuid4(),
+                            "name": "Widget",
+                            "price": Decimal("9.99"),
+                            "category": "misc",
+                        }
+                    )
+                )
 
         async def mark_image_ready(
-            self, product_id: uuid.UUID, token: str, image_key: str, outbox: tuple[str, str] | None = None
+            self, product_id: uuid.UUID, token: str, image_key: str, outbox: ImageOutboxFactory | None = None
         ) -> bool:
+            if self._apply:
+                self._emit(product_id, outbox)
             return self._apply
 
         async def mark_image_failed(
-            self, product_id: uuid.UUID, token: str, outbox: tuple[str, str] | None = None
+            self, product_id: uuid.UUID, token: str, outbox: ImageOutboxFactory | None = None
         ) -> bool:
             self.failed.append(product_id)
+            self._emit(product_id, outbox)
             return True
 
     class _Store:
@@ -211,16 +225,20 @@ def _self_check() -> None:  # pragma: no cover - runnable smoke test
         )
         assert await svc2.ingest("something/else.txt", "e") is IngestOutcome.SKIPPED
 
-        # An image-state change emits ProductUpdated so the read-cache is invalidated.
-        class _RowRepo(_Repo):
-            async def get_product(self, product_id: uuid.UUID):
-                return SimpleNamespace(merchant_id=uuid.uuid4(), name="Widget", price=Decimal("9.99"), category="misc")
-
+        # A rejected upload flips to `failed` and emits ProductUpdated built from the
+        # write's own row (post-update state), so the read-cache is invalidated.
+        repo = _Repo(True)
         svc3 = ImageIngestService(
-            _RowRepo(True), _Store(), _Dedup(), max_dimension=64, max_bytes=1, max_pixels=1, dedup_ttl_seconds=60
+            repo, _Store(), _Dedup(), max_dimension=64, max_bytes=1, max_pixels=1, dedup_ttl_seconds=60
         )
-        outbox = await svc3._product_updated_outbox(pid)
-        assert outbox is not None and outbox[0] == "ProductUpdated" and str(pid) in outbox[1]
+        assert await svc3.ingest(valid_key, "e") is IngestOutcome.FAILED
+        assert repo.emitted and repo.emitted[0][0] == "ProductUpdated" and str(pid) in repo.emitted[0][1]
+
+        # A superseded (stale) ready-flip emits nothing: the guarded UPDATE returns no
+        # row, so the adapter never calls the factory.
+        stale = _Repo(False)
+        assert await stale.mark_image_ready(pid, "tok123", "k", outbox=_image_outbox) is False
+        assert not stale.emitted
 
     asyncio.run(_run())
     print("OK image_ingest self-check passed")

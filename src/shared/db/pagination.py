@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import base64
 import json
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -73,13 +76,29 @@ def encode_cursor(sort_value: Any, id_value: Any) -> str:
     return base64.urlsafe_b64encode(raw).decode()
 
 
-def decode_cursor(cursor: str) -> tuple[str, str]:
+# Parsers used to prove a decoded cursor value is convertible to its column type
+# BEFORE it reaches SQL. Without this a structurally valid cursor carrying garbage
+# (e.g. ``["invalid", "invalid"]``) survives the codec and blows up as a Postgres
+# cast error (500) instead of the purpose-named 400.
+_SORT_VALUE_PARSERS: dict[str, Callable[[str], Any]] = {
+    "timestamptz": datetime.fromisoformat,
+    "numeric": Decimal,
+    "uuid": uuid.UUID,
+    "text": str,
+}
+
+
+def decode_cursor(cursor: str, sort_kind: str) -> tuple[str, str]:
     """Decode a cursor to ``(sort_value, id)`` strings; Postgres casts them back to column types.
 
     Any malformed/tampered value → :class:`InvalidCursorError`. Values stay
     strings on purpose: they're re-cast to the sort/id column types in SQL, so
-    no client-supplied text ever reaches a column position untyped.
+    no client-supplied text ever reaches a column position untyped. ``sort_kind``
+    names the target Postgres type so a value that could never cast is rejected
+    here (400) rather than failing mid-query (500); it is **required** so a new
+    call site can't silently skip that check. The id is always a uuid.
     """
+    parse_sort_value = _SORT_VALUE_PARSERS[sort_kind]  # our bug, not the client's → KeyError, not a 400
     try:
         raw = base64.urlsafe_b64decode(cursor.encode())
         parsed = json.loads(raw)
@@ -87,10 +106,12 @@ def decode_cursor(cursor: str) -> tuple[str, str]:
         # `a, b = "xy"` iterates chars, both silently "succeeding" on the wrong shape.
         if not isinstance(parsed, list) or len(parsed) != 2:
             raise ValueError("cursor must decode to a 2-item [sort_value, id] array")
-        sort_value, id_value = parsed
-    except Exception as exc:  # malformed base64 / JSON / wrong shape
+        sort_value, id_value = str(parsed[0]), str(parsed[1])
+        uuid.UUID(id_value)
+        parse_sort_value(sort_value)
+    except Exception as exc:  # malformed base64 / JSON / wrong shape / uncastable value
         raise InvalidCursorError(cursor) from exc
-    return str(sort_value), str(id_value)
+    return sort_value, id_value
 
 
 def resolve_sort_column(sort_field: str, sort_map: Mapping[str, ColumnElement]) -> ColumnElement:
@@ -151,13 +172,11 @@ def build_page[T](items: list[T], params: PageParams, key_of: Callable[[T], tupl
 
 if __name__ == "__main__":
     # DB-free self-check of the codec + envelope + whitelist gates.
-    import uuid
-    from datetime import datetime
-
     pid = uuid.uuid4()
     ts = datetime.now()
     enc = encode_cursor(ts, pid)
-    assert decode_cursor(enc) == (str(ts), str(pid))
+    assert decode_cursor(enc, "text") == (str(ts), str(pid))
+    assert decode_cursor(enc, "timestamptz") == (str(ts), str(pid))
 
     _dict_shaped = base64.urlsafe_b64encode(json.dumps({"a": 1, "b": 2}).encode()).decode()
     _two_char_str = base64.urlsafe_b64encode(json.dumps("xy").encode()).decode()
@@ -167,13 +186,23 @@ if __name__ == "__main__":
         base64.urlsafe_b64encode(b'"x"').decode(),
         _dict_shaped,
         _two_char_str,
+        encode_cursor(ts, "not-a-uuid"),  # structurally valid, id not castable to uuid
     ):
         try:
-            decode_cursor(bad)
+            decode_cursor(bad, "text")
         except InvalidCursorError:
             pass
         else:
             raise AssertionError(f"expected InvalidCursorError for {bad!r}")
+
+    # Structurally valid but semantically uncastable sort values → 400, not a SQL error.
+    for kind, bad_value in (("timestamptz", "invalid"), ("numeric", "invalid"), ("uuid", "invalid")):
+        try:
+            decode_cursor(encode_cursor(bad_value, pid), kind)
+        except InvalidCursorError:
+            pass
+        else:
+            raise AssertionError(f"expected InvalidCursorError for {kind} value {bad_value!r}")
 
     sort_map: dict[str, ColumnElement] = {"created_at": literal(1)}
     assert resolve_sort_column("created_at", sort_map) is sort_map["created_at"]

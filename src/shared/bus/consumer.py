@@ -5,9 +5,9 @@ is the verbatim event payload and the ``traceparent`` rides as a message
 attribute). For each message:
 
 1. Parse the envelope and validate it against its registered, versioned contract.
-2. If ``event:{event_id}`` is already the ``done`` marker → duplicate → ack and skip.
+2. If ``event:{consumer}:{event_id}`` is already the ``done`` marker → duplicate → ack and skip.
 3. Atomically claim a **short processing lease** under a unique token (``SET
-   event:{id} <token> NX EX lease_ttl``). If the claim is lost (another worker in
+   event:{consumer}:{id} <token> NX EX lease_ttl``). If the claim is lost (another worker in
    flight), leave the message for redrive rather than double-processing.
 4. Extract ``traceparent`` → pin the trace-id onto the log context for the handler.
 5. Run the handler. On success, upgrade the lease to a long ``done`` completion
@@ -21,10 +21,16 @@ attribute). For each message:
    per-subscription DLQ (replay via ``docs/RUNBOOK.md``).
 
 The Valkey dedup keys give best-effort effectively-once processing on top of the
-handler's own idempotent DB write. Two states share the ``event:{id}`` key so a
+handler's own idempotent DB write. Keys are **namespaced by consumer**
+(``event:{consumer}:{event_id}``) because SNS fans one event out to several
+subscriptions: a global ``event:{id}`` key would let the first subscriber that
+finishes suppress every *other* subscriber's handler. Dedup is therefore
+per-subscription, which is the only scope at which "already processed" is true.
+
+Two states share the ``event:{consumer}:{id}`` key so a
 crash can't lose an event: a **short processing lease** (a unique per-delivery
 token, TTL sized to the SQS visibility window) claimed before the handler runs,
-and a **long completion marker** (``event:{id}`` = ``done``) written only after the
+and a **long completion marker** (= ``done``) written only after the
 handler succeeds. A worker that crashes mid-handle lets the *lease* expire, so
 redelivery re-claims and reprocesses instead of the event being discarded for the
 full dedup TTL. The lease carries a **token** and is completed/released with
@@ -76,7 +82,10 @@ class SqsConsumer:
     """Drains one SQS queue into an async ``handler``.
 
     ``sqs`` is an entered aioboto3 SQS client; ``valkey`` is an async
-    redis-py-compatible client used for the ``event:{id}`` lease/completion marker.
+    redis-py-compatible client used for the ``event:{consumer}:{id}`` lease/completion
+    marker. ``consumer_name`` is the stable identity of this subscription (e.g.
+    ``catalog-cache``) — it scopes dedup so one subscriber completing an event never
+    suppresses another subscriber's handler for the same fanned-out event.
     """
 
     def __init__(
@@ -86,6 +95,7 @@ class SqsConsumer:
         queue_url: str,
         handler: Handler,
         *,
+        consumer_name: str,
         dedup_ttl_seconds: int,
         lease_ttl_seconds: int,
         max_messages: int = 10,
@@ -95,6 +105,7 @@ class SqsConsumer:
         self._valkey = valkey
         self._queue_url = queue_url
         self._handler = handler
+        self._consumer_name = consumer_name
         self._ttl = dedup_ttl_seconds
         self._lease_ttl = lease_ttl_seconds
         self._max_messages = max_messages
@@ -122,7 +133,9 @@ class SqsConsumer:
         validate_event(event)
 
         event_id = event["event_id"]
-        marker_key = f"event:{event_id}"
+        # Per-subscription scope: the same event delivered to another subscription
+        # gets its own marker, so fan-out consumers never dedupe each other away.
+        marker_key = f"event:{self._consumer_name}:{event_id}"
 
         # Already completed by a prior/concurrent delivery → dedupe, ack.
         if await self._is_done(marker_key):

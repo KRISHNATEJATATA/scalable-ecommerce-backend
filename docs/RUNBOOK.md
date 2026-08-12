@@ -87,6 +87,15 @@ publish-then-mark, so events are not lost — they ship once the relay recovers.
 `service`-role relay task; if lag persists, scale relay replicas (safe — `FOR UPDATE SKIP
 LOCKED` prevents double-claim).
 
+Inspect the backlog (note: the timestamp column is **`occurred_at`**, not `created_at` — the
+outbox is not a `TimestampMixin` table; `event_id`/`trace_id` live inside `payload`):
+
+```sql
+SELECT event_type, occurred_at, published_at IS NOT NULL AS published, payload
+FROM catalog.outbox            -- or identity./inventory./orders./payments.
+ORDER BY occurred_at DESC LIMIT 20;
+```
+
 ### 6. Image worker (secure upload pipeline)
 
 The `service`-role **image worker** (`python -m src.catalog.adapters.image_worker`) drains the
@@ -132,7 +141,7 @@ it **invalidates** the product's Valkey read-cache entry: it deletes both the ca
 the lock is what stops a cache fill that began *before* this update from writing its now-stale
 read back afterwards — the filler's guarded store no-ops once its lock is gone (a lock we already
 hold, so there is no separate expiring generation counter to race). The consumer is idempotent
-(dedupe on `event_id`) — re-delivering an event just re-invalidates an already-absent key.
+(dedupe on `event:{consumer}:{event_id}`) — re-delivering an event just re-invalidates an already-absent key.
 
 **Event-loss safety (processing lease).** A message is claimed with a **short processing lease**
 carrying a unique per-worker token (`CONSUMER_LEASE_TTL_SECONDS`, default 60s — keep it **≤** the

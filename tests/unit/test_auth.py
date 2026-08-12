@@ -28,6 +28,7 @@ from testcontainers.postgres import PostgresContainer
 
 from src.app import create_app
 from src.identity.adapters.db.repository import IdentityRepository
+from src.identity.application.outbox import user_created_outbox
 from src.shared.config.setting import AppSettings, get_settings
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -331,7 +332,7 @@ async def test_jit_get_or_create_is_race_safe(sessionmaker):
     async def provision():
         # Each racing task gets its own session (mirrors real concurrent requests).
         async with sessionmaker() as session:
-            return await IdentityRepository(session).get_or_create(sub, "race@test.io")
+            return await IdentityRepository(session).get_or_create(sub, "race@test.io", user_created_outbox)
 
     a, b = await asyncio.gather(provision(), provision())
     assert a.id == b.id  # both observe the single row (one insert, one DO UPDATE)
@@ -339,4 +340,11 @@ async def test_jit_get_or_create_is_race_safe(sessionmaker):
     async with sessionmaker() as session:
         result = await session.execute(text("SELECT count(*) FROM identity.users WHERE oidc_sub = :s"), {"s": sub})
         count = result.scalar_one()
+        events = await session.execute(
+            text("SELECT count(*) FROM identity.outbox WHERE event_type = 'UserCreated' AND payload LIKE :p"),
+            {"p": f'%"user_id":"{a.id}"%'},
+        )
     assert count == 1
+    # UserCreated is written in the same txn as the insert, and exactly once —
+    # the loser of the ON CONFLICT race must not re-announce a creation.
+    assert events.scalar_one() == 1

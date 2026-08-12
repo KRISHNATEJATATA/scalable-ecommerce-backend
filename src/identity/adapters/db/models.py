@@ -31,7 +31,8 @@ class User(Base, TimestampMixin):
     __table_args__ = (UniqueConstraint("oidc_sub"), {"schema": SCHEMA})
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    oidc_sub: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
+    # No ``index=True``: ``UNIQUE(oidc_sub)`` already backs the lookup with an index.
+    oidc_sub: Mapped[str] = mapped_column(String(255), nullable=False)
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 

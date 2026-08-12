@@ -14,6 +14,7 @@ import uuid
 
 from src.identity.application.dto import UserResponse
 from src.identity.application.mappers import to_domain
+from src.identity.application.outbox import user_created_outbox
 from src.identity.ports.admin import IdentityAdminPort
 from src.identity.ports.repository import IdentityRepositoryPort
 
@@ -39,8 +40,12 @@ class IdentityService:
         return UserResponse.model_validate(to_domain(row))
 
     async def get_or_create_by_sub(self, oidc_sub: str, email: str) -> UserResponse:
-        """JIT-provision (or fetch) the local mirror for a verified caller."""
-        row = await self._repo.get_or_create(oidc_sub, email)
+        """JIT-provision (or fetch) the local mirror for a verified caller.
+
+        A genuine insert also writes ``UserCreated`` to the identity outbox in the
+        same transaction (the repository emits it only when the row was inserted).
+        """
+        row = await self._repo.get_or_create(oidc_sub, email, user_created_outbox)
         return UserResponse.model_validate(to_domain(row))
 
 
@@ -73,6 +78,10 @@ class IdentityAdminService:
         if row is None:
             email = await self._admin.get_user_email(oidc_sub)
             if email is not None:
+                # No ``UserCreated``: this row exists only to carry the disable, and
+                # the ``set_active`` below is a separate transaction — announcing an
+                # active user we're about to disable would publish a lie (and a crash
+                # in between would leave it uncorrected).
                 await self._repo.get_or_create(oidc_sub, email)
                 await self._repo.set_active(oidc_sub, False)
 

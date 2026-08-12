@@ -93,10 +93,21 @@ def _message(event_id: str, *, trace_id: str = "0af7651916cd43dd8448eb211c80319c
     }
 
 
-def _consumer(sqs, valkey, handler) -> SqsConsumer:
+def _consumer(sqs, valkey, handler, name: str = "test-consumer") -> SqsConsumer:
     return SqsConsumer(
-        sqs, valkey, "q-url", handler, dedup_ttl_seconds=60, lease_ttl_seconds=30, max_messages=10, wait_time_seconds=0
+        sqs,
+        valkey,
+        "q-url",
+        handler,
+        consumer_name=name,
+        dedup_ttl_seconds=60,
+        lease_ttl_seconds=30,
+        max_messages=10,
+        wait_time_seconds=0,
     )
+
+
+_KEY = "event:test-consumer:{}"
 
 
 @pytest.mark.asyncio
@@ -115,7 +126,7 @@ async def test_duplicate_delivery_is_processed_once() -> None:
 
     assert calls == [event_id]  # handler ran exactly once
     assert sqs.deleted == ["a", "b"]  # both messages acked (dupe deleted without reprocessing)
-    assert f"event:{event_id}" in valkey.store
+    assert _KEY.format(event_id) in valkey.store
 
 
 @pytest.mark.asyncio
@@ -159,7 +170,7 @@ async def test_inflight_lease_leaves_message_for_redrive() -> None:
         raise AssertionError("handler must not run while another worker holds the lease")
 
     valkey = FakeValkey()
-    valkey.store[f"event:{event_id}"] = uuid.uuid4().hex  # another worker's lease token
+    valkey.store[_KEY.format(event_id)] = uuid.uuid4().hex  # another worker's lease token
     sqs = FakeSqs([_message(event_id, handle="inflight")])
     handled = await _consumer(sqs, valkey, handler).poll_once()
 
@@ -172,7 +183,7 @@ async def test_expired_worker_cannot_clobber_reclaimed_lease() -> None:
     """The lease is owner-safe: a worker whose lease expired and was re-claimed by
     another worker must not complete/delete the new owner's lease."""
     event_id = str(uuid.uuid4())
-    marker = f"event:{event_id}"
+    marker = _KEY.format(event_id)
 
     async def slow_then_check(event: dict) -> None:
         # Simulate our lease expiring and another worker re-claiming it mid-handle.
@@ -204,7 +215,7 @@ async def test_completed_event_marker_survives_for_dedup() -> None:
     await _consumer(sqs, valkey, handler).poll_once()
 
     assert calls == [event_id]
-    assert valkey.store[f"event:{event_id}"] == "done"  # completion marker, not the lease
+    assert valkey.store[_KEY.format(event_id)] == "done"  # completion marker, not the lease
 
 
 @pytest.mark.asyncio
@@ -219,3 +230,24 @@ async def test_handler_error_leaves_message_for_redrive() -> None:
     assert handled == 0
     assert sqs.deleted == []  # not deleted → SQS redelivers → DLQ after maxReceiveCount
     assert valkey.store == {}  # never marked processed
+
+
+@pytest.mark.asyncio
+async def test_fanout_subscribers_each_process_the_same_event() -> None:
+    """SNS fan-out: two subscriptions sharing one Valkey must BOTH run their handler
+    for the same event, while a duplicate delivery inside each is still suppressed."""
+    event_id = str(uuid.uuid4())
+    valkey = FakeValkey()  # shared, as in production
+    calls: dict[str, list[str]] = {"a": [], "b": []}
+
+    for name in ("a", "b"):
+
+        async def handler(event: dict, _n: str = name) -> None:
+            calls[_n].append(event["event_id"])
+
+        sqs = FakeSqs([_message(event_id, handle=f"{name}-1"), _message(event_id, handle=f"{name}-2")])
+        await _consumer(sqs, valkey, handler, name=f"consumer-{name}").poll_once()
+
+    assert calls == {"a": [event_id], "b": [event_id]}  # each subscriber ran exactly once
+    assert valkey.store[f"event:consumer-a:{event_id}"] == "done"
+    assert valkey.store[f"event:consumer-b:{event_id}"] == "done"

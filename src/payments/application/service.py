@@ -20,8 +20,8 @@ class PaymentsService:
     def __init__(self, repo: PaymentsRepositoryPort) -> None:
         self._repo = repo
 
-    async def get_by_order_id(self, order_id: uuid.UUID, params: PageParams) -> PageResponse[PaymentResponse]:
-        """Return a keyset page of payments for an order (newest first by default)."""
-        page = await self._repo.get_by_order_id(order_id, params)
+    async def list_by_order_id(self, order_id: uuid.UUID, params: PageParams) -> PageResponse[PaymentResponse]:
+        """Return a keyset page of payment attempts for an order (newest first by default)."""
+        page = await self._repo.list_by_order_id(order_id, params)
         items = [PaymentResponse.model_validate(to_domain(row)) for row in page.items]
         return PageResponse(items=items, next_cursor=page.next_cursor)

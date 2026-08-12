@@ -13,7 +13,7 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from src.catalog.api.schemas import (
     ImagePresignRequest,
@@ -23,6 +23,7 @@ from src.catalog.api.schemas import (
     ProductUpdate,
 )
 from src.catalog.application.service import CatalogService
+from src.shared.api.query import reject_unknown_query_params
 from src.shared.auth.dependencies import PrincipalDep, require_role
 from src.shared.auth.principal import Principal
 from src.shared.container import CurrentUserDep, get_catalog_service
@@ -39,9 +40,14 @@ MerchantPrincipalDep = Annotated[Principal, _merchant_principal]
 
 _NOT_FOUND = HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="product not found")
 
+# Every query param the listing understands; anything else is a 400 (see
+# ``shared/api/query.py``) rather than a silently unfiltered page.
+_LIST_QUERY_PARAMS = frozenset({"limit", "sort", "cursor", "category", "merchant_id"})
+
 
 @router.get("", response_model=PageResponse[ProductResponse])
 async def list_products(
+    request: Request,
     service: CatalogServiceDep,
     _principal: PrincipalDep,
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
@@ -51,6 +57,7 @@ async def list_products(
     merchant_id: uuid.UUID | None = None,
 ) -> PageResponse[ProductResponse]:
     """Keyset-paginated, filterable listing of live products."""
+    reject_unknown_query_params(request, _LIST_QUERY_PARAMS)
     filters: dict[str, object] = {}
     if category is not None:
         filters["category"] = category

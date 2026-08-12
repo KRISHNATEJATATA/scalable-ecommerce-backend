@@ -600,7 +600,9 @@ components:
         next_cursor:
           type: [string, "null"]
           description: Opaque cursor for the next page; `null` on the last page.
-      required: [items]
+      # next_cursor is always present (explicitly null on the last page), so it is
+      # required — clients must not have to distinguish "absent" from "null".
+      required: [items, next_cursor]
     Problem:
       description: RFC 9457 Problem Details (the one flat error shape).
       type: object

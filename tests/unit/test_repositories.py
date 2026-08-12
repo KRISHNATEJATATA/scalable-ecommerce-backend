@@ -21,6 +21,7 @@ from sqlalchemy import event, text
 from src.catalog.adapters.db.repository import CatalogRepository
 from src.inventory.adapters.db.repository import InventoryRepository
 from src.orders.adapters.db.repository import OrdersRepository
+from src.payments.adapters.db.repository import PaymentsRepository
 from src.shared.db.pagination import PageParams
 from src.shared.errors.exceptions import InvalidCursorError, InvalidQueryParamError
 
@@ -67,6 +68,26 @@ async def _insert_order(session, *, user_id, created_at, item_count):
             {"order_id": oid, "name": f"line-{i}", "price": Decimal("5.00")},
         )
     return oid
+
+
+async def _insert_payment(session, *, order_id, created_at, status="pending"):
+    pid = uuid.uuid4()
+    await session.execute(
+        text(
+            "INSERT INTO payments.payments "
+            "(id, order_id, idempotency_key, amount, status, created_at, updated_at) "
+            "VALUES (:id, :order_id, :key, :amount, :status, :created_at, :created_at)"
+        ),
+        {
+            "id": pid,
+            "order_id": order_id,
+            "key": str(uuid.uuid4()),
+            "amount": Decimal("10.00"),
+            "status": status,
+            "created_at": created_at,
+        },
+    )
+    return pid
 
 
 async def _walk(list_fn):
@@ -119,6 +140,35 @@ async def test_catalog_keyset_full_walk_no_dup_or_skip_with_midwalk_insert(sessi
     assert original_order == originals
 
 
+async def test_catalog_keyset_walks_tied_sort_values_via_id_tiebreaker(session):
+    """All rows share one ``created_at`` — only the id tiebreaker keeps the walk sane."""
+    repo = CatalogRepository(session)
+    same = datetime(2026, 1, 15, tzinfo=UTC)
+    ids = {await _insert_product(session, name=f"tie{i}", price=Decimal("9.99"), created_at=same) for i in range(5)}
+    await session.commit()
+
+    seen = await _walk(lambda c: repo.list_products(PageParams(limit=2, sort="-created_at", cursor=c)))
+    seen_ids = [p.id for p in seen if p.id in ids]
+    assert len(seen_ids) == 5 and set(seen_ids) == ids  # no duplicate, no skip
+    assert seen_ids == sorted(seen_ids, reverse=True)  # id DESC breaks the tie deterministically
+
+
+async def test_catalog_keyset_tied_price_values(session):
+    """Same tie, on a non-timestamp sort column (numeric cursor cast)."""
+    repo = CatalogRepository(session)
+    base = datetime(2026, 1, 20, tzinfo=UTC)
+    ids = {
+        await _insert_product(session, name=f"px{i}", price=Decimal("4.50"), created_at=base + timedelta(minutes=i))
+        for i in range(4)
+    }
+    await session.commit()
+
+    seen = await _walk(lambda c: repo.list_products(PageParams(limit=1, sort="price", cursor=c)))
+    seen_ids = [p.id for p in seen if p.id in ids]
+    assert len(seen_ids) == 4 and set(seen_ids) == ids
+    assert seen_ids == sorted(seen_ids)  # ascending sort → id ASC tiebreaker
+
+
 async def test_orders_keyset_terminates(session):
     repo = OrdersRepository(session)
     user_id = uuid.uuid4()
@@ -130,6 +180,57 @@ async def test_orders_keyset_terminates(session):
     seen = await _walk(lambda c: repo.list_orders(user_id, PageParams(limit=1, cursor=c)))
     assert len(seen) == 3
     assert len({o.id for o in seen}) == 3
+
+
+async def test_orders_keyset_full_walk_with_midwalk_insert(session):
+    """A concurrent order inserted mid-walk must not skip or duplicate the originals."""
+    repo = OrdersRepository(session)
+    user_id = uuid.uuid4()
+    base = datetime(2026, 2, 10, tzinfo=UTC)
+    originals = [
+        await _insert_order(session, user_id=user_id, created_at=base - timedelta(days=i), item_count=1)
+        for i in range(5)
+    ]
+    await session.commit()
+
+    seen: list[uuid.UUID] = []
+    cursor = None
+    inserted = False
+    while True:
+        page = await repo.list_orders(user_id, PageParams(limit=2, cursor=cursor))
+        seen.extend(o.id for o in page.items)
+        if not inserted:
+            # newest (above the cursor) and mid-range (below it) — neither may
+            # disturb the originals' walk.
+            await _insert_order(session, user_id=user_id, created_at=base + timedelta(days=1), item_count=1)
+            await _insert_order(session, user_id=user_id, created_at=base - timedelta(days=2, hours=12), item_count=1)
+            await session.commit()
+            inserted = True
+        if page.next_cursor is None:
+            break
+        cursor = page.next_cursor
+
+    for oid in originals:
+        assert seen.count(oid) == 1, f"{oid} skipped or duplicated"
+    assert [oid for oid in seen if oid in originals] == originals
+
+
+async def test_payments_list_by_order_id_paginates_newest_first(session):
+    """Retries share an ``order_id``; the page is scoped to it and newest-first."""
+    repo = PaymentsRepository(session)
+    order_id, other_order = uuid.uuid4(), uuid.uuid4()
+    base = datetime(2026, 6, 1, tzinfo=UTC)
+    attempts = [
+        await _insert_payment(session, order_id=order_id, created_at=base + timedelta(minutes=i)) for i in range(5)
+    ]
+    await _insert_payment(session, order_id=other_order, created_at=base)
+    await session.commit()
+
+    page = await repo.list_by_order_id(order_id, PageParams(limit=2))
+    assert [p.id for p in page.items] == attempts[::-1][:2] and page.next_cursor is not None
+
+    seen = await _walk(lambda c: repo.list_by_order_id(order_id, PageParams(limit=2, cursor=c)))
+    assert [p.id for p in seen] == attempts[::-1]  # every attempt, newest first, no leakage
 
 
 async def test_orders_scoped_to_user(session):

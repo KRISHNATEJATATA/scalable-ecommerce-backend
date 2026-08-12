@@ -40,7 +40,7 @@ class OrdersRepository:
         if status is not None:
             stmt = stmt.where(Order.status == status)
 
-        cursor = decode_cursor(params.cursor) if params.cursor else None
+        cursor = decode_cursor(params.cursor, "timestamptz") if params.cursor else None
         stmt = apply_keyset(stmt, sort_col, Order.id, params, cursor)
 
         rows = list((await self._session.execute(stmt)).scalars().all())

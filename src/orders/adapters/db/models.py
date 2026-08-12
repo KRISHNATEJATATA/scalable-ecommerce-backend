@@ -34,6 +34,9 @@ class Order(Base, TimestampMixin):
     __table_args__ = (
         UniqueConstraint("idempotency_key", name="uq_orders_idempotency_key"),
         Index("ix_orders_user_id_status", "user_id", "status"),
+        # ``list_orders`` is always user-scoped and keyset-ordered by
+        # ``(created_at, id)`` — this is the index that ORDER BY seeks on.
+        Index("ix_orders_user_id_created_at_id", "user_id", "created_at", "id"),
         {"schema": SCHEMA},
     )
 

@@ -3,6 +3,7 @@
 Implemented by ``adapters/db/repository.PaymentsRepository``. Returns every
 payment attempt for an order (retries share ``order_id``; only
 ``idempotency_key`` is unique) — reconciliation decides which is authoritative.
+Hence a keyset ``Page``, not the single row Ticket 2 sketched.
 """
 
 from __future__ import annotations
@@ -19,4 +20,4 @@ if TYPE_CHECKING:
 
 
 class PaymentsRepositoryPort(Protocol):
-    async def get_by_order_id(self, order_id: uuid.UUID, params: PageParams) -> Page[Any]: ...
+    async def list_by_order_id(self, order_id: uuid.UUID, params: PageParams) -> Page[Any]: ...
