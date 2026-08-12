@@ -11,20 +11,20 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from src.catalog.domain.image_status import ImageStatus
-from src.shared.config.setting import get_settings
 
 
-def _public_image_url(image_key: str | None, image_status: ImageStatus) -> str | None:
-    """Unsigned CDN URL for a READY public product image (``None`` otherwise)."""
+def public_image_url(image_key: str | None, image_status: ImageStatus, base: str | None) -> str | None:
+    """Unsigned CDN URL for a READY public product image (``None`` otherwise).
+
+    ``base`` is injected (from the app's settings, via the container) rather than
+    read from the global settings, so an app built with ``create_app(settings)``
+    serves URLs from *that* config.
+    """
     if image_status != ImageStatus.READY or not image_key:
         return None
-    settings = get_settings()
-    base = settings.s3_public_base_url or (
-        f"{settings.s3_endpoint_url}/{settings.s3_bucket}" if settings.s3_endpoint_url else None
-    )
     if not base:
         # No public base configured → refuse to emit a broken ``None/<bucket>/<key>``
         # URL. Startup validation (AppSettings) fails-fast in prod; this guards any
@@ -36,7 +36,10 @@ def _public_image_url(image_key: str | None, image_status: ImageStatus) -> str |
 class ProductResponse(BaseModel):
     """The public HTTP response shape for a product."""
 
-    model_config = ConfigDict(from_attributes=True)
+    # ``json_schema_serialization_defaults_required``: ``image_url`` has a default
+    # (the service fills it) but is always present on the wire — keep the generated
+    # response schema matching the hand-authored contract, which requires it.
+    model_config = ConfigDict(from_attributes=True, json_schema_serialization_defaults_required=True)
 
     id: uuid.UUID
     merchant_id: uuid.UUID
@@ -48,11 +51,10 @@ class ProductResponse(BaseModel):
     image_status: ImageStatus
     created_at: datetime
     updated_at: datetime
-
-    @computed_field  # unsigned CDN URL; presigned URLs stay reserved for private assets
-    @property
-    def image_url(self) -> str | None:
-        return _public_image_url(self.image_key, self.image_status)
+    # Unsigned CDN URL; presigned URLs stay reserved for private assets. Set by the
+    # service from the injected public base (see :func:`public_image_url`) — not a
+    # computed field, so it can't reach for the global settings at serialization time.
+    image_url: str | None = None
 
 
 class ProductCreate(BaseModel):

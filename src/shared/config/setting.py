@@ -141,6 +141,19 @@ class AppSettings(BaseSettings):
     worker_metrics_port: int | None = Field(default=None, gt=0, le=65535)
     metrics_pushgateway_url: str | None = None
 
+    @property
+    def image_public_base_url(self) -> str | None:
+        """Unsigned public base for product images (CDN, or the local endpoint/bucket path).
+
+        The endpoint fallback needs BOTH the endpoint and the bucket — an endpoint
+        without a bucket would otherwise build a malformed ``<endpoint>/None/<key>``.
+        """
+        if self.s3_public_base_url:
+            return self.s3_public_base_url
+        if self.s3_endpoint_url and self.s3_bucket:
+            return f"{self.s3_endpoint_url}/{self.s3_bucket}"
+        return None
+
     @model_validator(mode="after")
     def _require_public_image_base_in_cloud(self) -> "AppSettings":
         """Fail-fast: a real-AWS deploy serving images MUST set the public CDN base.

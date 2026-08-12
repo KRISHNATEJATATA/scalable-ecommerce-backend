@@ -86,11 +86,15 @@ def get_catalog_service(
     cache: Annotated[ProductCachePort | None, Depends(get_product_cache)],
 ) -> CatalogService:
     """Provide the catalog service over its repository + image-store + cache ports."""
+    settings = request.app.state.settings
     return CatalogService(
         repo,
         image_store,
         cache,
-        lock_ttl_seconds=request.app.state.settings.product_cache_lock_ttl_seconds,
+        lock_ttl_seconds=settings.product_cache_lock_ttl_seconds,
+        image_base_url=settings.image_public_base_url,
+        image_max_upload_bytes=settings.image_max_upload_bytes,
+        image_upload_ttl_seconds=settings.image_upload_ttl_seconds,
     )
 
 

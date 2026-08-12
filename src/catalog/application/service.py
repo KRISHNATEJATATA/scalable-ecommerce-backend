@@ -23,7 +23,7 @@ from dataclasses import dataclass
 
 from pydantic import ValidationError
 
-from src.catalog.application.dto import ProductCreate, ProductResponse, ProductUpdate
+from src.catalog.application.dto import ProductCreate, ProductResponse, ProductUpdate, public_image_url
 from src.catalog.application.image_processing import ALLOWED_MIME
 from src.catalog.application.mappers import to_domain
 from src.catalog.application.outbox import product_updated_outbox
@@ -32,7 +32,7 @@ from src.catalog.ports.repository import CatalogRepositoryPort
 from src.catalog.ports.storage import ImageStorePort
 from src.events.models import ProductCreated, ProductDeleted, ProductDeletedData, ProductWriteData
 from src.shared.config.logging import request_id_ctx
-from src.shared.config.setting import AppSettings, get_settings
+from src.shared.config.setting import AppSettings
 from src.shared.db.outbox import OutboxMessage
 from src.shared.db.pagination import PageParams, PageResponse
 from src.shared.errors.exceptions import AuthorizationError, InvalidUploadError
@@ -82,10 +82,24 @@ class CatalogService:
         cache: ProductCachePort | None = None,
         *,
         lock_ttl_seconds: int | None = None,
+        image_base_url: str | None = None,
+        image_max_upload_bytes: int | None = None,
+        image_upload_ttl_seconds: int | None = None,
     ) -> None:
         self._repo = repo
         self._image_store = image_store
         self._cache = cache
+        # Catalog's slice of the config, injected by the container from
+        # ``app.state.settings`` — never re-read from the global ``get_settings()``,
+        # so ``create_app(custom_settings)`` can't end up enforcing one upload limit
+        # / CDN base at the edge while the service uses another.
+        self._image_base_url = image_base_url
+        self._image_max_upload_bytes = (
+            image_max_upload_bytes or AppSettings.model_fields["image_max_upload_bytes"].default
+        )
+        self._image_upload_ttl_seconds = (
+            image_upload_ttl_seconds or AppSettings.model_fields["image_upload_ttl_seconds"].default
+        )
         # Renew the fill lock well inside its TTL so a slow DB read never lets it
         # lapse (which would let a second filler start). Half the lock TTL, floored
         # so a tiny TTL still yields a sane cadence. The TTL is taken from the SAME
@@ -98,6 +112,16 @@ class CatalogService:
             # a fully-configured environment (and can't drift from the config default).
             lock_ttl_seconds = AppSettings.model_fields["product_cache_lock_ttl_seconds"].default
         self._lock_renew_seconds = max(0.5, lock_ttl_seconds / 2)
+
+    def _to_response(self, product: object) -> ProductResponse:
+        """Map a domain product (or decoded cache entry) to the response schema.
+
+        The single place ``image_url`` is resolved, from the injected public base —
+        so a cached entry serialized under an older config is re-resolved on read.
+        """
+        response = product if isinstance(product, ProductResponse) else ProductResponse.model_validate(product)
+        response.image_url = public_image_url(response.image_key, response.image_status, self._image_base_url)
+        return response
 
     async def get_product(self, product_id: uuid.UUID) -> ProductResponse | None:
         """Resolve a product by id, or ``None`` if absent (route maps to 404).
@@ -151,7 +175,7 @@ class CatalogService:
         if cached == MISS:
             return True, None
         try:
-            return True, ProductResponse.model_validate_json(cached)
+            return True, self._to_response(ProductResponse.model_validate_json(cached))
         except ValidationError:
             log.warning("evicting corrupt product-cache entry for %s", product_id, exc_info=True)
             await self._cache.evict_value(product_id, cached)  # value only, and only this exact poison payload
@@ -169,7 +193,7 @@ class CatalogService:
             raise _RepositoryFailure(str(exc)) from exc
         if row is None:
             return None
-        return ProductResponse.model_validate(to_domain(row))
+        return self._to_response(to_domain(row))
 
     async def _read_through(self, product_id: uuid.UUID) -> ProductResponse | None:
         """Fill the cache on a miss with exactly one DB read across concurrent callers.
@@ -268,7 +292,7 @@ class CatalogService:
     ) -> PageResponse[ProductResponse]:
         """Return a keyset page of products, optionally filtered."""
         page = await self._repo.list_products(params, filters)
-        items = [ProductResponse.model_validate(to_domain(row)) for row in page.items]
+        items = [self._to_response(to_domain(row)) for row in page.items]
         return PageResponse(items=items, next_cursor=page.next_cursor)
 
     async def create_product(self, *, merchant_id: uuid.UUID, data: ProductCreate) -> ProductResponse:
@@ -294,7 +318,7 @@ class CatalogService:
             image_key=None,  # images are attached later, only after the worker passes them
             outbox=OutboxMessage(event.type, event.model_dump_json()),
         )
-        return ProductResponse.model_validate(to_domain(row))
+        return self._to_response(to_domain(row))
 
     async def update_product(
         self, *, product_id: uuid.UUID, merchant_id: uuid.UUID, is_admin: bool, patch: ProductUpdate
@@ -314,7 +338,7 @@ class CatalogService:
             category=changes.get("category", product.category),
         )
         row = await self._repo.update_product(product, changes, outbox=outbox)
-        return ProductResponse.model_validate(to_domain(row))
+        return self._to_response(to_domain(row))
 
     async def delete_product(self, *, product_id: uuid.UUID, merchant_id: uuid.UUID, is_admin: bool) -> bool:
         """Soft-delete an owned product and emit ``ProductDeleted``; ``False`` if absent."""
@@ -347,19 +371,18 @@ class CatalogService:
             return None
         self._assert_owner(product.merchant_id, merchant_id, is_admin)
 
-        settings = get_settings()
         if content_type not in ALLOWED_MIME:
             raise InvalidUploadError(f"content_type {content_type!r} is not an allowed image type")
-        if content_length > settings.image_max_upload_bytes:
-            raise InvalidUploadError(f"content_length exceeds {settings.image_max_upload_bytes} bytes")
+        if content_length > self._image_max_upload_bytes:
+            raise InvalidUploadError(f"content_length exceeds {self._image_max_upload_bytes} bytes")
         if self._image_store is None:  # pragma: no cover - misconfiguration guard
             raise RuntimeError("image store is not configured")
 
         presigned = await self._image_store.presign_upload(
             product_id,
             content_type=content_type,
-            max_bytes=settings.image_max_upload_bytes,
-            ttl_seconds=settings.image_upload_ttl_seconds,
+            max_bytes=self._image_max_upload_bytes,
+            ttl_seconds=self._image_upload_ttl_seconds,
         )
         # Flipping to ``pending`` drops the public image; emit ProductUpdated in the
         # same txn so a cached ready-image response is invalidated as the re-upload starts.
@@ -375,7 +398,7 @@ class CatalogService:
             url=presigned["url"],
             fields=presigned["fields"],
             key=presigned["key"],
-            expires_in=settings.image_upload_ttl_seconds,
+            expires_in=self._image_upload_ttl_seconds,
         )
 
     @staticmethod
