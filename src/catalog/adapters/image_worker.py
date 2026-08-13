@@ -28,6 +28,7 @@ from src.catalog.adapters.db.repository import CatalogRepository
 from src.catalog.adapters.s3_images import ImageStore
 from src.catalog.application.image_ingest import ImageIngestService
 from src.shared.bus.client import sqs_client
+from src.shared.bus.polling import poll_forever
 from src.shared.clients.s3_client import s3_client
 from src.shared.config.setting import AppSettings, get_settings
 
@@ -49,7 +50,7 @@ class ImageWorker:
         max_bytes: int,
         max_pixels: int,
         dedup_ttl_seconds: int,
-        max_messages: int = 10,
+        max_messages: int = 1,
         wait_time_seconds: int = 10,
     ) -> None:
         self._sqs = sqs
@@ -89,7 +90,15 @@ class ImageWorker:
             await self._process_record(record)
 
     async def poll_once(self) -> int:
-        """Receive one batch; process + delete each. Returns messages handled."""
+        """Receive one batch; process + delete each. Returns messages handled.
+
+        Images are decoded/re-encoded serially and CPU-heavy, so a batch of ten
+        would routinely outrun the queue's 30s visibility timeout: messages
+        reappear mid-processing and burn redrive attempts until they hit the DLQ
+        despite succeeding. One message per receive keeps a single decode well
+        inside the timeout. Throughput is unchanged (processing was already
+        serial) — scale by running more worker tasks, not bigger batches.
+        """
         resp = await self._sqs.receive_message(
             QueueUrl=self._queue_url,
             MaxNumberOfMessages=self._max_messages,
@@ -107,9 +116,12 @@ class ImageWorker:
         return handled
 
     async def run(self, stop: asyncio.Event) -> None:
-        """Long-poll loop until ``stop`` is set."""
-        while not stop.is_set():
-            await self.poll_once()
+        """Long-poll loop until ``stop`` is set.
+
+        Transient receive/delete failures are retried with backoff rather than
+        killing the worker — see :mod:`src.shared.bus.polling`.
+        """
+        await poll_forever(self.poll_once, stop, log)
 
 
 async def run_worker(settings: AppSettings, sessionmaker: async_sessionmaker, valkey: Any, stop: asyncio.Event) -> None:
@@ -127,7 +139,6 @@ async def run_worker(settings: AppSettings, sessionmaker: async_sessionmaker, va
             max_bytes=settings.image_max_upload_bytes,
             max_pixels=settings.image_max_source_pixels,
             dedup_ttl_seconds=settings.consumer_dedup_ttl_seconds,
-            max_messages=settings.consumer_max_messages,
             wait_time_seconds=settings.consumer_wait_time_seconds,
         )
         await worker.run(stop)
@@ -143,7 +154,7 @@ def main() -> None:  # pragma: no cover - process entrypoint
     settings = get_settings()
     setup_logging(settings.log_level)
     serve_worker_metrics(settings, job="image-worker")
-    engine = create_engine(settings)
+    engine = create_engine(settings, worker=True)
     sessionmaker = create_sessionmaker(engine)
     valkey = valkey_client.create_client(settings)
     log.info("image worker starting (queue=%s)", settings.image_queue_url)

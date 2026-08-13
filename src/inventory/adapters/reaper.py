@@ -98,7 +98,7 @@ def main() -> None:  # pragma: no cover - process entrypoint
     # at the end instead. Both no-ops unless configured.
     if not args.once:
         serve_worker_metrics(settings, job="reservation-reaper")
-    engine = create_engine(settings)
+    engine = create_engine(settings, worker=True)
     sessionmaker = create_sessionmaker(engine)
     log.info("reservation reaper starting (once=%s)", args.once)
 

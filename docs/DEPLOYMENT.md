@@ -70,6 +70,35 @@ Pushgateway. Both are opt-in; unset means no port bound and no push attempted. A
 and the postgres_exporter query behind the reaper's liveness signal ship in
 `ops/prometheus/`.
 
+**Connection budget.** Every process builds its own pool, and they all draw on the same
+RDS `max_connections`:
+
+```
+api    = (DB_POOL_SIZE + DB_MAX_OVERFLOW) x WEB_CONCURRENCY x api_tasks     # 15 x 2 = 30/task
+worker = (DB_WORKER_POOL_SIZE + DB_WORKER_MAX_OVERFLOW) x worker_tasks      #  2     =  2/task
+probe  = 1 per in-flight /v1/ready (NullPool: opened and closed per probe)
+total  = api + worker + probe  <  max_connections  (db.t3.medium ≈ 340)
+```
+
+Workers are single-task loops holding one session at a time, so they use the small
+worker pool automatically (`create_engine(settings, worker=True)`) — at the API's sizing
+four workers would have burned ~60 connections for nothing. At the defaults ten API tasks
+plus four workers is ~308, which fits but leaves little headroom: past that, either shrink
+`DB_POOL_SIZE`/`WEB_CONCURRENCY` or front RDS with **RDS Proxy / PgBouncer** (tickets 19–20)
+rather than raising `max_connections`.
+
+**Health checks.** Point the ALB at `/v1/ready` and set its timeout **above**
+`READINESS_PROBE_TIMEOUT_SECONDS` (default 2s per dependency). Only Postgres gates
+readiness — a Valkey outage returns `200 {"status": "degraded"}` because the app falls
+through to the DB, and deregistering every task over a cache blip would be a
+self-inflicted outage. The Postgres probe runs on its own `NullPool` engine, so a
+saturated request pool shows up as slow requests, not as a dead database that
+deregisters the task and pushes its load onto the tasks that are already saturated.
+
+**`/metrics` is unauthenticated** and served on the same port as the API. Do not route it
+from the public ALB — add a listener rule denying `/metrics` (or scrape it privately on a
+separate port) so pod-level counters aren't world-readable.
+
 ## Migrations (one-off task, not at app boot)
 
 Run Alembic as a dedicated one-off ECS task against RDS, before shifting traffic:

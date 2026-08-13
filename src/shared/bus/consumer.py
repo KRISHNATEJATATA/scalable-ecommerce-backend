@@ -49,6 +49,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from src.events.registry import validate_event
+from src.shared.bus.polling import poll_forever
 from src.shared.bus.tracecontext import TRACEPARENT_ATTR, parse_trace_id
 from src.shared.config.logging import request_id_ctx
 
@@ -223,6 +224,9 @@ class SqsConsumer:
         return handled
 
     async def run(self, stop) -> None:
-        """Long-poll loop until ``stop`` (an ``asyncio.Event``) is set."""
-        while not stop.is_set():
-            await self.poll_once()
+        """Long-poll loop until ``stop`` (an ``asyncio.Event``) is set.
+
+        Transient receive/delete failures are retried with backoff rather than
+        killing the worker — see :mod:`src.shared.bus.polling`.
+        """
+        await poll_forever(self.poll_once, stop, log)

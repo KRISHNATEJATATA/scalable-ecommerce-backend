@@ -86,7 +86,8 @@ async def internal_whoami(principal: Annotated[Principal, Depends(require_role("
 
     Exercised by relay/worker clients (Phase 6+) authenticating with a Keycloak
     ``service`` machine-account token; confirms ``require_role`` resolves the
-    role end-to-end with no DB hit. No ownership semantics — ``service`` bypasses
-    per-resource ownership the same way ``admin`` bypasses role gates.
+    role end-to-end with no DB hit. No ownership semantics here: ``service`` is a
+    plain role gate like any other — it grants no ownership bypass (only ``admin``
+    bypasses ownership, and that bypass never extends to role gates).
     """
     return {"sub": principal.sub, "role": "service"}

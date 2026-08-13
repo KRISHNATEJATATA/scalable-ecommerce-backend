@@ -44,7 +44,9 @@ async def get_current_user(
     # JWKS unreachable → DependencyUnavailableError (503) propagates; an unknown
     # kid / malformed token is a client error → 401.
     try:
-        signing_key = await resolve_signing_key(jwks_client, token)
+        signing_key = await resolve_signing_key(
+            jwks_client, token, min_refresh_interval=settings.jwks_min_refresh_interval_seconds
+        )
     except (PyJWKClientError, InvalidTokenError) as exc:
         raise AuthenticationError("could not resolve token signing key") from exc
 
@@ -66,12 +68,27 @@ async def get_current_user(
         sub = claims["sub"]
         if not isinstance(sub, str) or not sub:
             raise AuthenticationError("token 'sub' claim is missing or invalid")
-        realm_access = claims.get("realm_access") or {}
-        roles = frozenset(realm_access.get("roles") or [])
+        email = claims.get("email")
+        if email is not None and not isinstance(email, str):
+            raise AuthenticationError("token 'email' claim is invalid")
+        # Defaults apply only to a *missing* claim — a present-but-falsy value
+        # (``realm_access: []`` / ``null``, ``roles: ""``) is malformed, not empty,
+        # and must not be silently coerced into "no roles".
+        realm_access = claims.get("realm_access", {})
+        if not isinstance(realm_access, dict):
+            raise AuthenticationError("token 'realm_access' claim is invalid")
+        # Roles must be a LIST OF STRINGS, checked structurally. Iterating anything
+        # iterable would make ``"roles": {"admin": true}`` (a dict) or
+        # ``"roles": "admin"`` (a string, iterated per character) yield role names —
+        # RBAC is a plain membership test, so a loose parse here is a privilege grant.
+        raw_roles = realm_access.get("roles", [])
+        if not isinstance(raw_roles, list) or not all(isinstance(role, str) for role in raw_roles):
+            raise AuthenticationError("token 'realm_access.roles' claim is invalid")
+        roles = frozenset(raw_roles)
     except (AttributeError, TypeError, KeyError) as exc:
         raise AuthenticationError("token has malformed claims") from exc
 
-    return Principal(sub=sub, email=claims.get("email"), roles=roles)
+    return Principal(sub=sub, email=email, roles=roles)
 
 
 PrincipalDep = Annotated[Principal, Depends(get_current_user)]

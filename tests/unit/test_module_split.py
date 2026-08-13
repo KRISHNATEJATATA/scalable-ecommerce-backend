@@ -92,24 +92,34 @@ def test_catalog_price_check_constraint_rejects_non_positive(engine):
                 )
 
 
-def test_identity_email_unique_constraint(engine):
+def test_identity_email_is_not_unique_but_sub_is(engine):
+    """A recycled Keycloak email must be insertable as a *new* principal.
+
+    Keycloak enforces email uniqueness only among current accounts, so a freed
+    address is reusable. A `UNIQUE(email)` here would force a recreated account
+    to either fail JIT provisioning or take over the previous holder's row (and
+    with it their orders/products). `UNIQUE(oidc_sub)` is the real key.
+    """
     with engine.connect() as conn:
-        conn.execute(
-            text(
-                f"INSERT INTO {IDENTITY_SCHEMA}.users (id, oidc_sub, email, is_active) "
-                "VALUES (gen_random_uuid(), 'dup-sub-1', 'dup@example.com', true)"
+        for sub in ("dup-sub-1", "dup-sub-2"):
+            conn.execute(
+                text(
+                    f"INSERT INTO {IDENTITY_SCHEMA}.users (id, oidc_sub, email, is_active) "
+                    "VALUES (gen_random_uuid(), :sub, 'dup@example.com', true)"
+                ),
+                {"sub": sub},
             )
-        )
         conn.commit()
-        with pytest.raises(IntegrityError):
+
+        with pytest.raises(IntegrityError):  # sub, however, is still unique
             with conn.begin():
                 conn.execute(
                     text(
                         f"INSERT INTO {IDENTITY_SCHEMA}.users (id, oidc_sub, email, is_active) "
-                        "VALUES (gen_random_uuid(), 'dup-sub-2', 'dup@example.com', true)"
+                        "VALUES (gen_random_uuid(), 'dup-sub-1', 'other@example.com', true)"
                     )
                 )
-        conn.execute(text(f"DELETE FROM {IDENTITY_SCHEMA}.users WHERE oidc_sub = 'dup-sub-1'"))
+        conn.execute(text(f"DELETE FROM {IDENTITY_SCHEMA}.users WHERE email = 'dup@example.com'"))
         conn.commit()
 
 

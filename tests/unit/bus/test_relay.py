@@ -119,8 +119,9 @@ async def test_crash_between_publish_and_mark_leaves_rows_for_retry(sessionmaker
     await _seed(sessionmaker, 3)
     crashing = OutboxRelay(sessionmaker, RecordingPublisher(fail_after=1), batch_size=100, schemas=("orders",))
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ExceptionGroup) as exc_info:  # TaskGroup wraps the publish failure
         await crashing.drain_once()
+    assert exc_info.group_contains(RuntimeError)
 
     # transaction rolled back → nothing marked published → next pass re-ships all
     assert await _unpublished_count(sessionmaker) == 3
@@ -128,6 +129,30 @@ async def test_crash_between_publish_and_mark_leaves_rows_for_retry(sessionmaker
     recovered = RecordingPublisher()
     relay = OutboxRelay(sessionmaker, recovered, batch_size=100, schemas=("orders",))
     assert await relay.drain_once() == 3
+    assert await _unpublished_count(sessionmaker) == 0
+
+
+@pytest.mark.asyncio
+async def test_publishes_are_concurrent_and_bounded(sessionmaker) -> None:
+    """Batch publishes overlap (not serial) but never exceed ``concurrency``."""
+    in_flight = peak = 0
+
+    class SlowPublisher:
+        published: list[tuple[str, str]] = []
+
+        async def publish(self, event_type: str, payload: str) -> None:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.02)
+            in_flight -= 1
+
+    await _seed(sessionmaker, 10)
+    relay = OutboxRelay(sessionmaker, SlowPublisher(), batch_size=100, schemas=("orders",), concurrency=4)
+
+    assert await relay.drain_once() == 10
+    assert peak > 1  # serial publishing held the row locks for batch x RTT
+    assert peak <= 4  # and it stays inside the configured bound
     assert await _unpublished_count(sessionmaker) == 0
 
 

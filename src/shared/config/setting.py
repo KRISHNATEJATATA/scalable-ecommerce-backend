@@ -40,6 +40,11 @@ class AppSettings(BaseSettings):
     )
     db_pool_size: int = 5
     db_max_overflow: int = 10
+    # Workers are single-task loops holding one session at a time, so they get a
+    # far smaller pool than the API — every process's pool counts against the same
+    # RDS max_connections (budget formula in docs/DEPLOYMENT.md).
+    db_worker_pool_size: int = 2
+    db_worker_max_overflow: int = 0
     db_pool_pre_ping: bool = True
 
     # --- Valkey (ephemeral state: rate-limit counters, idempotency keys) ---
@@ -66,6 +71,14 @@ class AppSettings(BaseSettings):
     keycloak_realm: str = "ecommerce"
     keycloak_audience: str = "ecommerce-api"
     keycloak_jwks_url: str | None = None
+    # JWKS fetch timeout (PyJWT defaults to 30s — long enough that a blackholed
+    # Keycloak pins a threadpool thread per request).
+    jwks_timeout_seconds: float = Field(default=3.0, gt=0)
+    # Minimum gap between JWKS refreshes triggered by an *unknown* kid. The kid is
+    # read from the unverified token header, so without this an attacker sending
+    # random kids forces one outbound Keycloak call per request. Key rotation still
+    # resolves, up to one interval later.
+    jwks_min_refresh_interval_seconds: float = Field(default=10.0, ge=0)
     jwt_algorithm: Literal["RS256"] = "RS256"
     # Admin service-account for user/role management via Keycloak's Admin API.
     # server_url defaults to the issuer root; override when the issuer the tokens
@@ -76,7 +89,17 @@ class AppSettings(BaseSettings):
 
     # --- HTTP / CORS (bearer-token auth: no cookies → allow_credentials false) ---
     api_v1_prefix: str = "/v1"
+    # Per-dependency deadline for /v1/ready. Must stay well under the ALB's own
+    # health-check timeout: a blackholed dependency accepts the connection and
+    # never answers, so an unbounded probe just pins a worker until the ALB gives up.
+    readiness_probe_timeout_seconds: float = Field(default=2.0, gt=0)
     cors_allow_origins: list[str] = Field(default_factory=list)
+    # Peers whose X-Forwarded-* headers we trust. The ALB *appends* to
+    # X-Forwarded-For rather than replacing it, so trusting every peer ("*") lets
+    # any client forge their own client IP — which would make IP-keyed rate
+    # limiting trivially bypassable. Pin this to the ALB / VPC subnet CIDR in
+    # every deployed environment; the default is loopback + private ranges.
+    trusted_proxies: list[str] = Field(default_factory=lambda: ["127.0.0.1", "10.0.0.0/8", "172.16.0.0/12"])
 
     # --- Feature flags (plain env booleans; not a flag service) ---
     enable_reviews: bool = False
@@ -109,6 +132,9 @@ class AppSettings(BaseSettings):
     bus_region: str = "us-east-1"
     bus_topic_prefix: str = "ecommerce-"  # SNS topic name = f"{prefix}{EventType}"
     relay_batch_size: int = Field(default=100, gt=0)
+    # Bounded concurrent SNS publishes per claimed batch: serial awaits held the
+    # outbox row locks + a pooled connection for batch × RTT.
+    relay_publish_concurrency: int = Field(default=10, gt=0)
     relay_poll_interval_seconds: float = Field(default=1.0, gt=0)
     consumer_max_messages: int = Field(default=10, ge=1, le=10)  # SQS receive batch (max 10)
     consumer_wait_time_seconds: int = Field(default=10, ge=0, le=20)  # SQS long-poll seconds

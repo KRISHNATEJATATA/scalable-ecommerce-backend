@@ -31,6 +31,9 @@ async def _lifespan(app: FastAPI):
     settings: AppSettings = app.state.settings
     app.state.db_engine = postgres_client.create_engine(settings)
     app.state.db_sessionmaker = postgres_client.create_sessionmaker(app.state.db_engine)
+    # Readiness probes get their own pool-free engine so a saturated request pool
+    # can't be misread as a dead database (see create_probe_engine).
+    app.state.db_probe_engine = postgres_client.create_probe_engine(settings)
     app.state.valkey = valkey_client.create_client(settings)
     # Process-wide JWKS client (reuses PyJWT's kid cache) + Keycloak admin adapter
     # (constructed lazily-connecting: no network at startup).
@@ -46,6 +49,7 @@ async def _lifespan(app: FastAPI):
         yield
     finally:
         await app.state.db_engine.dispose()
+        await app.state.db_probe_engine.dispose()
         await app.state.valkey.aclose()
         if s3_cm is not None:
             await s3_cm.__aexit__(None, None, None)
@@ -68,7 +72,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.state.settings = settings
 
     # Trust ALB-forwarded scheme/host so redirects and client IPs are correct.
-    app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+    # Scoped to `trusted_proxies` — the ALB appends to X-Forwarded-For instead of
+    # replacing it, so trusting any peer would let a client forge their client IP
+    # and bypass IP-keyed rate limiting.
+    app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=settings.trusted_proxies)
     # Bearer-token auth uses no cookies → allow_credentials stays false.
     app.add_middleware(
         CORSMiddleware,

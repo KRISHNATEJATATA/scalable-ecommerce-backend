@@ -59,12 +59,21 @@ class KeycloakIdentityAdmin:
         await kc.a_update_user(user_sub, {"enabled": enabled})
 
     async def get_user_email(self, user_sub: str) -> str | None:
-        """Look up a Keycloak user's email by ``sub`` (``None`` if the user is gone)."""
+        """Look up a Keycloak user's email by ``sub`` (``None`` only if the user is gone).
+
+        Suppress **404 alone**. Swallowing every ``KeycloakGetError`` would turn an
+        expired admin token (401), a missing service-account role (403) or a Keycloak
+        outage (5xx) into "this user doesn't exist" — and the disable path would then
+        return 204 without writing the inactive local mirror, leaving the account free
+        to JIT-provision itself active again on its next request.
+        """
         kc = await self._client()
         try:
             user = await kc.a_get_user(user_sub)
-        except KeycloakGetError:
-            return None
+        except KeycloakGetError as exc:
+            if exc.response_code == 404:
+                return None
+            raise
         return user.get("email")
 
     async def create_user(self, email: str) -> str:
@@ -82,8 +91,8 @@ class KeycloakIdentityAdmin:
         Create + email are made effectively atomic: if the email send fails **or
         the call is cancelled**, the just-created (credentialless, unauthenticatable)
         account is deleted, so a retry starts clean instead of colliding with an
-        orphaned half-provisioned user on the ``UNIQUE(email)`` constraint. The
-        compensating delete is shielded so a cancellation can't abort the cleanup
+        orphaned half-provisioned user on Keycloak's own email/username uniqueness.
+        The compensating delete is shielded so a cancellation can't abort the cleanup
         itself.
         """
         kc = await self._client()

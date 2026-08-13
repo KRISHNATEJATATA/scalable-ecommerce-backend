@@ -305,6 +305,61 @@ async def test_disable_non_provisioned_user_still_blocks_future_login(app_ctx, r
     assert resp.status_code == 403
 
 
+async def test_malformed_roles_claim_is_rejected(app_ctx, rsa_key):
+    """`realm_access.roles` must be a list of strings — a loose parse is a role grant."""
+    now = int(time.time())
+
+    def _token(realm_access) -> str:
+        return jwt.encode(
+            {
+                "sub": str(uuid.uuid4()),
+                "email": "user@test.io",
+                "iss": ISSUER,
+                "aud": AUDIENCE,
+                "iat": now,
+                "exp": now + 300,
+                "realm_access": realm_access,
+            },
+            _pem(rsa_key),
+            algorithm="RS256",
+        )
+
+    hostile = [
+        {"roles": {"admin": True}},  # dict → iterating keys would yield "admin"
+        {"roles": "admin"},  # str → membership test on a string
+        {"roles": [{"name": "admin"}]},  # list of non-strings
+        "admin",  # realm_access itself not a mapping
+        [],  # falsy non-mapping — must not be coerced to {}
+        None,  # explicit null — malformed, not "no roles"
+        {"roles": ""},  # falsy non-list
+        {"roles": None},  # present but null
+    ]
+    async with _client(app_ctx) as client:
+        for realm_access in hostile:
+            resp = await client.get("/v1/internal/whoami", headers=_auth(_token(realm_access)))
+            assert resp.status_code == 401, (realm_access, resp.text)
+
+
+async def test_non_string_email_claim_is_rejected(app_ctx, rsa_key):
+    now = int(time.time())
+    token = jwt.encode(
+        {
+            "sub": str(uuid.uuid4()),
+            "email": {"nested": "oops"},
+            "iss": ISSUER,
+            "aud": AUDIENCE,
+            "iat": now,
+            "exp": now + 300,
+            "realm_access": {"roles": ["consumer"]},
+        },
+        _pem(rsa_key),
+        algorithm="RS256",
+    )
+    async with _client(app_ctx) as client:
+        resp = await client.get("/v1/me", headers=_auth(token))
+    assert resp.status_code == 401
+
+
 # --- service role (machine-to-machine) -------------------------------------
 
 
@@ -348,3 +403,91 @@ async def test_jit_get_or_create_is_race_safe(sessionmaker):
     # UserCreated is written in the same txn as the insert, and exactly once —
     # the loser of the ON CONFLICT race must not re-announce a creation.
     assert events.scalar_one() == 1
+
+
+async def test_jit_recreated_keycloak_account_is_a_new_principal(sessionmaker):
+    """Recycled email + new ``sub`` must get its own row, never inherit the old one."""
+    email = f"recycled-{uuid.uuid4()}@test.io"
+    async with sessionmaker() as session:
+        first = await IdentityRepository(session).get_or_create(str(uuid.uuid4()), email, user_created_outbox)
+
+    new_sub = str(uuid.uuid4())
+    async with sessionmaker() as session:
+        second = await IdentityRepository(session).get_or_create(new_sub, email, user_created_outbox)
+
+    # A new Keycloak account is a new principal: separate row, so it cannot
+    # inherit the previous holder's orders.user_id / products.merchant_id.
+    assert second.id != first.id
+    assert second.oidc_sub == new_sub
+
+
+async def test_disable_blocks_concurrent_jit_from_seeing_an_active_user(sessionmaker):
+    """JIT must wait out an in-flight disable, not be served as active meanwhile."""
+    from src.identity.application.service import IdentityAdminService
+
+    sub = str(uuid.uuid4())
+    email = f"racing-{uuid.uuid4()}@test.io"
+
+    class _SlowAdmin:
+        async def set_enabled(self, _sub, _enabled): ...
+
+        async def get_user_email(self, _sub):
+            await asyncio.sleep(0.3)  # Keycloak round-trip, with the lock held
+            return email
+
+    async def disable():
+        async with sessionmaker() as session:
+            await IdentityAdminService(IdentityRepository(session), _SlowAdmin()).disable_user(sub)
+
+    async def jit():
+        await asyncio.sleep(0.05)  # arrives mid-disable
+        async with sessionmaker() as session:
+            return await IdentityRepository(session).get_or_create(sub, email, user_created_outbox)
+
+    _, row = await asyncio.gather(disable(), jit())
+    assert row.is_active is False  # blocked on the advisory lock, resumed to a disabled row
+
+
+async def test_disable_fails_closed_when_keycloak_breaks(sessionmaker):
+    """A Keycloak failure must never leave the mirror active for a disabled account."""
+    from src.identity.application.service import IdentityAdminService
+
+    # Read fails → nothing mutated anywhere, so the admin's retry is clean.
+    class _BrokenRead:
+        set_enabled_called = False
+
+        async def get_user_email(self, _sub):
+            raise RuntimeError("keycloak 500")
+
+        async def set_enabled(self, _sub, _enabled):
+            self.set_enabled_called = True
+
+    sub = str(uuid.uuid4())
+    admin = _BrokenRead()
+    async with sessionmaker() as session:
+        with pytest.raises(RuntimeError):
+            await IdentityAdminService(IdentityRepository(session), admin).disable_user(sub)
+    assert admin.set_enabled_called is False
+
+    # Keycloak disable fails → the local mirror is already off, so tokens are dead here.
+    class _BrokenWrite:
+        async def get_user_email(self, _sub):
+            return f"closed-{uuid.uuid4()}@test.io"
+
+        async def set_enabled(self, _sub, _enabled):
+            raise RuntimeError("keycloak 500")
+
+    async with sessionmaker() as session:
+        with pytest.raises(RuntimeError):
+            await IdentityAdminService(IdentityRepository(session), _BrokenWrite()).disable_user(sub)
+    async with sessionmaker() as session:
+        row = await IdentityRepository(session).get_by_oidc_sub(sub)
+    assert row is not None and row.is_active is False
+
+
+async def test_disable_provisions_an_already_inactive_mirror(sessionmaker):
+    """A disable for a never-seen user must never leave an active row behind."""
+    sub = str(uuid.uuid4())
+    async with sessionmaker() as session:
+        row = await IdentityRepository(session).get_or_create(sub, f"off-{uuid.uuid4()}@test.io", is_active=False)
+    assert row.is_active is False

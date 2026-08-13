@@ -92,12 +92,17 @@ PKCE against Keycloak; the API only validates the tokens Keycloak issues.
   token and returns a claims-only `Principal(sub, email, roles)` — **no DB hit**;
   `get_current_db_user` does JIT + `is_active` and is wired only into routes needing
   the local `users.id`. A process-wide `PyJWKClient` (built in the lifespan) caches
-  keys; its blocking fetch runs via `run_in_threadpool`. JWKS unreachable → **503**;
-  bad/expired/tampered token → **401** (`WWW-Authenticate: Bearer`).
+  keys; its blocking fetch runs via `run_in_threadpool`, with a short timeout and a
+  coalesced, rate-limited refresh so unverified `kid`s can't amplify onto Keycloak.
+  JWKS unreachable **or unusable** (bad JSON, empty/malformed key set) → **503**;
+  bad/expired/tampered token, or an unknown `kid` against a usable key set → **401**
+  (`WWW-Authenticate: Bearer`).
 - **Roles** (`consumer` / `merchant` / `admin`, plus a `service` machine role) are
   **Keycloak realm roles** in the token (`realm_access.roles`) → RBAC is a cheap
   `Depends(require_role(...))` claim check on `Principal`, not a DB hit. Keycloak is
-  the single source of truth for roles.
+  the single source of truth for roles. `realm_access.roles` is validated as a **list
+  of strings** (and `email` as a string) before use — a loose parse would let
+  `{"roles": {"admin": true}}` grant privileges; anything else → **401**.
 - **Local `users` row keyed by the OIDC `sub`**, JIT-provisioned race-safely
   (`INSERT ... ON CONFLICT (oidc_sub) DO UPDATE ... RETURNING`) on first
   authenticated request, anchors FK ownership (`products.merchant_id`,
@@ -202,8 +207,12 @@ attribute so one trace spans the queue hop.
 - **Idempotent checkout**: `UNIQUE(user_id, idempotency_key)` on `Order` is the
   durable guard (Valkey only short-circuits fast retries); a live hold is likewise
   unique per `(order_id, sku)`.
-- DB constraints belong in the DB: `UNIQUE(email)`, `CHECK(price > 0)`,
+- DB constraints belong in the DB: `CHECK(price > 0)`,
   `CHECK(on_hand >= 0)`, `CHECK(reserved <= on_hand)`, explicit `ON DELETE`.
+  The identity mirror is keyed by `UNIQUE(oidc_sub)` and deliberately carries
+  **no `UNIQUE(email)`** — Keycloak owns email uniqueness, and only among
+  *current* accounts, so a recreated account must become a new principal rather
+  than inherit the previous holder's orders/products.
 - Uploads validated at the trust boundary: sniff real bytes (`python-magic`),
   re-encode images (Pillow) to strip EXIF.
 

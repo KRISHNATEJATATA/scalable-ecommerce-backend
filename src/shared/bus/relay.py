@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from src.shared.bus.client import sns_client
 from src.shared.bus.constants import OUTBOX_SCHEMAS
+from src.shared.bus.polling import poll_forever
 from src.shared.bus.publisher import SnsPublisher
 from src.shared.config.setting import AppSettings, get_settings
 
@@ -36,11 +37,24 @@ class OutboxRelay:
     ``async publish(event_type, payload)`` method (the real :class:`SnsPublisher`
     in production; a fake in tests)."""
 
-    def __init__(self, sessionmaker: async_sessionmaker, publisher, *, batch_size: int, schemas=OUTBOX_SCHEMAS) -> None:
+    def __init__(
+        self,
+        sessionmaker: async_sessionmaker,
+        publisher,
+        *,
+        batch_size: int,
+        schemas=OUTBOX_SCHEMAS,
+        concurrency: int = 10,
+    ) -> None:
         self._sessionmaker = sessionmaker
         self._publisher = publisher
         self._batch = batch_size
         self._schemas = tuple(schemas)
+        self._sem = asyncio.Semaphore(concurrency)
+
+    async def _publish(self, event_type: str, payload) -> None:
+        async with self._sem:
+            await self._publisher.publish(event_type, payload)
 
     async def _drain_schema(self, session, schema: str) -> int:
         # `schema` is a trusted constant from OUTBOX_SCHEMAS, never user input,
@@ -58,8 +72,18 @@ class OutboxRelay:
             ).all()
             if not rows:
                 return 0
-            for row in rows:
-                await self._publisher.publish(row.event_type, row.payload)
+            # Publish concurrently (bounded): serial awaits held the row locks and a
+            # pooled connection for batch_size × RTT (~3s at 100 × 30ms), capping a
+            # replica near 30 events/s. A TaskGroup cancels siblings on the first
+            # failure and the txn rolls back, so nothing is marked published that
+            # wasn't. Safe because the topics are standard (non-FIFO) SNS — no
+            # ordering guarantee to preserve — and consumers are
+            # idempotent, so a publish that landed before the rollback just
+            # redelivers. Not PublishBatch: its per-entry ``Failed`` list would have
+            # to be reconciled row-by-row or we'd stamp unpublished rows published.
+            async with asyncio.TaskGroup() as tg:
+                for row in rows:
+                    tg.create_task(self._publish(row.event_type, row.payload))
             await session.execute(
                 text(f"UPDATE {schema}.outbox SET published_at = now() WHERE id = ANY(:ids)"),
                 {"ids": [row.id for row in rows]},
@@ -76,14 +100,7 @@ class OutboxRelay:
 
     async def run(self, poll_interval: float, stop: asyncio.Event | None = None) -> None:
         """Loop until ``stop`` is set; sleep ``poll_interval`` only when idle."""
-        while stop is None or not stop.is_set():
-            try:
-                published = await self.drain_once()
-            except Exception:  # boundary: never let one bad pass kill the relay
-                log.exception("relay pass failed; retrying after backoff")
-                published = 0
-            if published == 0:
-                await asyncio.sleep(poll_interval)
+        await poll_forever(self.drain_once, stop or asyncio.Event(), log, idle_interval=poll_interval)
 
 
 async def run_relay(
@@ -96,7 +113,13 @@ async def run_relay(
     """Build a real SNS-backed relay from settings and run its loop."""
     async with sns_client(settings) as sns:
         publisher = SnsPublisher(sns, settings.bus_topic_prefix)
-        relay = OutboxRelay(sessionmaker, publisher, batch_size=settings.relay_batch_size, schemas=schemas)
+        relay = OutboxRelay(
+            sessionmaker,
+            publisher,
+            batch_size=settings.relay_batch_size,
+            schemas=schemas,
+            concurrency=settings.relay_publish_concurrency,
+        )
         await relay.run(settings.relay_poll_interval_seconds, stop=stop)
 
 
@@ -109,7 +132,7 @@ def main() -> None:  # pragma: no cover - process entrypoint
     settings = get_settings()
     setup_logging(settings.log_level)
     serve_worker_metrics(settings, job="outbox-relay")
-    engine = create_engine(settings)
+    engine = create_engine(settings, worker=True)
     sessionmaker = create_sessionmaker(engine)
     log.info("outbox relay starting (schemas=%s)", ",".join(OUTBOX_SCHEMAS))
 
