@@ -190,6 +190,39 @@ idempotent DB write, giving
 retries (replay via SQS redrive — see RUNBOOK). W3C `traceparent` rides as an SQS message
 attribute so one trace spans the queue hop.
 
+**Dedup is not ordering.** Standard SNS/SQS makes no ordering promise and the relay publishes a
+batch **concurrently**, so a consumer can see an older `ProductUpdated` *after* a newer one — or
+after the `ProductDeleted`. `event_id` dedup only suppresses exact redeliveries, and
+`schema_version` versions the *contract*, not the *instance*. Product events therefore carry
+`data.product_version` — the catalog aggregate's `version_id` **after** the write that emitted
+them, bumped by the ORM optimistic lock on edits/deletes and by hand in the raw image-flip
+`UPDATE`s. A consumer that holds product state must record the last applied version per product
+and **drop any event whose `product_version` is not greater**, treating `ProductDeleted` as a
+**tombstone** at its own version so a slower in-flight update cannot resurrect it. The
+`catalog-cache` worker is exempt by construction: it only *evicts* a key, and an eviction is
+order-insensitive (the next read repopulates from Postgres).
+
+That counter arrived as **`schema_version: 2`** of the three product events, not as an edit to
+v1. Payloads are `extra="forbid"`, so adding a required field in place would fail both ways — a
+v1 message already in an outbox row or an SQS queue would no longer validate, and a v1 consumer
+would reject the new field — and a failed handler redrives to the DLQ. Producers emit v2; the v1
+models stay in `EVENT_MODELS` so in-flight v1 messages still validate, and are droppable once
+no v1 message can remain (queue retention plus any DLQ replay window). That is the worked
+example of the versioning rule: **new `Literal` subclass, both versions registered.**
+
+Registering both versions makes the change compatible in one direction only — new code reads
+old messages, but old code still can't read new ones (an unregistered `(type, schema_version)`
+is an `UnknownEventError`, and a raising handler redrives to the DLQ). So the rollout order is
+part of the contract: **consumers first, producers last** — deploy every bus reader (today
+just the cache worker) onto the version-capable image, let it stabilize, and only then the
+services that emit: the API **and the image worker**, which consumes plain S3 notifications
+but writes `ProductUpdated` rows on `image_status` flips. The relay is version-agnostic
+(opaque rows, no validation). Roll back in the mirror order. `PRODUCED_VERSIONS` in
+`src/events/registry.py` pins what
+producers put on the wire and a test fails if the code drifts from it, so the producer half of
+a bump is always an explicit diff. Procedure: `docs/DEPLOYMENT.md` § "Rolling out a new event
+version"; recovery if it's violated: `docs/RUNBOOK.md` § 4.
+
 ## Correctness invariants (never simplify away)
 
 - **Atomic conditional decrement** on inventory (see ADR 0010) — the single

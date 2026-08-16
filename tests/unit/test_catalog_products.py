@@ -9,6 +9,7 @@ criteria: merchant-scoped CRUD (cross-merchant → 403), keyset/filter listing, 
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
@@ -30,8 +31,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from testcontainers.postgres import PostgresContainer
 
 from src.app import create_app
+from src.catalog.adapters.db.repository import CatalogRepository
+from src.catalog.application.outbox import product_updated_outbox
+from src.catalog.ports.repository import ProductRecord
 from src.shared.config.setting import AppSettings, get_settings
 from src.shared.container import get_image_store
+from src.shared.errors.exceptions import ConcurrentUpdateError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULES = ["identity", "catalog"]
@@ -270,6 +275,30 @@ async def test_owner_updates_bumps_version_and_emits(app_ctx, rsa_key, sessionma
     assert [e["event_type"] for e in await _outbox(sessionmaker)] == ["ProductCreated", "ProductUpdated"]
 
 
+async def test_empty_patch_is_422_and_emits_no_event(app_ctx, rsa_key, sessionmaker):
+    """``{}`` changes nothing, so it must not publish a ``ProductUpdated`` event —
+    consumers would act on a state transition that never happened."""
+    token = _make_token(rsa_key, roles=["merchant"])
+    async with _client(app_ctx) as client:
+        created = (await client.post("/v1/products", headers=_auth(token), json=_PRODUCT)).json()
+        resp = await client.patch(f"/v1/products/{created['id']}", headers=_auth(token), json={})
+    assert resp.status_code == 422, resp.text
+    assert resp.headers["content-type"].startswith("application/problem+json")  # matches the published contract
+    assert [e["event_type"] for e in await _outbox(sessionmaker)] == ["ProductCreated"]
+
+
+async def test_explicit_null_on_a_not_null_field_is_422(app_ctx, rsa_key, sessionmaker):
+    """``{"name": null}``/``{"price": null}`` target NOT-NULL columns — reject at the
+    boundary (422) rather than let the DB raise a NOT-NULL violation (500)."""
+    token = _make_token(rsa_key, roles=["merchant"])
+    async with _client(app_ctx) as client:
+        created = (await client.post("/v1/products", headers=_auth(token), json=_PRODUCT)).json()
+        for body in ({"name": None}, {"price": None}):
+            resp = await client.patch(f"/v1/products/{created['id']}", headers=_auth(token), json=body)
+            assert resp.status_code == 422, resp.text
+    assert [e["event_type"] for e in await _outbox(sessionmaker)] == ["ProductCreated"]
+
+
 async def test_cross_merchant_update_403(app_ctx, rsa_key):
     owner = _make_token(rsa_key, roles=["merchant"])
     other = _make_token(rsa_key, roles=["merchant"])
@@ -322,6 +351,78 @@ async def test_cross_merchant_delete_403(app_ctx, rsa_key):
         created = (await client.post("/v1/products", headers=_auth(owner), json=_PRODUCT)).json()
         resp = await client.delete(f"/v1/products/{created['id']}", headers=_auth(other))
     assert resp.status_code == 403
+
+
+async def test_delete_missing_or_already_deleted_is_404(app_ctx, rsa_key, sessionmaker):
+    """A never-existed id and an already-soft-deleted one are the same 404 — the
+    second delete must not re-emit ``ProductDeleted`` (consumers would tombstone twice)."""
+    token = _make_token(rsa_key, roles=["merchant"])
+    async with _client(app_ctx) as client:
+        missing = await client.delete(f"/v1/products/{uuid.uuid4()}", headers=_auth(token))
+        assert missing.status_code == 404
+
+        created = (await client.post("/v1/products", headers=_auth(token), json=_PRODUCT)).json()
+        assert (await client.delete(f"/v1/products/{created['id']}", headers=_auth(token))).status_code == 204
+        again = await client.delete(f"/v1/products/{created['id']}", headers=_auth(token))
+    assert again.status_code == 404  # soft-deleted rows are invisible to the repository
+    assert [e["event_type"] for e in await _outbox(sessionmaker)] == ["ProductCreated", "ProductDeleted"]
+
+
+# --- optimistic locking ---------------------------------------------------
+
+
+async def test_concurrent_updates_lose_the_race_with_409_not_500(app_ctx, rsa_key, sessionmaker):
+    """Two merchants patching the same product: the loser gets a retryable 409.
+
+    ``version_id`` optimistic locking is what stops the second writer silently
+    clobbering the first. Its ``StaleDataError`` must be translated at the adapter
+    boundary — untranslated it falls through to the 500 handler, which tells the
+    caller "server bug, don't retry" about a perfectly retryable conflict.
+    Each racing task gets its **own** session, mirroring two concurrent requests.
+    """
+    token = _make_token(rsa_key, roles=["merchant"])
+    async with _client(app_ctx) as client:
+        created = (await client.post("/v1/products", headers=_auth(token), json=_PRODUCT)).json()
+    product_id = uuid.UUID(created["id"])
+
+    async def patch(name: str):
+        # Both writers load the row at version 1 before either commits.
+        async with sessionmaker() as session:
+            repo = CatalogRepository(session)
+            product = await repo.get_product(product_id)
+            # The real adapter row must satisfy the port the use-cases code against
+            # (`version_id` lives only on the ORM model — see ProductRecord).
+            assert isinstance(product, ProductRecord)
+            await barrier.wait()
+            return await repo.update_product(
+                product,
+                {"name": name},
+                product_updated_outbox(
+                    product_id=product_id,
+                    merchant_id=product.merchant_id,
+                    name=name,
+                    price=product.price,
+                    category=product.category,
+                    product_version=product.version_id + 1,
+                ),
+            )
+
+    barrier = asyncio.Barrier(2)
+    results = await asyncio.gather(patch("winner"), patch("loser"), return_exceptions=True)
+
+    conflicts = [r for r in results if isinstance(r, ConcurrentUpdateError)]
+    winners = [r for r in results if not isinstance(r, BaseException)]
+    assert len(winners) == 1, results  # exactly one commit lands
+    assert len(conflicts) == 1, results
+    assert "retry" in conflicts[0].detail  # the caller is told this is retryable
+
+    async with sessionmaker() as s:
+        version = (
+            await s.execute(text("SELECT version_id FROM catalog.products WHERE id = :id"), {"id": product_id})
+        ).scalar_one()
+    assert version == 2  # one bump, not two — the loser's write never committed
+    # ...and the loser published nothing: the outbox row rolled back with it.
+    assert [e["event_type"] for e in await _outbox(sessionmaker)] == ["ProductCreated", "ProductUpdated"]
 
 
 # --- image upload presign -------------------------------------
@@ -444,9 +545,58 @@ async def _seed_pending(sessionmaker, upload_token: str) -> uuid.UUID:
     return pid
 
 
+async def test_product_events_carry_a_monotonic_aggregate_version(app_ctx, rsa_key, sessionmaker):
+    """Every product event must carry the post-write ``version_id``, strictly rising.
+
+    SNS is unordered and the relay publishes a batch concurrently, so a projector
+    can see an older update after a newer one — or after the delete. ``event_id``
+    dedup only kills exact redeliveries and ``schema_version`` versions the
+    contract, so without this counter a stale update would restore an old price or
+    resurrect a deleted product. The delete tombstone is on the same counter.
+    """
+    token = _make_token(rsa_key, roles=["merchant"])
+    async with _client(app_ctx) as client:
+        created = (await client.post("/v1/products", headers=_auth(token), json=_PRODUCT)).json()
+        await client.patch(f"/v1/products/{created['id']}", headers=_auth(token), json={"price": "12.50"})
+        await client.patch(f"/v1/products/{created['id']}", headers=_auth(token), json={"name": "renamed"})
+        assert (await client.delete(f"/v1/products/{created['id']}", headers=_auth(token))).status_code == 204
+
+    events = await _outbox(sessionmaker)
+    assert [e["event_type"] for e in events] == [
+        "ProductCreated",
+        "ProductUpdated",
+        "ProductUpdated",
+        "ProductDeleted",
+    ]
+    versions = [e["payload"]["data"]["product_version"] for e in events]
+    assert versions == [1, 2, 3, 4]  # matches the row's version_id after each write
+
+
+async def test_image_flip_bumps_the_version_it_publishes(sessionmaker):
+    """The image flips are raw SQL (no ORM unit-of-work), so they must bump
+    ``version_id`` themselves — otherwise two flips publish the same version and a
+    projector cannot order them against a concurrent merchant edit."""
+
+    pid = await _seed_pending(sessionmaker, "tokB")  # seeded at version_id = 1
+    seen_rows = []
+
+    def outbox(row):
+        seen_rows.append(dict(row))
+        return ("ProductUpdated", json.dumps({"type": "ProductUpdated"}))
+
+    async with sessionmaker() as s:
+        assert await CatalogRepository(s).mark_image_ready(pid, "tokB", "public/x.webp", outbox=outbox) is True
+    async with sessionmaker() as s:
+        version = (
+            await s.execute(text("SELECT version_id FROM catalog.products WHERE id = :id"), {"id": pid})
+        ).scalar_one()
+
+    assert version == 2
+    assert seen_rows[0]["product_version"] == 2  # RETURNING carries the post-increment value
+
+
 async def test_mark_image_ready_is_token_guarded(sessionmaker):
     """A stale event (superseded upload token) updates zero rows; the current one wins."""
-    from src.catalog.adapters.db.repository import CatalogRepository
 
     pid = await _seed_pending(sessionmaker, "tokB")
     async with sessionmaker() as s:
@@ -467,7 +617,6 @@ async def test_mark_image_ready_emits_outbox_only_when_applied(sessionmaker):
 
     The payload is built from the UPDATE's own ``RETURNING`` row, so it can't carry
     state read before the write."""
-    from src.catalog.adapters.db.repository import CatalogRepository
 
     pid = await _seed_pending(sessionmaker, "tokB")
     seen_rows = []
@@ -492,8 +641,6 @@ async def test_mark_image_ready_emits_outbox_only_when_applied(sessionmaker):
     assert row.n == 1  # exactly one outbox row — only the applied flip emitted
     assert len(seen_rows) == 1 and seen_rows[0]["product_id"] == pid  # factory fed the updated row
     assert json.loads(row.payload)["name"] == seen_rows[0]["name"]
-
-    from src.catalog.adapters.db.repository import CatalogRepository
 
     pid = await _seed_pending(sessionmaker, "tokB")
     async with sessionmaker() as s:

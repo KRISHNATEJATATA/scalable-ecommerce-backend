@@ -15,6 +15,34 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from src.catalog.domain.image_status import ImageStatus
 
+# Fields that are optional-to-send but never nullable: they back NOT-NULL columns,
+# so ``null`` is rejected at runtime (see ``ProductUpdate._reject_explicit_null``).
+_NOT_NULLABLE_PATCH_FIELDS = ("name", "price")
+
+
+def _patch_schema(schema: dict) -> None:
+    """Make the generated ``ProductUpdate`` schema match what the API accepts.
+
+    Pydantic renders ``str | None = None`` — the idiomatic "may be omitted" shape —
+    as ``anyOf: [string, null]``, which advertises ``{"name": null}`` as valid when
+    the runtime answers 422. Collapse those unions to the non-null branch and drop
+    the ``null`` default, so the live ``/openapi.json`` and the hand-authored
+    contract tell clients the same thing. ``minProperties`` rejects the no-op ``{}``
+    patch that would otherwise emit a false ``ProductUpdated`` event.
+    """
+    schema["minProperties"] = 1
+    for field in _NOT_NULLABLE_PATCH_FIELDS:
+        prop = schema.get("properties", {}).get(field)
+        if not prop:  # pragma: no cover - only reachable if a field is renamed
+            continue
+        variants = [v for v in prop.pop("anyOf", []) if v.get("type") != "null"]
+        if len(variants) == 1:
+            prop.update(variants[0])
+        elif variants:
+            prop["anyOf"] = variants
+        if prop.get("default", ...) is None:
+            del prop["default"]
+
 
 def public_image_url(image_key: str | None, image_status: ImageStatus, base: str | None) -> str | None:
     """Unsigned CDN URL for a READY public product image (``None`` otherwise).
@@ -75,14 +103,34 @@ class ProductCreate(BaseModel):
 class ProductUpdate(BaseModel):
     """Partial merchant update — every field optional; unset fields are untouched.
     ``image_key`` is not updatable here (worker-owned; use the presign endpoint).
+
+    An **empty** patch is rejected: it changes nothing but would still persist a
+    ``ProductUpdated`` outbox row, so consumers would see a domain event for a
+    state transition that never happened. ``name``/``price`` may be omitted but
+    never sent as ``null`` — both the validator and the generated schema say so.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    # ``json_schema_extra`` is a mutator (see :func:`_patch_schema`) so the live
+    # ``/openapi.json`` matches the hand-authored contract: no empty patch, and no
+    # ``null`` advertised for the two NOT-NULL-backed fields.
+    model_config = ConfigDict(extra="forbid", json_schema_extra=_patch_schema)
 
     name: str | None = Field(default=None, min_length=1, max_length=255)
     description: str | None = None
     category: str | None = Field(default=None, max_length=255)
     price: Decimal | None = Field(default=None, gt=0, max_digits=12, decimal_places=2)
+
+    @model_validator(mode="after")
+    def _reject_empty_patch(self) -> ProductUpdate:
+        """An empty body is a no-op update — reject it rather than emit a false event.
+
+        ``update_product`` always writes a ``ProductUpdated`` outbox row, so ``{}``
+        would publish an event asserting a change that did not occur. Guard it at
+        the trust boundary (422) instead of teaching every consumer to ignore it.
+        """
+        if not self.model_fields_set:
+            raise ValueError("patch must set at least one field")
+        return self
 
     @model_validator(mode="after")
     def _reject_explicit_null(self) -> ProductUpdate:

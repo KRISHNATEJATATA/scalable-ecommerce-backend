@@ -22,6 +22,7 @@ from src.shared.clients.s3_client import s3_client
 from src.shared.config.logging import setup_logging
 from src.shared.config.setting import AppSettings, get_settings
 from src.shared.errors.exception_handlers import register_exception_handlers
+from src.shared.errors.openapi import use_problem_details_openapi
 from src.shared.middleware.security import RequestIDMiddleware, SecurityHeadersMiddleware
 
 
@@ -88,6 +89,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.add_middleware(RequestIDMiddleware)
 
     register_exception_handlers(app)
+    # ...and make the published contract match those handlers, not FastAPI's default.
+    use_problem_details_openapi(app)
 
     app.include_router(health.router, prefix=settings.api_v1_prefix)
     app.include_router(identity_routes.router, prefix=settings.api_v1_prefix)

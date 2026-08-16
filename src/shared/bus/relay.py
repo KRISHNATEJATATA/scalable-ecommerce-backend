@@ -103,9 +103,14 @@ class OutboxRelay:
         outbox's ordering guarantee, and the row is visible via the outbox-lag
         metric.)
 
-        If *every* schema failed, the cause is shared (SNS/network down), so the
-        error propagates and :func:`poll_forever` backs off exponentially instead
-        of hammering a dead dependency once per poll interval.
+        A failed pass that shipped **nothing** propagates, so :func:`poll_forever`
+        backs off exponentially instead of hammering a dead dependency once per
+        poll interval. Forward progress anywhere (any row published) swallows the
+        error instead: the bus is demonstrably up, so the failure is local to one
+        schema and backing off would only delay the schemas that are working.
+        Counting failed *schemas* instead of published rows missed the common
+        case — SNS down while every schema but one happens to be idle, where an
+        empty schema "succeeds" trivially and hid the outage from the backoff.
         """
         published = 0
         failures: list[Exception] = []
@@ -116,7 +121,7 @@ class OutboxRelay:
                 except Exception as exc:  # boundary: one schema must not starve the others
                     log.exception("outbox drain failed for schema %s; continuing with the rest", schema)
                     failures.append(exc)
-        if failures and len(failures) == len(self._schemas):
+        if failures and published == 0:
             raise failures[0]
         return published
 

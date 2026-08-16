@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.catalog.application.service import CatalogService
+from src.catalog.ports.repository import ProductRecord
 from src.shared.config.setting import AppSettings
 from src.shared.errors.exceptions import InvalidUploadError
 
@@ -31,6 +32,7 @@ def _row(image_key: str | None = "products/x.jpg", image_status: str = "ready"):
         price=Decimal("9.99"),
         image_key=image_key,
         image_status=image_status,
+        version_id=1,  # aggregate counter the emitted ProductUpdated is ordered by
         created_at=_NOW,
         updated_at=_NOW,
     )
@@ -54,6 +56,17 @@ class _ImageStore:
     async def presign_upload(self, product_id, *, content_type, max_bytes, ttl_seconds):
         self.calls.append({"max_bytes": max_bytes, "ttl_seconds": ttl_seconds})
         return {"url": "http://s3/local", "fields": {}, "key": "k", "token": "t"}
+
+
+def test_stand_in_row_satisfies_the_repository_port_contract():
+    """The double must carry every field the use-cases read off a real row.
+
+    ``ProductRecord`` is ``@runtime_checkable`` precisely so this is checkable: the
+    repo runs no type checker, so without this assert a double that drops (say)
+    ``version_id`` fails as an ``AttributeError`` deep inside a use-case — which is
+    exactly how it failed before the port declared the shape.
+    """
+    assert isinstance(_row(), ProductRecord)
 
 
 async def test_image_url_uses_injected_base_not_global_settings():

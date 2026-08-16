@@ -107,6 +107,58 @@ deregisters the task and pushes its load onto the tasks that are already saturat
 from the public ALB — add a listener rule denying `/metrics` (or scrape it privately on a
 separate port) so pod-level counters aren't world-readable.
 
+## Rolling out a new event version (consumer-first, non-negotiable order)
+
+Every service runs the **same image** but as separate ECS services, so a rollout
+updates them one service at a time — and that order is a correctness decision, not
+a preference. A consumer that meets a `(type, schema_version)` it doesn't have
+registered raises `UnknownEventError`, never deletes the message, and the queue
+routes it to the DLQ after `maxReceiveCount` (5) receives. Deploying producers
+first therefore **manufactures a DLQ backlog** out of perfectly valid traffic.
+
+Order for any `schema_version` bump (the live example is product events v1 → v2,
+which added `data.product_version`):
+
+1. **Consumers first.** Update every service that *reads domain events off the bus*
+   to the image that registers the new version, and wait for it to reach a steady
+   state (`aws ecs wait services-stable`). Old-version messages keep validating
+   because the previous model stays in `EVENT_MODELS` — the new code accepts
+   **both**. Today that is exactly one service: the **cache worker**
+   (`catalog-cache`), the only `validate_event` consumer of product events.
+2. **Verify.** DLQ depth flat, consumer error rate flat, `/v1/health` green.
+3. **Producers last.** Deploy every service that *emits* events:
+   - the **API/web** service (create · update · delete · presign), and
+   - the **image worker** — it consumes raw **S3 ObjectCreated** notifications (no
+     `schema_version`, so it is not a bus consumer), but it *writes*
+     `ProductUpdatedV2` outbox rows when it flips `image_status`. Shipping it in the
+     consumer phase would put V2 on the bus before the cache worker is replaced,
+     which is the failure this ordering exists to prevent.
+
+   The **relay** is version-agnostic — it ships opaque outbox rows and never
+   validates — so it can go in either phase; keep it with the producers to hold the
+   fleet on one tag.
+4. **Retire the old version** only after it can no longer exist anywhere: queue
+   retention **plus** the DLQ replay window. Until then the old model stays
+   registered.
+
+```bash
+# 1. consumers (bus readers only)
+aws ecs update-service --cluster ecommerce --service ecommerce-cache-worker --force-new-deployment
+aws ecs wait services-stable --cluster ecommerce --services ecommerce-cache-worker
+# 3. producers (API + image worker, relay alongside)
+aws ecs update-service --cluster ecommerce --service ecommerce-api          --force-new-deployment
+aws ecs update-service --cluster ecommerce --service ecommerce-image-worker --force-new-deployment
+aws ecs update-service --cluster ecommerce --service ecommerce-relay        --force-new-deployment
+```
+
+A rollback runs the mirror image: roll **producers back first**, consumers after —
+never leave producers on a version the consumers can't parse.
+
+`src/events/registry.py` pins `PRODUCED_VERSIONS` (what producers put on the wire)
+and a test fails if production code emits anything else, so the producer half of the
+bump can't merge as an unremarked one-line change. Recovering a DLQ that filled
+because the order was violated: `docs/RUNBOOK.md` § 4.
+
 ## Migrations (one-off task, not at app boot)
 
 Run Alembic as a dedicated one-off ECS task against RDS, before shifting traffic:

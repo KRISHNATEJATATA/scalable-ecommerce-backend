@@ -9,7 +9,9 @@ Covers the ticket's acceptance criteria:
 - state write + outbox row → relay ships it and marks it published;
 - a crash between publish and mark leaves rows unpublished → next pass re-ships
   (effectively-once downstream);
-- two racing relays never double-claim a row (``SKIP LOCKED``).
+- two racing relays never double-claim a row (``SKIP LOCKED``);
+- every schema in ``OUTBOX_SCHEMAS`` actually drains — a module whose outbox the
+  relay never scans would otherwise write events that are never visible on the bus.
 """
 
 from __future__ import annotations
@@ -27,10 +29,20 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from testcontainers.postgres import PostgresContainer
 
+from src.shared.bus.constants import OUTBOX_SCHEMAS
 from src.shared.bus.relay import OutboxRelay
 from src.shared.config.setting import get_settings
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+# The publishing modules, written out independently of ``OUTBOX_SCHEMAS`` on purpose:
+# asserting the constant against itself is a tautology (drop ``catalog`` from the
+# constant and a self-referential test drops it too, silently). This literal is the
+# expected topology — changing it must be a deliberate edit here.
+EXPECTED_OUTBOX_SCHEMAS = ("identity", "catalog", "inventory", "orders", "payments")
+# A schema the relay is pointed at but that does not exist in the container — the
+# same shape as any permanent per-schema failure (unprovisioned topic, oversized
+# payload). Deliberately not a real module: every real outbox must actually drain.
+MISSING_SCHEMA = "not_a_module"
 
 
 class RecordingPublisher:
@@ -54,11 +66,15 @@ def _migrated():
         os.environ["DATABASE_URL"] = async_url
         get_settings.cache_clear()
         try:
-            subprocess.run(
-                [sys.executable, "-m", "alembic", "-c", "src/orders/alembic.ini", "upgrade", "head"],
-                cwd=REPO_ROOT,
-                check=True,
-            )
+            # Every publishing module, not just orders: the relay is only correct if
+            # each schema it scans really owns an ``outbox`` table of the expected
+            # shape. Migrating one module hid catalog/inventory/payments regressions.
+            for module in EXPECTED_OUTBOX_SCHEMAS:
+                subprocess.run(
+                    [sys.executable, "-m", "alembic", "-c", f"src/{module}/alembic.ini", "upgrade", "head"],
+                    cwd=REPO_ROOT,
+                    check=True,
+                )
             yield
         finally:
             if old_url is None:
@@ -72,12 +88,13 @@ def _migrated():
 async def sessionmaker(_migrated):
     engine = create_async_engine(str(get_settings().database_url))
     async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE orders.outbox"))
+        for schema in EXPECTED_OUTBOX_SCHEMAS:
+            await conn.execute(text(f"TRUNCATE {schema}.outbox"))
     yield async_sessionmaker(engine, expire_on_commit=False)
     await engine.dispose()
 
 
-async def _seed(maker, count: int) -> list[uuid.UUID]:
+async def _seed(maker, count: int, schema: str = "orders") -> list[uuid.UUID]:
     ids = []
     async with maker() as session:
         for _ in range(count):
@@ -85,17 +102,17 @@ async def _seed(maker, count: int) -> list[uuid.UUID]:
             ids.append(eid)
             payload = json.dumps({"type": "OrderPlaced", "event_id": str(eid), "trace_id": uuid.uuid4().hex})
             await session.execute(
-                text("INSERT INTO orders.outbox (id, event_type, payload) VALUES (:id, 'OrderPlaced', :p)"),
+                text(f"INSERT INTO {schema}.outbox (id, event_type, payload) VALUES (:id, 'OrderPlaced', :p)"),
                 {"id": eid, "p": payload},
             )
         await session.commit()
     return ids
 
 
-async def _unpublished_count(maker) -> int:
+async def _unpublished_count(maker, schema: str = "orders") -> int:
     async with maker() as session:
         return (
-            await session.execute(text("SELECT count(*) FROM orders.outbox WHERE published_at IS NULL"))
+            await session.execute(text(f"SELECT count(*) FROM {schema}.outbox WHERE published_at IS NULL"))
         ).scalar_one()
 
 
@@ -175,21 +192,59 @@ async def test_publishes_are_concurrent_and_bounded(sessionmaker) -> None:
 
 
 @pytest.mark.asyncio
+async def test_every_outbox_schema_actually_drains(sessionmaker) -> None:
+    """The relay must ship rows from **every** publishing module.
+
+    Exercising only ``orders`` left a whole class of regression invisible: a module
+    whose schema was dropped from the allow-list (or whose outbox table drifted)
+    would keep writing events in-transaction that never became visible on the bus.
+    The expected set is the independent ``EXPECTED_OUTBOX_SCHEMAS`` literal, so a
+    module silently disappearing from ``OUTBOX_SCHEMAS`` fails here.
+    """
+    assert set(OUTBOX_SCHEMAS) == set(EXPECTED_OUTBOX_SCHEMAS)
+
+    for schema in EXPECTED_OUTBOX_SCHEMAS:
+        await _seed(sessionmaker, 2, schema)
+    publisher = RecordingPublisher()
+    relay = OutboxRelay(sessionmaker, publisher, batch_size=100)  # default = OUTBOX_SCHEMAS
+
+    assert await relay.drain_once() == 2 * len(EXPECTED_OUTBOX_SCHEMAS)
+    for schema in EXPECTED_OUTBOX_SCHEMAS:
+        assert await _unpublished_count(sessionmaker, schema) == 0, schema
+    assert len(publisher.published) == 2 * len(EXPECTED_OUTBOX_SCHEMAS)
+
+
+@pytest.mark.asyncio
 async def test_one_broken_schema_does_not_starve_the_others(sessionmaker) -> None:
     """A schema that fails must not abort the pass for the schemas after it.
 
-    ``catalog.outbox`` does not exist in this container (only the orders migration
-    ran), which is the same shape as any permanent per-schema failure — an
-    unprovisioned topic, an oversized payload. ``orders`` still has to drain, and
-    the pass must not raise, or one stuck module would silently stop every other
-    module from ever shipping an event.
+    ``MISSING_SCHEMA`` has no ``outbox`` table in this container, which is the same
+    shape as any permanent per-schema failure — an unprovisioned topic, an oversized
+    payload. ``orders`` still has to drain, and the pass must not raise, or one stuck
+    module would silently stop every other module from ever shipping an event.
     """
     await _seed(sessionmaker, 3)
     publisher = RecordingPublisher()
-    relay = OutboxRelay(sessionmaker, publisher, batch_size=100, schemas=("catalog", "orders"))
+    relay = OutboxRelay(sessionmaker, publisher, batch_size=100, schemas=(MISSING_SCHEMA, "orders"))
 
     assert await relay.drain_once() == 3
     assert await _unpublished_count(sessionmaker) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_failing_schema_still_backs_off_when_the_others_are_idle(sessionmaker) -> None:
+    """A failure with nothing shipped anywhere must propagate so the loop backs off.
+
+    Counting failed schemas let this slip: with ``orders`` empty, its drain
+    "succeeded" trivially, so a broken ``catalog`` was not *every* schema failing
+    and ``drain_once`` returned 0. SNS being down during a quiet minute therefore
+    looked identical to having no work, and the poll loop hammered it at the full
+    poll rate instead of backing off exponentially.
+    """
+    relay = OutboxRelay(sessionmaker, RecordingPublisher(), batch_size=100, schemas=(MISSING_SCHEMA, "orders"))
+
+    with pytest.raises(Exception):  # noqa: B017 - any propagated failure engages the backoff
+        await relay.drain_once()
 
 
 @pytest.mark.asyncio
@@ -197,7 +252,9 @@ async def test_every_schema_failing_propagates_so_the_loop_backs_off(sessionmake
     """A shared cause (SNS down) must still surface, so poll_forever backs off
     exponentially instead of retrying once per poll interval forever."""
     await _seed(sessionmaker, 1)
-    relay = OutboxRelay(sessionmaker, RecordingPublisher(fail_after=0), batch_size=100, schemas=("orders", "catalog"))
+    relay = OutboxRelay(
+        sessionmaker, RecordingPublisher(fail_after=0), batch_size=100, schemas=("orders", MISSING_SCHEMA)
+    )
 
     with pytest.raises((ExceptionGroup, Exception)):
         await relay.drain_once()

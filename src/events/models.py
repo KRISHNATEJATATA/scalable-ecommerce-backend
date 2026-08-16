@@ -84,7 +84,14 @@ class UserDeleted(DomainEvent):
 
 
 class ProductWriteData(_Strict):
-    """Shared payload for product create/update (same fields change together)."""
+    """v1 payload for product create/update (same fields change together).
+
+    **Frozen.** Superseded by :class:`ProductWriteDataV2`, but kept registered so
+    v1 messages already sitting in an outbox table or an SQS queue when v2 shipped
+    still validate instead of failing their handler into a DLQ. Nothing produces
+    it any more; delete it once no v1 message can be in flight (past the queue's
+    retention + any DLQ replay window).
+    """
 
     product_id: uuid.UUID
     merchant_id: uuid.UUID
@@ -106,6 +113,8 @@ class ProductUpdated(DomainEvent):
 
 
 class ProductDeletedData(_Strict):
+    """v1 delete payload. Frozen — see :class:`ProductWriteData`."""
+
     product_id: uuid.UUID
     merchant_id: uuid.UUID
 
@@ -114,6 +123,60 @@ class ProductDeleted(DomainEvent):
     type: Literal["ProductDeleted"] = "ProductDeleted"
     schema_version: Literal[1] = 1
     data: ProductDeletedData
+
+
+class ProductWriteDataV2(ProductWriteData):
+    """v2 payload — v1 plus the ordering counter (**what producers emit**).
+
+    ``product_version`` is the catalog aggregate's ``version_id`` **after** the
+    write that produced this event. SNS topics are standard (unordered) and the
+    relay publishes a batch concurrently, so a consumer can legitimately see an
+    older update *after* a newer one. ``event_id`` dedup only suppresses exact
+    redeliveries and ``schema_version`` versions the *contract* — neither orders
+    instances. A projector must therefore keep the last applied version per
+    product and drop any event whose ``product_version`` is not greater.
+
+    Adding it is a **breaking** payload change (payloads are ``extra="forbid"``, so
+    a v1 consumer would reject the extra field and a v1 message lacking it would
+    fail v2 validation), hence a new ``schema_version`` rather than an edit in place.
+
+    **Deliberately not carried: ``description``.** The payload is a *notification*
+    of a change plus the fields a consumer projects (cart line display: name, price,
+    category) — not a replica of the row. A `description`-only edit still emits
+    ``ProductUpdated``, so cache invalidation and re-fetch are correct; nothing today
+    projects the description. Adding it later is a v3, not an in-place edit.
+    """
+
+    product_version: int = Field(ge=1)
+
+
+class ProductCreatedV2(DomainEvent):
+    type: Literal["ProductCreated"] = "ProductCreated"
+    schema_version: Literal[2] = 2
+    data: ProductWriteDataV2
+
+
+class ProductUpdatedV2(DomainEvent):
+    type: Literal["ProductUpdated"] = "ProductUpdated"
+    schema_version: Literal[2] = 2
+    data: ProductWriteDataV2
+
+
+class ProductDeletedDataV2(ProductDeletedData):
+    """v2 delete payload — a **tombstone**, ordered by the same counter.
+
+    Carries ``product_version`` for the same reason as the write payload: without
+    it, an update published before the delete but delivered after it would
+    resurrect a removed product in a downstream projection.
+    """
+
+    product_version: int = Field(ge=1)
+
+
+class ProductDeletedV2(DomainEvent):
+    type: Literal["ProductDeleted"] = "ProductDeleted"
+    schema_version: Literal[2] = 2
+    data: ProductDeletedDataV2
 
 
 # --- Inventory ----------------------------------------------------------------

@@ -144,6 +144,7 @@ def _image_outbox(row: Mapping[str, Any]) -> OutboxMessage:
         name=row["name"],
         price=row["price"],
         category=row["category"],
+        product_version=row["product_version"],
     )
 
 
@@ -176,6 +177,7 @@ def _self_check() -> None:  # pragma: no cover - runnable smoke test
                             "name": "Widget",
                             "price": Decimal("9.99"),
                             "category": "misc",
+                            "product_version": 2,
                         }
                     )
                 )

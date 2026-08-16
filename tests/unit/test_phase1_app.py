@@ -5,12 +5,15 @@ so ``/v1/ready`` sees no wired pools and must report 503.
 """
 
 import asyncio
+import logging
 import time
 
 import httpx
+from sqlalchemy.orm.exc import StaleDataError
 
 from src.app import create_app
 from src.shared.config.setting import AppSettings
+from src.shared.errors.exceptions import ConcurrentUpdateError
 
 SETTINGS = AppSettings(
     _env_file=None,
@@ -106,3 +109,122 @@ async def test_metrics_exposed():
         resp = await client.get("/metrics")
     assert resp.status_code == 200
     assert "text/plain" in resp.headers["content-type"]
+
+
+async def test_generated_openapi_documents_errors_as_rfc9457_problems():
+    """Every 4xx/5xx in ``/openapi.json`` must be ``application/problem+json``.
+
+    FastAPI documents its own validation failure as ``application/json`` with an
+    ``HTTPValidationError`` body, but ``register_exception_handlers`` answers every
+    error with a flat Problem Details document. A generated client would parse the
+    wrong content type and look for fields that are never sent.
+    """
+    schema = create_app(SETTINGS).openapi()
+
+    checked = 0
+    for operations in schema["paths"].values():
+        for operation in operations.values():
+            if not isinstance(operation, dict):
+                continue
+            for status, response in operation.get("responses", {}).items():
+                if not (status.isdigit() and int(status) >= 400):
+                    continue
+                assert list(response["content"]) == ["application/problem+json"], status
+                assert response["content"]["application/problem+json"]["schema"] == {
+                    "$ref": "#/components/schemas/Problem"
+                }
+                checked += 1
+
+    assert checked  # a spec with no documented errors would pass vacuously
+    assert "Problem" in schema["components"]["schemas"]
+    assert "HTTPValidationError" not in schema["components"]["schemas"]
+
+
+async def test_openapi_override_keeps_app_metadata():
+    """Rewriting the error responses must not cost the rest of the document.
+
+    Re-implementing ``get_openapi(...)`` with a hand-copied argument list drops
+    whatever isn't copied — ``servers``, ``openapi_tags``, ``webhooks``,
+    ``summary``, ``separate_input_output_schemas``. None are set today, so the loss
+    would be silent until someone sets one on ``create_app``. This test sets them
+    after the fact and asserts they survive alongside the Problem rewrite.
+    """
+    app = create_app(SETTINGS)
+    app.servers = [{"url": "https://api.example.test", "description": "prod"}]
+    app.openapi_tags = [{"name": "catalog", "description": "products"}]
+    app.summary = "E-commerce API"
+    app.openapi_schema = None  # drop whatever the factory may have cached
+
+    schema = app.openapi()
+
+    assert schema["servers"] == app.servers
+    assert schema["tags"] == app.openapi_tags
+    assert schema["info"]["summary"] == "E-commerce API"
+    assert schema["info"]["title"] == app.title
+    assert schema["openapi"] == app.openapi_version
+    assert "Problem" in schema["components"]["schemas"]  # ...and the rewrite still ran
+
+
+async def test_optimistic_lock_conflicts_are_409_problems_not_500s():
+    """Both the translated error *and* a raw SQLAlchemy ``StaleDataError`` map to 409.
+
+    A lost update is the optimistic lock working, so the caller should be told to
+    re-read and retry — not handed an opaque 500 from the boundary handler. The
+    ``StaleDataError`` arm is the backstop for a module whose adapter forgets to
+    translate; it logs at **WARNING** because reaching it is a defect either way —
+    SQLAlchemy also raises ``StaleDataError`` for an ORM write that matched an
+    unexpected row count, which is our bug, not contention.
+    """
+    app = create_app(SETTINGS)
+
+    async def conflict() -> None:
+        raise ConcurrentUpdateError("product")
+
+    async def untranslated() -> None:
+        raise StaleDataError("UPDATE matched 0 rows")
+
+    app.add_api_route("/_test/conflict", conflict)
+    app.add_api_route("/_test/untranslated", untranslated)
+
+    # The app's logging config doesn't propagate to root, so capture at the source.
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logger = logging.getLogger("src.shared.errors.exception_handlers")
+    logger.addHandler(handler)
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            for path in ("/_test/conflict", "/_test/untranslated"):
+                records.clear()
+                resp = await client.get(path)
+                assert resp.status_code == 409, (path, resp.text)
+                assert resp.headers["content-type"].startswith("application/problem+json"), path
+                assert resp.json()["title"] == "Conflict"
+                assert "retry" in resp.json()["detail"]
+                # The untranslated arm must be alertable; the translated one is routine.
+                assert [r.levelno for r in records] == ([logging.WARNING] if path.endswith("untranslated") else []), (
+                    path
+                )
+    finally:
+        logger.removeHandler(handler)
+
+
+async def test_generated_openapi_matches_what_a_product_patch_accepts():
+    """The live ``/openapi.json`` must describe the patch rules the API enforces.
+
+    Two ways the generated schema drifted from the hand-authored contract and the
+    runtime: it allowed ``{}`` (no ``minProperties``), and it advertised ``null``
+    for ``name``/``price`` — both of which the API answers with a 422. A client
+    generated from the runtime spec would send them believing they were valid.
+    """
+    schema = create_app(SETTINGS).openapi()["components"]["schemas"]["ProductUpdate"]
+
+    assert schema["minProperties"] == 1
+    for field in ("name", "price"):
+        prop = schema["properties"][field]
+        variants = prop.get("anyOf", [prop])
+        assert "null" not in [v.get("type") for v in variants], field
+        assert "default" not in prop, field  # a null default reintroduces the claim
+    # ...while genuinely nullable columns keep their null branch.
+    assert "null" in [v.get("type") for v in schema["properties"]["description"]["anyOf"]]

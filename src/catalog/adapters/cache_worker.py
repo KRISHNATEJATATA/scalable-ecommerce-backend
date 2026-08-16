@@ -14,6 +14,14 @@ Idempotent by construction: a ``DELETE`` of an already-absent key is a no-op, an
 (``event:catalog-cache:{event_id}``, so another subscriber to the same event still
 runs its own handler). A handler that raises leaves the message for SQS redrive →
 DLQ (replay per ``docs/RUNBOOK.md``).
+
+**No ``product_version`` gate here, deliberately.** Product events carry the
+aggregate's post-write version so a *stateful* consumer can drop out-of-order
+deliveries, but this one only evicts: applying a stale event just drops a key the
+next read repopulates from Postgres, whereas *skipping* one could leave a stale
+entry cached. Any future projector that stores product state (the cart's price/name
+snapshot) must instead apply only strictly-greater versions and treat
+``ProductDeleted`` as a tombstone.
 Run: ``python -m src.catalog.adapters.cache_worker``.
 """
 

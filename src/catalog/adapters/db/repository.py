@@ -21,6 +21,7 @@ from typing import Any
 
 from sqlalchemy import Result, String, bindparam, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.sql import text
 
 from src.catalog.adapters.db.models import SCHEMA, Outbox, Product
@@ -28,7 +29,7 @@ from src.catalog.domain.image_status import ImageStatus
 from src.catalog.ports.repository import ImageOutboxFactory
 from src.shared.db.outbox import OutboxMessage
 from src.shared.db.pagination import Page, PageParams, build_page, check_filters, decode_cursor
-from src.shared.errors.exceptions import InvalidQueryParamError
+from src.shared.errors.exceptions import ConcurrentUpdateError, InvalidQueryParamError
 
 # Whitelist: sort field -> (column, Postgres cast type for the cursor value).
 # The authoritative injection gate — only these names ever reach the SQL string.
@@ -43,7 +44,9 @@ _SELECT_COLS = "id, merchant_id, name, description, category, price, image_key, 
 
 # Fields the image-flip UPDATEs return so the ``ProductUpdated`` payload is built
 # from post-update state inside the same transaction (no read-then-publish race).
-_EVENT_COLS = "id AS product_id, merchant_id, name, price, category"
+# ``version_id`` is the post-increment value, so the event carries the same
+# monotonic counter an ORM-mediated edit publishes.
+_EVENT_COLS = "id AS product_id, merchant_id, name, price, category, version_id AS product_version"
 
 
 @dataclass(slots=True)
@@ -112,6 +115,20 @@ class CatalogRepository:
 
     # --- writes: state change + outbox row committed in ONE transaction -------
 
+    async def _commit_versioned(self) -> None:
+        """Commit an ORM write on the versioned ``Product`` aggregate.
+
+        ``version_id_col`` turns a lost update into ``StaleDataError`` at flush.
+        Translate it at the adapter boundary (and roll back the now-unusable
+        transaction) so the API answers a retryable **409** instead of letting a
+        SQLAlchemy exception reach the 500 handler.
+        """
+        try:
+            await self._session.commit()
+        except StaleDataError as exc:
+            await self._session.rollback()
+            raise ConcurrentUpdateError("product") from exc
+
     async def create_product(
         self,
         *,
@@ -145,12 +162,13 @@ class CatalogRepository:
 
         The product is mutated through the ORM so ``version_id`` auto-bumps
         (optimistic lock): a concurrent edit that already advanced the version
-        makes this commit raise ``StaleDataError`` instead of silently clobbering.
+        makes this commit raise ``StaleDataError`` instead of silently clobbering,
+        which :meth:`_commit_versioned` turns into a retryable 409.
         """
         for field, value in changes.items():
             setattr(product, field, value)
         self._session.add(self._outbox_row(outbox))
-        await self._session.commit()
+        await self._commit_versioned()
         await self._session.refresh(product)
         return product
 
@@ -158,7 +176,7 @@ class CatalogRepository:
         """Soft-delete (``deleted_at``) + emit the ``ProductDeleted`` outbox row."""
         product.deleted_at = datetime.now(UTC)
         self._session.add(self._outbox_row(outbox))
-        await self._session.commit()
+        await self._commit_versioned()
 
     # --- image pipeline state (presign sets pending; the worker marks ready/failed) ---
 
@@ -178,7 +196,7 @@ class CatalogRepository:
         product.image_upload_token = upload_token
         if outbox is not None:
             self._session.add(self._outbox_row(outbox))
-        await self._session.commit()
+        await self._commit_versioned()
 
     async def mark_image_ready(
         self, product_id: uuid.UUID, upload_token: str, image_key: str, outbox: ImageOutboxFactory | None = None
@@ -201,11 +219,16 @@ class CatalogRepository:
         Guarded on ``image_status = 'pending'`` as well as the token, so a
         **redelivery** of the same event (the row is already ``ready``) updates zero
         rows and does not emit a *duplicate* ``ProductUpdated`` outbox row.
+
+        Bumps ``version_id`` by hand: this write bypasses the ORM unit-of-work, so
+        nothing else would advance the aggregate's counter, and two flips (or a flip
+        and a merchant edit) would publish events sharing a version — leaving a
+        downstream projector unable to order them.
         """
         result = await self._session.execute(
             text(
                 f"UPDATE {SCHEMA}.products "
-                "SET image_key = :key, image_status = :ready, updated_at = now() "
+                "SET image_key = :key, image_status = :ready, version_id = version_id + 1, updated_at = now() "
                 "WHERE id = :id AND image_upload_token = :token "
                 "AND image_status = :pending AND deleted_at IS NULL "
                 f"RETURNING {_EVENT_COLS}"
@@ -230,11 +253,12 @@ class CatalogRepository:
         already-``failed`` row updates zero rows so no duplicate outbox row is
         emitted. The ``outbox`` factory is fed the same transaction's ``RETURNING``
         row, so the status change invalidates the read-cache with post-update state.
+        ``version_id`` is bumped here too (see :meth:`mark_image_ready`).
         """
         result = await self._session.execute(
             text(
                 f"UPDATE {SCHEMA}.products "
-                "SET image_status = :failed, updated_at = now() "
+                "SET image_status = :failed, version_id = version_id + 1, updated_at = now() "
                 "WHERE id = :id AND image_upload_token = :token "
                 "AND image_status = :pending AND deleted_at IS NULL "
                 f"RETURNING {_EVENT_COLS}"

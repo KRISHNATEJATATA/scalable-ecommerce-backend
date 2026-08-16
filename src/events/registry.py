@@ -1,7 +1,9 @@
 """Event schema registry + validation — the contract-test entry point.
 
-Keyed by ``(type, schema_version)`` so a future ``v2`` of any event coexists with
-its ``v1`` and both stay independently validatable (only ``v1`` exists today).
+Keyed by ``(type, schema_version)`` so a ``v2`` of any event coexists with its
+``v1`` and both stay independently validatable — the product events are the live
+example: producers emit ``v2`` (with the ``product_version`` ordering counter)
+while ``v1`` stays registered for messages already in an outbox/queue.
 :func:`validate_event` checks a raw event body (as pulled off SQS / stored in the
 outbox) by re-parsing it through the registered strict Pydantic model — the same
 contract that generates the JSON Schema, so no separate validator library is
@@ -22,8 +24,11 @@ from src.events.models import (
     PaymentFailed,
     PaymentSucceeded,
     ProductCreated,
+    ProductCreatedV2,
     ProductDeleted,
+    ProductDeletedV2,
     ProductUpdated,
+    ProductUpdatedV2,
     StockReleased,
     StockReserved,
     UserCreated,
@@ -33,15 +38,44 @@ from src.events.models import (
 EVENT_MODELS: tuple[type[DomainEvent], ...] = (
     UserCreated,
     UserDeleted,
+    # Product events: v1 is frozen and no longer produced, but stays registered so
+    # messages written before the v2 rollout still validate on the way out of an
+    # outbox table or an SQS queue instead of being DLQ'd as unknown.
     ProductCreated,
     ProductUpdated,
     ProductDeleted,
+    ProductCreatedV2,
+    ProductUpdatedV2,
+    ProductDeletedV2,
     StockReserved,
     StockReleased,
     OrderPlaced,
     PaymentSucceeded,
     PaymentFailed,
 )
+
+
+#: The ``schema_version`` producers currently put on the wire, per event type.
+#: Every consumer must accept a version **before** any producer emits it, because a
+#: consumer that doesn't know a ``(type, schema_version)`` raises
+#: :class:`UnknownEventError`, never deletes the message, and the queue DLQs it after
+#: ``maxReceiveCount``. So a version bump is a **two-phase, consumer-first rollout**:
+#: ship the V-capable consumers (and let them reach steady state), *then* the
+#: producers — see ``docs/DEPLOYMENT.md`` § "Rolling out a new event version".
+#: Pinned here rather than derived so the bump is an explicit, reviewable diff; a
+#: test in ``tests/unit/test_events.py`` fails if production code drifts from it.
+PRODUCED_VERSIONS: dict[str, int] = {
+    "UserCreated": 1,
+    "UserDeleted": 1,
+    "ProductCreated": 2,
+    "ProductUpdated": 2,
+    "ProductDeleted": 2,
+    "StockReserved": 1,
+    "StockReleased": 1,
+    "OrderPlaced": 1,
+    "PaymentSucceeded": 1,
+    "PaymentFailed": 1,
+}
 
 
 class UnknownEventError(LookupError):

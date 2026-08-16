@@ -30,7 +30,7 @@ from src.catalog.application.outbox import product_updated_outbox
 from src.catalog.ports.cache import MISS, ProductCachePort
 from src.catalog.ports.repository import CatalogRepositoryPort
 from src.catalog.ports.storage import ImageStorePort
-from src.events.models import ProductCreated, ProductDeleted, ProductDeletedData, ProductWriteData
+from src.events.models import ProductCreatedV2, ProductDeletedDataV2, ProductDeletedV2, ProductWriteDataV2
 from src.shared.config.logging import current_trace_id
 from src.shared.config.setting import AppSettings
 from src.shared.db.outbox import OutboxMessage
@@ -38,6 +38,14 @@ from src.shared.db.pagination import PageParams, PageResponse
 from src.shared.errors.exceptions import AuthorizationError, InvalidUploadError
 
 log = logging.getLogger(__name__)
+
+# The version an INSERT lands on (``VersionIdMixin.version_id`` defaults to 1), and
+# the step every subsequent write takes. An ORM mutation guarded by
+# ``version_id_col`` only commits if the row still holds the loaded version, so the
+# post-write value is deterministically ``version_id + 1`` — safe to put in the
+# event payload that is written in that same transaction, before the flush.
+_INITIAL_VERSION = 1
+_VERSION_STEP = 1
 
 
 class _RepositoryFailure(Exception):
@@ -298,14 +306,15 @@ class CatalogService:
     async def create_product(self, *, merchant_id: uuid.UUID, data: ProductCreate) -> ProductResponse:
         """Create a product owned by ``merchant_id`` and emit ``ProductCreated``."""
         product_id = uuid.uuid4()
-        event = ProductCreated.new(
+        event = ProductCreatedV2.new(
             trace_id=current_trace_id(),
-            data=ProductWriteData(
+            data=ProductWriteDataV2(
                 product_id=product_id,
                 merchant_id=merchant_id,
                 name=data.name,
                 price=data.price,
                 category=data.category,
+                product_version=_INITIAL_VERSION,
             ),
         )
         row = await self._repo.create_product(
@@ -336,6 +345,7 @@ class CatalogService:
             name=changes.get("name", product.name),
             price=changes.get("price", product.price),
             category=changes.get("category", product.category),
+            product_version=product.version_id + _VERSION_STEP,
         )
         row = await self._repo.update_product(product, changes, outbox=outbox)
         return self._to_response(to_domain(row))
@@ -347,9 +357,15 @@ class CatalogService:
             return False
         self._assert_owner(product.merchant_id, merchant_id, is_admin)
 
-        event = ProductDeleted.new(
+        event = ProductDeletedV2.new(
             trace_id=current_trace_id(),
-            data=ProductDeletedData(product_id=product_id, merchant_id=product.merchant_id),
+            data=ProductDeletedDataV2(
+                product_id=product_id,
+                merchant_id=product.merchant_id,
+                # Tombstones share the aggregate's counter, so a slower in-flight
+                # update can't resurrect a deleted product downstream.
+                product_version=product.version_id + _VERSION_STEP,
+            ),
         )
         await self._repo.soft_delete_product(product, outbox=OutboxMessage(event.type, event.model_dump_json()))
         return True
@@ -392,6 +408,7 @@ class CatalogService:
             name=product.name,
             price=product.price,
             category=product.category,
+            product_version=product.version_id + _VERSION_STEP,
         )
         await self._repo.set_image_pending(product, presigned["token"], outbox=outbox)
         return ImageUploadTicket(

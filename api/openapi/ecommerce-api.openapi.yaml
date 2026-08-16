@@ -148,6 +148,23 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: >-
+            Lost update — another writer advanced this product's version between
+            the read and the write (optimistic lock). Re-read and re-apply.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422":
+          description: >-
+            Invalid patch — an empty body, an explicit `null` for `name`/`price`
+            (both back NOT-NULL columns: omit to leave untouched), or a
+            non-positive price.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
     delete:
       tags: [catalog]
       operationId: deleteProduct
@@ -166,6 +183,14 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: >-
+            Lost update — a concurrent edit advanced this product's version
+            (optimistic lock). Re-read and retry the delete.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
   /v1/products/{product_id}/image:presign:
     parameters:
       - $ref: "#/components/parameters/ProductId"
@@ -203,6 +228,15 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: >-
+            Lost update — a concurrent edit advanced this product's version while
+            the presign was marking its image `pending` (optimistic lock).
+            Re-request the presign.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
   /v1/me:
     get:
       tags: [identity]
@@ -538,12 +572,13 @@ components:
           description: Positive decimal money value (> 0).
       required: [name, price]
     ProductUpdate:
-      description: Partial merchant update — every field optional; unset fields are untouched. `image_key` is not updatable here (use the presign endpoint).
+      description: Partial merchant update — every field optional; unset fields are untouched. `image_key` is not updatable here (use the presign endpoint). An empty body is rejected (422) — it would emit a `ProductUpdated` event for a change that never happened. `name`/`price` back NOT-NULL columns, so they may be omitted but never sent as `null`.
       type: object
       additionalProperties: false
+      minProperties: 1
       properties:
         name:
-          type: [string, "null"]
+          type: string
           minLength: 1
           maxLength: 255
         description:
@@ -552,7 +587,7 @@ components:
           type: [string, "null"]
           maxLength: 255
         price:
-          type: [string, "null"]
+          type: string
           description: Positive decimal money value (> 0).
     ImagePresignRequest:
       description: Merchant declares the intended upload; validated BEFORE a URL is issued.

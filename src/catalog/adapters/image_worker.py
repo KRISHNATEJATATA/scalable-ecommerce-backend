@@ -11,6 +11,13 @@ the application layer means this adapter never touches the DB directly.
 A handler that raises leaves the message for SQS redrive → DLQ (replay per
 ``docs/RUNBOOK.md``); a clean pass (including a rejected-but-handled upload)
 deletes the message. Run: ``python -m src.catalog.adapters.image_worker``.
+
+**Rollout phase: producer, not consumer.** What it consumes is a raw S3
+notification, which carries no ``schema_version`` — but marking an image usable
+writes a ``ProductUpdatedV2`` outbox row, so this worker *emits* domain events. On
+an event-version bump it deploys in the **producer** phase, alongside the API and
+after the bus consumers (the cache worker) are stable — see ``docs/DEPLOYMENT.md``
+§ "Rolling out a new event version".
 """
 
 from __future__ import annotations

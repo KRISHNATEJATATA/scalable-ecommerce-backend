@@ -10,8 +10,10 @@ that violates the versioned contract.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -21,6 +23,7 @@ from src.events import (
     OrderPlaced,
     PaymentSucceeded,
     ProductCreated,
+    ProductCreatedV2,
     StockReserved,
     UnknownEventError,
     UserCreated,
@@ -31,10 +34,11 @@ from src.events.models import (
     OrderPlacedLine,
     PaymentSucceededData,
     ProductWriteData,
+    ProductWriteDataV2,
     StockChangeData,
     UserCreatedData,
 )
-from src.events.registry import schema_for
+from src.events.registry import PRODUCED_VERSIONS, REGISTRY, schema_for
 
 _EXPECTED = {
     "UserCreated",
@@ -120,6 +124,12 @@ def test_consumer_rejects_any_missing_envelope_field(field: str) -> None:
             trace_id="t",
             data=ProductWriteData(product_id=uuid.uuid4(), merchant_id=uuid.uuid4(), name="x", price=Decimal("9.99")),
         ),
+        ProductCreatedV2.new(
+            trace_id="t",
+            data=ProductWriteDataV2(
+                product_id=uuid.uuid4(), merchant_id=uuid.uuid4(), name="x", price=Decimal("9.99"), product_version=1
+            ),
+        ),
         OrderPlaced.new(
             trace_id="t",
             data=OrderPlacedData(
@@ -172,6 +182,129 @@ def test_unknown_type_or_version_raises() -> None:
         validate_event(json.dumps({**good, "type": "NopeEvent"}))
     with pytest.raises(UnknownEventError):
         validate_event(json.dumps({**good, "schema_version": 999}))
+
+
+# --- product event versioning (v1 frozen, v2 live) -------------------------
+
+# A ``ProductUpdated`` exactly as it was written to ``catalog.outbox`` (or shipped
+# to SQS) before the v2 rollout: no ``product_version``. Hard-coded rather than
+# built from a model, so it stays a record of the *old wire format* even if the
+# v1 model is ever touched.
+_V1_ON_THE_WIRE = {
+    "type": "ProductUpdated",
+    "schema_version": 1,
+    "event_id": "0f9d5f9c-4a1a-4a5e-9a4d-3f5a1f4b2c11",
+    "trace_id": "trace-abc",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "data": {
+        "product_id": "6a1f0b5e-1d2c-4f3a-8b7c-9d0e1f2a3b4c",
+        "merchant_id": "7b2f1c6d-2e3d-4a4b-9c8d-0e1f2a3b4c5d",
+        "name": "widget",
+        "price": "9.99",
+        "category": "tools",
+    },
+}
+
+
+@pytest.mark.parametrize("event_type", ["ProductCreated", "ProductUpdated", "ProductDeleted"])
+def test_both_product_event_versions_stay_registered(event_type: str) -> None:
+    """v1 must not be de-registered when v2 ships: messages produced before the
+    rollout can still be sitting in an outbox table or an SQS queue (plus a DLQ
+    replay window), and an unregistered version is an ``UnknownEventError`` — the
+    handler raises and the message redrives to the DLQ."""
+    assert (event_type, 1) in REGISTRY
+    assert (event_type, 2) in REGISTRY
+
+
+def test_v1_product_message_still_validates_after_the_v2_rollout() -> None:
+    """The compatibility guarantee: an in-flight v1 payload keeps validating."""
+    normalized = validate_event(json.dumps(_V1_ON_THE_WIRE))
+
+    assert normalized["schema_version"] == 1
+    assert "product_version" not in normalized["data"]  # v1 never carried one
+
+
+def test_adding_product_version_to_v1_would_have_broken_in_flight_messages() -> None:
+    """Why the ``schema_version`` bump was required rather than editing v1.
+
+    Payloads are ``extra="forbid"``, so the two directions each fail: a v1 message
+    can't satisfy a v1 model that gained a required field, and a v2 message (with
+    the extra field) can't validate against the v1 contract.
+    """
+    v2_body = dict(_V1_ON_THE_WIRE, data={**_V1_ON_THE_WIRE["data"], "product_version": 3})
+
+    with pytest.raises(ValidationError):  # v2 payload against the v1 contract
+        validate_event(json.dumps(v2_body))
+    with pytest.raises(ValidationError):  # ...and a v1 payload against the v2 contract
+        validate_event(json.dumps({**_V1_ON_THE_WIRE, "schema_version": 2}))
+
+    # Same body routed to v2 (where the field belongs) validates.
+    assert validate_event(json.dumps({**v2_body, "schema_version": 2}))["data"]["product_version"] == 3
+
+
+def test_v2_product_version_must_be_a_positive_int() -> None:
+    """``ge=1``: version 0 is not a real aggregate version, so it can't order anything."""
+    with pytest.raises(ValidationError):
+        ProductWriteDataV2(
+            product_id=uuid.uuid4(), merchant_id=uuid.uuid4(), name="x", price=Decimal("1.00"), product_version=0
+        )
+
+
+_SRC = Path(__file__).resolve().parents[2] / "src"
+
+#: ``{class name: (event type, schema_version)}`` for every registered model.
+_MODEL_KEYS = {m.__name__: key for key, m in REGISTRY.items()}
+
+
+def _versions_constructed_in_production_code() -> dict[str, set[int]]:
+    """Scan ``src/`` (minus the contracts package) for ``<EventModel>.new(`` calls.
+
+    Producers are the only place events are built, and they always go through
+    ``.new()``, so this is what actually reaches the bus — as opposed to a constant
+    that can silently drift from the code.
+    """
+    pattern = re.compile(rf"\b({'|'.join(map(re.escape, _MODEL_KEYS))})\.new\(")
+    produced: dict[str, set[int]] = {}
+    for path in _SRC.rglob("*.py"):
+        if path.parent.name == "events":  # the models/registry themselves
+            continue
+        for name in pattern.findall(path.read_text(encoding="utf-8")):
+            event_type, version = _MODEL_KEYS[name]
+            produced.setdefault(event_type, set()).add(version)
+    return produced
+
+
+def test_pinned_producer_versions_are_registered() -> None:
+    """A producer may only emit a ``(type, version)`` some consumer can parse."""
+    assert {t for t, _ in REGISTRY} == set(PRODUCED_VERSIONS)
+    for event_type, version in PRODUCED_VERSIONS.items():
+        assert (event_type, version) in REGISTRY
+
+
+def test_production_code_emits_exactly_the_pinned_version() -> None:
+    """Consumer-first rollout guard.
+
+    Bumping a producer to a new ``schema_version`` while an older consumer task is
+    still running means that consumer raises ``UnknownEventError``, never deletes
+    the message, and the queue DLQs it after ``maxReceiveCount``. So the order is
+    fixed: deploy V-capable **consumers** first, then flip producers. This test
+    fails on the producer half of that change unless ``PRODUCED_VERSIONS`` is
+    updated in the same diff, which is the reviewable checkpoint for the rule (see
+    ``docs/DEPLOYMENT.md`` § "Rolling out a new event version").
+    """
+    produced = _versions_constructed_in_production_code()
+
+    # Canary: the scan matches a literal ``<ModelClass>.new(``, so a producer
+    # refactored behind an alias (``_EVENT = ProductUpdatedV2`` … ``_EVENT.new(``)
+    # or built with a plain constructor would make this test iterate over nothing
+    # and pass a version bump it exists to catch. Assert it still sees its subject.
+    assert {"ProductCreated", "ProductUpdated", "ProductDeleted"} <= produced.keys(), produced
+
+    for event_type, versions in produced.items():
+        assert versions == {PRODUCED_VERSIONS[event_type]}, (
+            f"{event_type} is produced at {sorted(versions)} but pinned to "
+            f"{PRODUCED_VERSIONS[event_type]}; deploy V2-capable consumers before bumping producers"
+        )
 
 
 def test_request_dto_ignores_unexpected_privileged_field() -> None:

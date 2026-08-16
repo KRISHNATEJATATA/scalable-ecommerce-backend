@@ -1,0 +1,23 @@
+# Line endings are normalized to LF in the repository and in the working tree.
+#
+# Without this, `core.autocrlf` decides per developer machine: files committed
+# from Windows landed with CRLF in the index while their neighbours were LF
+# (several source files and two docs ended up *mixed*), which makes appended
+# lines show up as trailing-whitespace errors in `git diff --check` and turns a
+# one-line edit into a whole-file diff. LF everywhere also keeps the Linux
+# Docker image and shell scripts byte-identical to what CI builds.
+* text=auto eol=lf
+
+# Windows-only entrypoints keep CRLF; cmd.exe mis-parses LF-only batch files.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Never touch binaries.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary

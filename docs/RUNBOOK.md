@@ -80,6 +80,25 @@ Watch the CloudWatch alarm on the DLQ's `ApproximateNumberOfMessagesVisible` ret
 If a message is genuinely un-processable, inspect the payload, fix the consumer/data, then
 redrive — never delete blindly.
 
+**Special case: a DLQ that filled with valid events after a deploy.** If the DLQ'd bodies
+carry a `schema_version` the running consumers don't register, the producers were deployed
+**before** the consumers — the consumer raised `UnknownEventError` on every receive. The
+messages are fine; the fleet order was wrong.
+
+```bash
+# What version is stuck? (any DLQ body)
+aws sqs receive-message --queue-url <dlq-url> --max-number-of-messages 1 \
+  --query 'Messages[0].Body' --output text | python -c 'import json,sys; m=json.load(sys.stdin); print(json.loads(m["Message"])["type"], json.loads(m["Message"])["schema_version"])'
+```
+
+Recovery: deploy the bus consumers (the cache worker) onto the image that registers that
+version, wait for `services-stable`, **then** redrive the DLQ with the command above.
+Consumers are idempotent, so replaying whatever already succeeded is a no-op. Do **not** roll
+producers back first — that strands the already-emitted messages. See `docs/DEPLOYMENT.md`
+§ "Rolling out a new event version" for the ordering rule this violates (note the image
+worker counts as a **producer** there: it writes `ProductUpdated` rows on `image_status`
+flips).
+
 ### 5. Outbox stuck (relay down / lagging)
 
 Symptom: `outbox lag` metric (age of oldest `published_at IS NULL` row) climbing. The relay is

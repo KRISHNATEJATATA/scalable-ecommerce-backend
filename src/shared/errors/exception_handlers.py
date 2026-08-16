@@ -9,6 +9,7 @@ import logging
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from sqlalchemy.orm.exc import StaleDataError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse
 
@@ -16,6 +17,7 @@ from src.shared.errors.error_builder import PROBLEM_CONTENT_TYPE, build_problem
 from src.shared.errors.exceptions import (
     AuthenticationError,
     AuthorizationError,
+    ConcurrentUpdateError,
     DependencyUnavailableError,
     InsufficientStockError,
     InvalidCursorError,
@@ -72,6 +74,27 @@ async def _reservation_conflict_handler(_: Request, exc: ReservationConflictErro
     return _problem_response(409, title="Reservation Conflict", detail=exc.detail)
 
 
+async def _concurrent_update_handler(_: Request, exc: ConcurrentUpdateError) -> JSONResponse:
+    # 409: the optimistic lock (`version_id`) rejected a lost-update, which is the
+    # guard working — a retryable client outcome, not the 500 boundary.
+    return _problem_response(409, title="Conflict", detail=exc.detail)
+
+
+async def _stale_data_handler(_: Request, exc: StaleDataError) -> JSONResponse:
+    # Backstop: any module whose adapter forgets to translate SQLAlchemy's
+    # optimistic-lock error still answers 409 rather than an opaque 500.
+    #
+    # WARNING, not INFO, and deliberately loud: reaching here is a defect either
+    # way. Every adapter is supposed to translate its own conflicts, and
+    # SQLAlchemy raises StaleDataError for a *second* reason — an ORM UPDATE/DELETE
+    # that matched an unexpected row count with no versioning involved, which is
+    # our bug and morally a 500. Answering 409 keeps a real lock conflict
+    # retryable; this log line is what stops the other case hiding inside normal
+    # contention. Alert on it.
+    logger.warning("optimistic lock conflict reached the boundary untranslated (adapter bug?): %s", exc)
+    return _problem_response(409, title="Conflict", detail=ConcurrentUpdateError().detail)
+
+
 async def _dependency_unavailable_handler(_: Request, exc: DependencyUnavailableError) -> JSONResponse:
     logger.warning("Dependency unavailable: %s", exc.detail)
     return _problem_response(503, title="Service Unavailable", detail=exc.detail)
@@ -106,6 +129,8 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(InvalidReservationError, _detail_bad_request_handler)
     app.add_exception_handler(InsufficientStockError, _insufficient_stock_handler)
     app.add_exception_handler(ReservationConflictError, _reservation_conflict_handler)
+    app.add_exception_handler(ConcurrentUpdateError, _concurrent_update_handler)
+    app.add_exception_handler(StaleDataError, _stale_data_handler)
     app.add_exception_handler(DependencyUnavailableError, _dependency_unavailable_handler)
     app.add_exception_handler(StarletteHTTPException, _http_exception_handler)
     app.add_exception_handler(RequestValidationError, _validation_exception_handler)

@@ -96,6 +96,29 @@ class ReservationConflictError(Exception):
         self.detail = detail
 
 
+class ConcurrentUpdateError(Exception):
+    """An optimistic-lock (``version_id``) conflict lost the race → 409, retryable.
+
+    Two writers loaded the same aggregate and both tried to commit: SQLAlchemy's
+    ``version_id_col`` guard makes the loser's ``UPDATE`` match zero rows and raise
+    ``StaleDataError``. That is the oversell-style guard working, not a server
+    fault, so it must not fall through to the 500 boundary handler — the caller can
+    simply re-read and re-apply its patch. Adapters translate the SQLAlchemy error
+    into this one so the ORM exception never leaks past the repository.
+
+    **Scope:** this guards the read→write window *inside one request*. There is no
+    ``ETag``/``If-Match`` yet (``ProductResponse`` exposes no version), so two
+    *sequential* requests remain last-write-wins by design — conditional updates
+    are ticket 25, not a gap in this guard.
+    """
+
+    def __init__(self, resource: str = "resource") -> None:
+        detail = f"{resource} was modified concurrently; re-read it and retry"
+        super().__init__(detail)
+        self.resource = resource
+        self.detail = detail
+
+
 class StockMutationError(Exception):
     """A guarded stock UPDATE matched an unexpected number of rows → 500, our bug.
 
