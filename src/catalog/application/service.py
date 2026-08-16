@@ -31,7 +31,7 @@ from src.catalog.ports.cache import MISS, ProductCachePort
 from src.catalog.ports.repository import CatalogRepositoryPort
 from src.catalog.ports.storage import ImageStorePort
 from src.events.models import ProductCreated, ProductDeleted, ProductDeletedData, ProductWriteData
-from src.shared.config.logging import request_id_ctx
+from src.shared.config.logging import current_trace_id
 from src.shared.config.setting import AppSettings
 from src.shared.db.outbox import OutboxMessage
 from src.shared.db.pagination import PageParams, PageResponse
@@ -298,8 +298,8 @@ class CatalogService:
     async def create_product(self, *, merchant_id: uuid.UUID, data: ProductCreate) -> ProductResponse:
         """Create a product owned by ``merchant_id`` and emit ``ProductCreated``."""
         product_id = uuid.uuid4()
-        event = ProductCreated(
-            trace_id=request_id_ctx.get(),
+        event = ProductCreated.new(
+            trace_id=current_trace_id(),
             data=ProductWriteData(
                 product_id=product_id,
                 merchant_id=merchant_id,
@@ -347,8 +347,8 @@ class CatalogService:
             return False
         self._assert_owner(product.merchant_id, merchant_id, is_admin)
 
-        event = ProductDeleted(
-            trace_id=request_id_ctx.get(),
+        event = ProductDeleted.new(
+            trace_id=current_trace_id(),
             data=ProductDeletedData(product_id=product_id, merchant_id=product.merchant_id),
         )
         await self._repo.soft_delete_product(product, outbox=OutboxMessage(event.type, event.model_dump_json()))

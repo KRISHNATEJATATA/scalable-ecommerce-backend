@@ -61,6 +61,14 @@ Losing the cache worker degrades read latency (more DB reads, staleness bounded 
 `PRODUCT_CACHE_TTL_SECONDS`) but is not a correctness incident; losing the relay or
 image worker stalls events/uploads until it recovers (both replay safely).
 
+**Topic ARNs.** Terraform provisions the per-event-type SNS topics, so give the relay task
+role `sns:Publish` only and point `BUS_TOPIC_ARN_PREFIX` at the ARN namespace
+(`arn:aws:sns:<region>:<account-id>:` — the topic name from `BUS_TOPIC_PREFIX` is appended).
+The relay then resolves ARNs by string with no API call; **it refuses to start** when
+`BUS_ENDPOINT_URL` is unset (real AWS) and this is missing, rather than falling back to
+`sns:CreateTopic` and failing `AccessDenied` on the first event. Locally the variable stays
+empty and `scripts/bus_bootstrap.py` creates the topics on LocalStack.
+
 **Worker metrics.** Only the API serves `/metrics`, so every worker above needs its own
 export or its counters are invisible. Set `WORKER_METRICS_PORT` on the long-running worker
 services and scrape it like any other target (docker-compose sets it on all four workers and

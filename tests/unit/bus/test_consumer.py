@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 
@@ -78,6 +79,7 @@ def _message(event_id: str, *, trace_id: str = "0af7651916cd43dd8448eb211c80319c
             "schema_version": 1,
             "event_id": event_id,
             "trace_id": trace_id,
+            "occurred_at": datetime.now(UTC).isoformat(),
             "data": {
                 "order_id": str(uuid.uuid4()),
                 "user_id": str(uuid.uuid4()),

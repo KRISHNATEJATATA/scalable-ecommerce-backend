@@ -91,11 +91,33 @@ class OutboxRelay:
             return len(rows)
 
     async def drain_once(self) -> int:
-        """One pass over every schema; returns the number of rows published."""
+        """One pass over every schema; returns the number of rows published.
+
+        Schemas are **isolated from each other**. A publish that fails for good —
+        an event type whose topic was never provisioned, a payload over the SNS
+        size limit — would otherwise abort the whole pass at the schema it sits
+        in, so every schema *after* it in the list would never drain again: one
+        stuck row in ``catalog`` silently stops ``orders`` and ``payments`` from
+        shipping. Each schema therefore fails on its own; the rest still drain.
+        (Within a schema a stuck row does block the rows behind it — that is the
+        outbox's ordering guarantee, and the row is visible via the outbox-lag
+        metric.)
+
+        If *every* schema failed, the cause is shared (SNS/network down), so the
+        error propagates and :func:`poll_forever` backs off exponentially instead
+        of hammering a dead dependency once per poll interval.
+        """
         published = 0
+        failures: list[Exception] = []
         async with self._sessionmaker() as session:
             for schema in self._schemas:
-                published += await self._drain_schema(session, schema)
+                try:
+                    published += await self._drain_schema(session, schema)
+                except Exception as exc:  # boundary: one schema must not starve the others
+                    log.exception("outbox drain failed for schema %s; continuing with the rest", schema)
+                    failures.append(exc)
+        if failures and len(failures) == len(self._schemas):
+            raise failures[0]
         return published
 
     async def run(self, poll_interval: float, stop: asyncio.Event | None = None) -> None:
@@ -110,9 +132,21 @@ async def run_relay(
     schemas=OUTBOX_SCHEMAS,
     stop: asyncio.Event | None = None,
 ) -> None:
-    """Build a real SNS-backed relay from settings and run its loop."""
+    """Build a real SNS-backed relay from settings and run its loop.
+
+    On real AWS (``bus_endpoint_url is None``) the topic ARN namespace is
+    **required**: Terraform owns the topics there and the task role is publish-only,
+    so falling back to ``create_topic`` would fail with ``AccessDenied`` on the
+    first event of every cold start. Refuse to start with a clear message instead
+    of discovering it one dropped batch at a time.
+    """
+    if settings.bus_endpoint_url is None and not settings.bus_topic_arn_prefix:
+        raise RuntimeError(
+            "BUS_TOPIC_ARN_PREFIX must be set when BUS_ENDPOINT_URL is unset (real AWS): "
+            "topics are provisioned by Terraform and the relay task role has sns:Publish only"
+        )
     async with sns_client(settings) as sns:
-        publisher = SnsPublisher(sns, settings.bus_topic_prefix)
+        publisher = SnsPublisher(sns, settings.bus_topic_prefix, settings.bus_topic_arn_prefix)
         relay = OutboxRelay(
             sessionmaker,
             publisher,

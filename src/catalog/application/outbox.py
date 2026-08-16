@@ -15,7 +15,7 @@ import uuid
 from decimal import Decimal
 
 from src.events.models import ProductUpdated, ProductWriteData
-from src.shared.config.logging import request_id_ctx
+from src.shared.config.logging import current_trace_id
 from src.shared.db.outbox import OutboxMessage
 
 
@@ -32,8 +32,8 @@ def product_updated_outbox(
     Used for cache invalidation on any change that alters a product's cached
     response — a field edit or an image-state transition.
     """
-    event = ProductUpdated(
-        trace_id=request_id_ctx.get() or str(uuid.uuid4()),
+    event = ProductUpdated.new(
+        trace_id=current_trace_id(),
         data=ProductWriteData(
             product_id=product_id,
             merchant_id=merchant_id,

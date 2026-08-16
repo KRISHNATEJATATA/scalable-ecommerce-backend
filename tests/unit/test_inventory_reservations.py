@@ -9,7 +9,6 @@ Uses the shared Testcontainers-Postgres fixtures from ``conftest.py``.
 """
 
 import asyncio
-import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -416,7 +415,7 @@ async def test_retry_succeeds_when_the_conflicting_hold_is_released_mid_flight(s
 async def test_reserved_outbox_payload_is_a_valid_registered_event():
     message = stock_reserved_outbox("sku-1", uuid.uuid4(), 2)
     assert message.event_type == "StockReserved"
-    validate_event(json.loads(message.payload))
+    validate_event(message.payload)  # the stored payload IS the wire body
 
 
 async def _expire_all(session) -> None:

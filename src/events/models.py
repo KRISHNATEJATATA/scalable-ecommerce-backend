@@ -17,7 +17,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -36,14 +36,24 @@ class DomainEvent(_Strict):
     """Base envelope shared by every domain event.
 
     Carries ``event_id``, ``trace_id`` and ``occurred_at`` here; each concrete
-    subclass adds the remaining two required envelope fields — ``type`` and
+    subclass adds the remaining two envelope fields — ``type`` and
     ``schema_version`` — as ``Literal`` defaults, plus its typed ``data`` payload.
-    A producer therefore only supplies ``trace_id`` and ``data``.
+
+    **No field here has a default.** Defaulting ``event_id``/``occurred_at`` would
+    leave them out of the schema's ``required`` list and let a consumer accept an
+    event that never carried them — dedupe keys off ``event_id`` and handlers read
+    ``occurred_at``, so "absent" must fail validation, not be quietly minted at the
+    receiving end. Producers stamp both through :meth:`new`.
     """
 
-    event_id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    event_id: uuid.UUID
     trace_id: str
-    occurred_at: datetime = Field(default_factory=_utcnow)
+    occurred_at: datetime
+
+    @classmethod
+    def new(cls, **fields: Any) -> Self:
+        """Build an event as it is emitted: stamps ``event_id`` and ``occurred_at``."""
+        return cls(event_id=uuid.uuid4(), occurred_at=_utcnow(), **fields)
 
 
 # --- Identity -----------------------------------------------------------------

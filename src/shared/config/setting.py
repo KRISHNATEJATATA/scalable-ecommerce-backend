@@ -13,7 +13,7 @@ latter would break test collection and any env without config.
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, PostgresDsn, model_validator
+from pydantic import Field, PostgresDsn, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -131,6 +131,14 @@ class AppSettings(BaseSettings):
     bus_endpoint_url: str | None = None
     bus_region: str = "us-east-1"
     bus_topic_prefix: str = "ecommerce-"  # SNS topic name = f"{prefix}{EventType}"
+    # ARN namespace the per-event-type topics live under, e.g.
+    # "arn:aws:sns:us-east-1:123456789012:" — the full ARN is this + the topic name,
+    # so the name still has exactly one source (`bus_topic_prefix`). Set it wherever
+    # Terraform owns topic creation (staging/prod): with it the relay resolves ARNs
+    # by string and needs only `sns:Publish`, without it it must call
+    # `sns:CreateTopic` on every cold start. Leave empty on LocalStack, which has no
+    # pre-created topics. `run_relay` refuses to start on real AWS without it.
+    bus_topic_arn_prefix: str | None = None
     relay_batch_size: int = Field(default=100, gt=0)
     # Bounded concurrent SNS publishes per claimed batch: serial awaits held the
     # outbox row locks + a pooled connection for batch × RTT.
@@ -166,6 +174,30 @@ class AppSettings(BaseSettings):
     # off, so tests and local runs bind no port and make no network call.
     worker_metrics_port: int | None = Field(default=None, gt=0, le=65535)
     metrics_pushgateway_url: str | None = None
+
+    @field_validator("bus_topic_arn_prefix")
+    @classmethod
+    def _validate_topic_arn_prefix(cls, value: str | None) -> str | None:
+        """Fail-fast on a prefix that would build a malformed topic ARN.
+
+        The publisher appends the topic name verbatim, so a prefix missing its
+        trailing ``:`` (or pointing at the wrong service) would produce ARNs that
+        fail per-publish at runtime rather than at startup. A trailing ``:`` is
+        appended when absent; anything that isn't an SNS ARN namespace is rejected.
+        """
+        if value is None or not value.strip():
+            return None
+        prefix = value.strip()
+        if not prefix.endswith(":"):
+            prefix += ":"
+        # arn:<partition>:sns:<region>:<account>:  -> 6 fields, last one empty
+        parts = prefix.split(":")
+        if len(parts) != 6 or parts[0] != "arn" or parts[2] != "sns" or not parts[3] or not parts[4]:
+            raise ValueError(
+                "bus_topic_arn_prefix must be an SNS ARN namespace like "
+                "'arn:aws:sns:<region>:<account-id>:' (topic name is appended)"
+            )
+        return prefix
 
     @property
     def image_public_base_url(self) -> str | None:

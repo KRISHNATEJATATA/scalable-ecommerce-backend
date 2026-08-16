@@ -17,12 +17,28 @@ sensitive keys automatically.
 
 import logging
 import sys
+import uuid
 from contextvars import ContextVar
 
 import ecs_logging
 
 # Per-request trace id, set by the request-id middleware; empty until then.
 request_id_ctx: ContextVar[str] = ContextVar("request_id", default="")
+
+
+def current_trace_id() -> str:
+    """The ambient request trace id, or a fresh one when there is no request.
+
+    Event producers must never stamp an **empty** ``trace_id``: the relay derives
+    the W3C ``traceparent`` from it, and an empty value normalises to the all-zero
+    trace-id the spec declares invalid. Workers (relay, image worker, reaper) run
+    outside any request, so an absent context yields a fresh id — an event traceable
+    to one worker pass rather than to nothing.
+
+    Returned as 32 hex chars so it maps 1:1 onto a W3C trace-id with no reformatting.
+    """
+    return request_id_ctx.get() or uuid.uuid4().hex
+
 
 # minimal boundary redaction. Full key/PII scrubbing hardens in Phase 9.
 _REDACT_KEYS = ("password", "token", "authorization", "secret", "cookie", "jwt")

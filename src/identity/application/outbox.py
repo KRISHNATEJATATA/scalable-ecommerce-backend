@@ -13,14 +13,14 @@ from __future__ import annotations
 import uuid
 
 from src.events.models import UserCreated, UserCreatedData
-from src.shared.config.logging import request_id_ctx
+from src.shared.config.logging import current_trace_id
 from src.shared.db.outbox import OutboxMessage
 
 
 def user_created_outbox(user_id: uuid.UUID, email: str) -> OutboxMessage:
     """Build the ``UserCreated`` outbox message for a freshly JIT-provisioned user."""
-    event = UserCreated(
-        trace_id=request_id_ctx.get() or str(uuid.uuid4()),
+    event = UserCreated.new(
+        trace_id=current_trace_id(),
         data=UserCreatedData(user_id=user_id, email=email),
     )
     return OutboxMessage(event.type, event.model_dump_json())

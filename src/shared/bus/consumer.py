@@ -42,7 +42,6 @@ lease immediately (owner-checked ``DEL``) so SQS redrive can retry at once.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
@@ -125,13 +124,12 @@ class SqsConsumer:
         ``False`` → currently in flight elsewhere (lease held) → leave for redrive.
         raises    → contract-invalid or handler error → leave for redrive → DLQ.
         """
-        event = json.loads(message["Body"])
-
         # Contract gate: the payload must validate against its registered, versioned
         # event schema before any handling. An unknown or malformed event is poison —
         # it raises here, the message is left on the queue, and SQS redrives it to
-        # the DLQ (never silently handled).
-        validate_event(event)
+        # the DLQ (never silently handled). The handler gets the *validated,
+        # normalized* event back, never the raw body.
+        event = validate_event(message["Body"])
 
         event_id = event["event_id"]
         # Per-subscription scope: the same event delivered to another subscription

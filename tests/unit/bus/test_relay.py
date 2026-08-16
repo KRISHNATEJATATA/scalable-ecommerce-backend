@@ -100,6 +100,24 @@ async def _unpublished_count(maker) -> int:
 
 
 @pytest.mark.asyncio
+async def test_relay_refuses_to_start_on_real_aws_without_a_topic_arn_prefix() -> None:
+    """Terraform owns the topics in the cloud and the task role is publish-only, so a
+    missing ARN namespace must fail at startup, not AccessDenied on the first event."""
+    from src.shared.bus.relay import run_relay
+    from src.shared.config.setting import AppSettings
+
+    dsn = "postgresql+asyncpg://u:p@localhost:5432/db"
+    real_aws = AppSettings(_env_file=None, database_url=dsn, bus_endpoint_url=None)
+
+    with pytest.raises(RuntimeError, match="BUS_TOPIC_ARN_PREFIX"):
+        await run_relay(real_aws, None, schemas=("orders",))
+
+    # ...and it is not required against LocalStack, which creates topics on demand.
+    local = AppSettings(_env_file=None, database_url=dsn, bus_endpoint_url="http://localhost:4566")
+    assert local.bus_topic_arn_prefix is None
+
+
+@pytest.mark.asyncio
 async def test_relay_publishes_and_marks_rows(sessionmaker) -> None:
     await _seed(sessionmaker, 3)
     publisher = RecordingPublisher()
@@ -154,6 +172,36 @@ async def test_publishes_are_concurrent_and_bounded(sessionmaker) -> None:
     assert peak > 1  # serial publishing held the row locks for batch x RTT
     assert peak <= 4  # and it stays inside the configured bound
     assert await _unpublished_count(sessionmaker) == 0
+
+
+@pytest.mark.asyncio
+async def test_one_broken_schema_does_not_starve_the_others(sessionmaker) -> None:
+    """A schema that fails must not abort the pass for the schemas after it.
+
+    ``catalog.outbox`` does not exist in this container (only the orders migration
+    ran), which is the same shape as any permanent per-schema failure — an
+    unprovisioned topic, an oversized payload. ``orders`` still has to drain, and
+    the pass must not raise, or one stuck module would silently stop every other
+    module from ever shipping an event.
+    """
+    await _seed(sessionmaker, 3)
+    publisher = RecordingPublisher()
+    relay = OutboxRelay(sessionmaker, publisher, batch_size=100, schemas=("catalog", "orders"))
+
+    assert await relay.drain_once() == 3
+    assert await _unpublished_count(sessionmaker) == 0
+
+
+@pytest.mark.asyncio
+async def test_every_schema_failing_propagates_so_the_loop_backs_off(sessionmaker) -> None:
+    """A shared cause (SNS down) must still surface, so poll_forever backs off
+    exponentially instead of retrying once per poll interval forever."""
+    await _seed(sessionmaker, 1)
+    relay = OutboxRelay(sessionmaker, RecordingPublisher(fail_after=0), batch_size=100, schemas=("orders", "catalog"))
+
+    with pytest.raises((ExceptionGroup, Exception)):
+        await relay.drain_once()
+    assert await _unpublished_count(sessionmaker) == 1
 
 
 @pytest.mark.asyncio

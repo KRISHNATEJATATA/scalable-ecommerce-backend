@@ -19,21 +19,21 @@ from __future__ import annotations
 import uuid
 
 from src.events.models import StockChangeData, StockReleased, StockReserved
-from src.shared.config.logging import request_id_ctx
+from src.shared.config.logging import current_trace_id
 from src.shared.db.outbox import OutboxMessage
-
-
-def _trace_id() -> str:
-    return request_id_ctx.get() or str(uuid.uuid4())
 
 
 def stock_reserved_outbox(sku: str, order_id: uuid.UUID, quantity: int) -> OutboxMessage:
     """Build the ``StockReserved`` outbox message."""
-    event = StockReserved(trace_id=_trace_id(), data=StockChangeData(sku=sku, order_id=order_id, quantity=quantity))
+    event = StockReserved.new(
+        trace_id=current_trace_id(), data=StockChangeData(sku=sku, order_id=order_id, quantity=quantity)
+    )
     return OutboxMessage(event.type, event.model_dump_json())
 
 
 def stock_released_outbox(sku: str, order_id: uuid.UUID, quantity: int) -> OutboxMessage:
     """Build the ``StockReleased`` outbox message."""
-    event = StockReleased(trace_id=_trace_id(), data=StockChangeData(sku=sku, order_id=order_id, quantity=quantity))
+    event = StockReleased.new(
+        trace_id=current_trace_id(), data=StockChangeData(sku=sku, order_id=order_id, quantity=quantity)
+    )
     return OutboxMessage(event.type, event.model_dump_json())
