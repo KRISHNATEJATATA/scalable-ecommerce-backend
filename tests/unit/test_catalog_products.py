@@ -33,7 +33,7 @@ from testcontainers.postgres import PostgresContainer
 from src.app import create_app
 from src.catalog.adapters.db.repository import CatalogRepository
 from src.catalog.application.outbox import product_updated_outbox
-from src.catalog.ports.repository import ProductRecord
+from src.catalog.ports.repository import PendingUpload, ProductRecord
 from src.shared.config.setting import AppSettings, get_settings
 from src.shared.container import get_image_store
 from src.shared.errors.exceptions import ConcurrentUpdateError
@@ -466,8 +466,10 @@ async def test_presign_issued_after_validation_and_marks_pending(app_ctx, rsa_ke
     body = resp.json()
     assert body["url"] and body["fields"] and body["key"].startswith(f"uploads/{created['id']}/")
     assert body["expires_in"] > 0
+    # The policy is pinned to the *declared* size (clamped by the server cap), so a
+    # ticket for 100 KB can't be used to push 5 MiB.
     assert image_store.calls == [
-        {"content_type": "image/jpeg", "max_bytes": 5 * 1024 * 1024, "ttl": body["expires_in"]}
+        {"content_type": "image/jpeg", "max_bytes": _PRESIGN["content_length"], "ttl": body["expires_in"]}
     ]
     async with sessionmaker() as s:
         status = (
@@ -585,7 +587,9 @@ async def test_image_flip_bumps_the_version_it_publishes(sessionmaker):
         return ("ProductUpdated", json.dumps({"type": "ProductUpdated"}))
 
     async with sessionmaker() as s:
-        assert await CatalogRepository(s).mark_image_ready(pid, "tokB", "public/x.webp", outbox=outbox) is True
+        assert (
+            await CatalogRepository(s).mark_image_ready(pid, "tokB", "public/x.webp", outbox=outbox)
+        ).applied is True
     async with sessionmaker() as s:
         version = (
             await s.execute(text("SELECT version_id FROM catalog.products WHERE id = :id"), {"id": pid})
@@ -601,14 +605,216 @@ async def test_mark_image_ready_is_token_guarded(sessionmaker):
     pid = await _seed_pending(sessionmaker, "tokB")
     async with sessionmaker() as s:
         repo = CatalogRepository(s)
-        assert await repo.mark_image_ready(pid, "tokA", "public/stale.webp") is False  # stale → no-op
-        assert await repo.mark_image_ready(pid, "tokB", "public/current.webp") is True  # current → applied
+        assert (await repo.mark_image_ready(pid, "tokA", "public/stale.webp")).applied is False  # stale → no-op
+        assert (await repo.mark_image_ready(pid, "tokB", "public/current.webp")).applied is True  # current → applied
     async with sessionmaker() as s:
         row = (
             await s.execute(text("SELECT image_status, image_key FROM catalog.products WHERE id = :id"), {"id": pid})
         ).one()
     assert row.image_status == "ready"
     assert row.image_key == "public/current.webp"  # the stale event never clobbered it
+
+
+async def test_mark_image_ready_returns_the_key_it_replaced(sessionmaker):
+    """The flip reports the superseded ``image_key`` so the worker can reclaim its
+    renditions — ``public/`` is outside the ``uploads/`` lifecycle rule, so nothing
+    else would, and every re-upload would leak a main image plus two thumbnails."""
+
+    pid = await _seed_pending(sessionmaker, "tokB")
+    async with sessionmaker() as s:
+        first = await CatalogRepository(s).mark_image_ready(pid, "tokB", "public/first.webp")
+    assert first == (True, None)  # nothing replaced on the very first image
+
+    async with sessionmaker() as s:  # merchant re-uploads: back to pending, new token
+        await s.execute(
+            text("UPDATE catalog.products SET image_status = 'pending', image_upload_token = 'tokC' WHERE id = :id"),
+            {"id": pid},
+        )
+        await s.commit()
+    async with sessionmaker() as s:
+        second = await CatalogRepository(s).mark_image_ready(pid, "tokC", "public/second.webp")
+    assert second == (True, "public/first.webp")
+
+    async with sessionmaker() as s:  # ...and queued the replaced key for deletion, in that same txn
+        queued = (
+            await s.execute(
+                text("SELECT object_key, attempts FROM catalog.image_reclaim WHERE product_id = :id"), {"id": pid}
+            )
+        ).all()
+    assert [(r.object_key, r.attempts) for r in queued] == [("public/first.webp", 0)]
+
+
+async def test_image_reclaim_is_leased_on_claim_and_dropped_when_finished(sessionmaker):
+    """The cleanup queue behaves like a lease: a claim bumps ``attempts`` and pushes
+    ``next_attempt_at`` out, so a crashed sweep retries instead of leaking the object,
+    and a second worker polling meanwhile claims nothing (no double-delete storm)."""
+
+    pid = await _seed_pending(sessionmaker, "tokR")
+    async with sessionmaker() as s:
+        await CatalogRepository(s).schedule_image_reclaim(pid, "public/old.webp")
+        await CatalogRepository(s).schedule_image_reclaim(pid, "public/old.webp")  # idempotent
+
+    async with sessionmaker() as s:
+        claimed = [t for t in await CatalogRepository(s).claim_image_reclaims(batch_size=50) if t.product_id == pid]
+    assert [(t.object_key, t.attempts) for t in claimed] == [("public/old.webp", 1)]
+
+    async with sessionmaker() as s:  # leased → invisible to the next sweep
+        again = await CatalogRepository(s).claim_image_reclaims(batch_size=50)
+    assert [t for t in again if t.product_id == pid] == []
+
+    async with sessionmaker() as s:
+        await CatalogRepository(s).finish_image_reclaim([claimed[0].id])
+    async with sessionmaker() as s:
+        left = (
+            await s.execute(text("SELECT count(*) FROM catalog.image_reclaim WHERE product_id = :id"), {"id": pid})
+        ).scalar_one()
+    assert left == 0
+
+
+async def test_deferring_a_reclaim_records_why_and_retries_later(sessionmaker):
+    pid = await _seed_pending(sessionmaker, "tokD")
+    async with sessionmaker() as s:
+        await CatalogRepository(s).schedule_image_reclaim(pid, "public/stuck.webp")
+    async with sessionmaker() as s:
+        task = next(
+            t
+            for t in await CatalogRepository(s).claim_image_reclaims(batch_size=50)
+            if t.object_key == "public/stuck.webp"
+        )
+    async with sessionmaker() as s:
+        await CatalogRepository(s).defer_image_reclaim(task.id, delay_seconds=60, error="RuntimeError: s3 down")
+    async with sessionmaker() as s:
+        row = (
+            await s.execute(
+                text("SELECT last_error, next_attempt_at > now() AS pending FROM catalog.image_reclaim WHERE id = :id"),
+                {"id": task.id},
+            )
+        ).one()
+    assert row.last_error == "RuntimeError: s3 down" and row.pending
+
+
+async def _expire_presign(sessionmaker, pid: uuid.UUID, *, seconds_ago: int) -> None:
+    async with sessionmaker() as s:
+        await s.execute(
+            text(
+                "UPDATE catalog.products SET image_upload_expires_at = now() - make_interval(secs => :ago) "
+                "WHERE id = :id"
+            ),
+            {"id": pid, "ago": seconds_ago},
+        )
+        await s.commit()
+
+
+async def _image_state(sessionmaker, pid: uuid.UUID):
+    async with sessionmaker() as s:
+        return (
+            await s.execute(
+                text(
+                    "SELECT image_status, image_key, image_upload_token, image_upload_expires_at, version_id "
+                    "FROM catalog.products WHERE id = :id"
+                ),
+                {"id": pid},
+            )
+        ).one()
+
+
+async def test_abandoned_upload_is_reaped_back_to_its_previous_image(sessionmaker):
+    """A presign that is never used must not strip the product of the image it was
+    already serving: presigning drops ``image_url`` immediately, and only an upload
+    event ever moves the row out of ``pending``."""
+
+    pid = await _seed_pending(sessionmaker, "tokE")
+    async with sessionmaker() as s:  # it had a ready image before the re-upload attempt
+        await s.execute(text("UPDATE catalog.products SET image_key = 'public/old.webp' WHERE id = :id"), {"id": pid})
+        await s.commit()
+    await _expire_presign(sessionmaker, pid, seconds_ago=1000)
+
+    async with sessionmaker() as s:
+        repo = CatalogRepository(s)
+        assert PendingUpload(pid, "tokE") in await repo.due_pending_uploads(grace_seconds=900, batch_size=100)
+        assert await repo.expire_abandoned_upload(pid, "tokE")
+
+    row = await _image_state(sessionmaker, pid)
+    assert row.image_status == "ready" and row.image_key == "public/old.webp"
+    assert row.image_upload_token is None and row.image_upload_expires_at is None
+    assert row.version_id == 2, "the image state changed, so the aggregate version must move"
+
+
+async def test_abandoned_first_upload_is_reaped_to_none(sessionmaker):
+    pid = await _seed_pending(sessionmaker, "tokF")  # never had an image
+    await _expire_presign(sessionmaker, pid, seconds_ago=1000)
+    async with sessionmaker() as s:
+        await CatalogRepository(s).expire_abandoned_upload(pid, "tokF")
+    assert (await _image_state(sessionmaker, pid)).image_status == "none"
+
+
+async def test_expiry_is_token_guarded_against_an_upload_that_landed_meanwhile(sessionmaker):
+    """Candidates are read without a lock, so the restore is a compare-and-set: if the
+    upload completed (or the merchant re-presigned) between the read and the probe,
+    it must update nothing rather than undo newer state."""
+
+    pid = await _seed_pending(sessionmaker, "tokF2")
+    await _expire_presign(sessionmaker, pid, seconds_ago=1000)
+    async with sessionmaker() as s:
+        assert not await CatalogRepository(s).expire_abandoned_upload(pid, "staletok")
+    assert (await _image_state(sessionmaker, pid)).image_status == "pending"
+
+
+async def test_deferring_keeps_the_row_pending_and_moves_the_deadline_out(sessionmaker):
+    """The raw object exists — only the event is late — so the token the eventual
+    flip is guarded on must survive, and the row must stop being a candidate."""
+
+    pid = await _seed_pending(sessionmaker, "tokF3")
+    await _expire_presign(sessionmaker, pid, seconds_ago=1000)
+    async with sessionmaker() as s:
+        repo = CatalogRepository(s)
+        await repo.defer_upload_expiry(pid, "tokF3", delay_seconds=3600)
+    async with sessionmaker() as s:
+        due = await CatalogRepository(s).due_pending_uploads(grace_seconds=900, batch_size=50)
+    assert pid not in [p.product_id for p in due]
+    row = await _image_state(sessionmaker, pid)
+    assert row.image_status == "pending" and row.image_upload_token == "tokF3"
+
+
+async def test_an_upload_inside_the_grace_window_is_left_alone(sessionmaker):
+    """The grace covers bytes that landed just before the presign died and are still
+    queued or mid-processing — reaping those would clear the token their flip is
+    guarded on and revert a perfectly good upload."""
+
+    pid = await _seed_pending(sessionmaker, "tokG")
+    await _expire_presign(sessionmaker, pid, seconds_ago=60)
+    async with sessionmaker() as s:
+        due = await CatalogRepository(s).due_pending_uploads(grace_seconds=900, batch_size=100)
+    assert pid not in [p.product_id for p in due]
+    row = await _image_state(sessionmaker, pid)
+    assert row.image_status == "pending" and row.image_upload_token == "tokG"
+
+
+async def test_reaping_emits_a_product_updated_row(sessionmaker):
+    """``image_url`` reappears, so the read-cache must be invalidated like any other
+    image transition."""
+
+    pid = await _seed_pending(sessionmaker, "tokH")
+    await _expire_presign(sessionmaker, pid, seconds_ago=1000)
+    seen: list[dict] = []
+
+    def outbox(row):
+        seen.append(dict(row))
+        return ("ProductUpdated", json.dumps({"product_id": str(row["product_id"])}))
+
+    async with sessionmaker() as s:
+        await CatalogRepository(s).expire_abandoned_upload(pid, "tokH", outbox=outbox)
+    assert any(r["product_id"] == pid for r in seen)
+    assert all(r["product_version"] == 2 for r in seen if r["product_id"] == pid)
+
+
+async def test_a_ready_flip_clears_the_upload_deadline(sessionmaker):
+    pid = await _seed_pending(sessionmaker, "tokI")
+    await _expire_presign(sessionmaker, pid, seconds_ago=0)
+    async with sessionmaker() as s:
+        assert (await CatalogRepository(s).mark_image_ready(pid, "tokI", "public/new.webp")).applied
+    row = await _image_state(sessionmaker, pid)
+    assert row.image_upload_expires_at is None, "a completed upload must not stay reapable"
 
 
 async def test_mark_image_ready_emits_outbox_only_when_applied(sessionmaker):
@@ -627,8 +833,10 @@ async def test_mark_image_ready_emits_outbox_only_when_applied(sessionmaker):
 
     async with sessionmaker() as s:
         repo = CatalogRepository(s)
-        assert await repo.mark_image_ready(pid, "tokA", "public/stale.webp", outbox=outbox) is False  # stale
-        assert await repo.mark_image_ready(pid, "tokB", "public/current.webp", outbox=outbox) is True  # applied
+        assert (await repo.mark_image_ready(pid, "tokA", "public/stale.webp", outbox=outbox)).applied is False  # stale
+        assert (
+            await repo.mark_image_ready(pid, "tokB", "public/current.webp", outbox=outbox)
+        ).applied is True  # applied
     async with sessionmaker() as s:
         row = (
             await s.execute(

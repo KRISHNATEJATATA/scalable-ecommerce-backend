@@ -119,6 +119,22 @@ class AppSettings(BaseSettings):
     image_upload_ttl_seconds: int = Field(default=300, gt=0)  # presigned-POST validity (~5 min)
     # SQS queue the ImageWorker drains (S3 ObjectCreated → SQS). LocalStack locally.
     image_queue_url: str | None = None
+    # Visibility timeout for that queue. Image ingest is the heaviest per-message
+    # work in the repo (download + sniff + three WebP encodes of a ~40MP source),
+    # so SQS's 30s default would redeliver a slow-but-succeeding message mid-flight
+    # and burn redrive attempts until it DLQs. Keep it well above the worst-case
+    # single-image processing time; s3_bootstrap applies it to the local queue.
+    image_visibility_timeout_seconds: int = Field(default=300, gt=0)
+    # Lifecycle expiry for raw `uploads/` objects. Nothing references them once the
+    # worker has produced the public renditions, and a rejected (possibly malicious)
+    # upload must not be retained forever — S3 reclaims them instead of the app.
+    image_upload_retention_days: int = Field(default=7, gt=0)
+    # Grace added to a presign's expiry before the image worker reaps an abandoned
+    # upload (product `pending` but no bytes ever arrived) back to its previous
+    # image state. Must stay above the queue's visibility timeout: an upload that
+    # landed just before expiry may still be queued or mid-processing, and reaping
+    # it would clear the token its flip is guarded on.
+    image_upload_reaper_grace_seconds: int = Field(default=900, gt=0)
 
     # --- SQS async worker (Phase 8) ---
     sqs_queue_url: str | None = None
@@ -223,6 +239,26 @@ class AppSettings(BaseSettings):
         """
         if self.s3_bucket and self.s3_endpoint_url is None and not self.s3_public_base_url:
             raise ValueError("s3_public_base_url is required when s3_bucket is set without s3_endpoint_url (real AWS)")
+        return self
+
+    @model_validator(mode="after")
+    def _require_reaper_grace_above_visibility_timeout(self) -> "AppSettings":
+        """Fail-fast: the abandoned-upload grace must outlast one processing attempt.
+
+        The reaper clears ``image_upload_token``, which is the guard the worker's
+        flip is conditioned on. If the grace were <= the queue's visibility timeout,
+        a message still being processed (or about to be redelivered) could have its
+        product reaped mid-flight, turning a perfectly good upload into a stale flip
+        whose renditions are then reclaimed — the merchant's image silently vanishes.
+        The relationship is what makes the reaper safe, so it is enforced, not
+        documented and hoped for.
+        """
+        if self.image_upload_reaper_grace_seconds <= self.image_visibility_timeout_seconds:
+            raise ValueError(
+                "image_upload_reaper_grace_seconds must exceed image_visibility_timeout_seconds "
+                f"({self.image_upload_reaper_grace_seconds} <= {self.image_visibility_timeout_seconds}): "
+                "an in-flight upload would be reaped mid-processing"
+            )
         return self
 
 

@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable, Mapping
+from datetime import datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, runtime_checkable
 
 from src.shared.db.outbox import OutboxMessage
 
@@ -35,6 +36,36 @@ if TYPE_CHECKING:
 # transaction, so the payload is always the post-update state — including the
 # freshly incremented ``version_id``, which orders the event downstream.
 ImageOutboxFactory = Callable[[Mapping[str, Any]], OutboxMessage]
+
+
+class PendingUpload(NamedTuple):
+    """A product still awaiting bytes for a presigned upload (reaper candidate)."""
+
+    product_id: uuid.UUID
+    upload_token: str
+
+
+class ImageReclaimTask(NamedTuple):
+    """One claimed row of the durable image-cleanup queue."""
+
+    id: int
+    product_id: uuid.UUID
+    object_key: str
+    attempts: int
+
+
+class ImageFlip(NamedTuple):
+    """Outcome of the guarded ``pending → ready`` image flip.
+
+    ``previous_key`` is the ``image_key`` the flip replaced (``None`` when the
+    product had no image, or when the guards rejected the write). It is read in
+    the same locked statement so the caller can reclaim the superseded public
+    renditions — nothing else ever would: ``public/`` is live CDN content and sits
+    outside the ``uploads/`` lifecycle rule.
+    """
+
+    applied: bool
+    previous_key: str | None
 
 
 @runtime_checkable
@@ -95,13 +126,36 @@ class CatalogRepositoryPort(Protocol):
     async def soft_delete_product(self, product: ProductRecord, outbox: OutboxMessage) -> None: ...
 
     async def set_image_pending(
-        self, product: ProductRecord, upload_token: str, outbox: OutboxMessage | None = None
+        self,
+        product: ProductRecord,
+        upload_token: str,
+        *,
+        expires_at: datetime,
+        outbox: OutboxMessage | None = None,
     ) -> None: ...
 
     async def mark_image_ready(
         self, product_id: uuid.UUID, upload_token: str, image_key: str, outbox: ImageOutboxFactory | None = None
-    ) -> bool: ...
+    ) -> ImageFlip: ...
 
     async def mark_image_failed(
         self, product_id: uuid.UUID, upload_token: str, outbox: ImageOutboxFactory | None = None
     ) -> bool: ...
+
+    async def current_image_key(self, product_id: uuid.UUID) -> str | None: ...
+
+    async def schedule_image_reclaim(self, product_id: uuid.UUID, object_key: str) -> None: ...
+
+    async def claim_image_reclaims(self, *, batch_size: int) -> list[ImageReclaimTask]: ...
+
+    async def finish_image_reclaim(self, ids: list[int]) -> None: ...
+
+    async def defer_image_reclaim(self, task_id: int, *, delay_seconds: int, error: str) -> None: ...
+
+    async def due_pending_uploads(self, *, grace_seconds: int, batch_size: int) -> list[PendingUpload]: ...
+
+    async def expire_abandoned_upload(
+        self, product_id: uuid.UUID, upload_token: str, outbox: ImageOutboxFactory | None = None
+    ) -> bool: ...
+
+    async def defer_upload_expiry(self, product_id: uuid.UUID, upload_token: str, *, delay_seconds: int) -> None: ...

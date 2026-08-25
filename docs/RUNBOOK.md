@@ -125,11 +125,71 @@ thumbnails under `public/`, and flips `catalog.products.image_status` from `pend
 (or `failed`). Processed objects under `public/` are world-readable (CloudFront/OAC in prod);
 raw `uploads/` stay private.
 
-**Queues & DLQ.** `image-uploads` has a redrive policy (`maxReceiveCount=5`) → **`image-uploads-dlq`**.
+**Queues & DLQ.** `image-uploads` has a redrive policy (`maxReceiveCount=5`) → **`image-uploads-dlq`**,
+and an explicit **visibility timeout** (`IMAGE_VISIBILITY_TIMEOUT_SECONDS`, 300s) ≥ the worst-case
+single-image processing time. Do not leave it at SQS's 30s default: a large image would be
+redelivered mid-processing and burn redrive attempts until it DLQ'd despite every attempt
+succeeding. If DLQ messages appear whose objects process fine on replay, raise this first.
 A message that repeatedly raises (e.g. S3 fetch error, worker bug) lands on the DLQ — replay it
 with the SQS redrive in **§4** once the fault is fixed (the worker is idempotent + token-guarded,
 so replay is safe). A *validation* failure (spoofed/oversized bytes) is **not** a poison message:
 it terminally sets `image_status='failed'` and the message is acked normally.
+
+**Object retention.** Raw `uploads/` objects are expired by an S3 lifecycle rule after
+`IMAGE_UPLOAD_RETENTION_DAYS` (7) — nothing references them after processing and rejected bytes
+must not be kept forever. **This bounds the DLQ replay window**: redrive a DLQ'd image message
+*within* the retention period, because past it the raw object is gone. A replay after expiry is
+not a retry storm — the worker treats a missing object as terminal, flips the product to
+`image_status='failed'` and acks, so the merchant re-presigns rather than the product sitting
+`pending` forever. Raise `IMAGE_UPLOAD_RETENTION_DAYS` if your incident-response window is longer.
+The worker deletes only renditions it wrote for an upload that turned out to be superseded (or
+whose product was deleted meanwhile). `public/` objects are live CDN content and are never
+lifecycle-expired; renditions of a product soft-deleted *before* this change are reclaimed by the
+image-removal path, not here.
+
+**Rendition cleanup queue.** Public objects that stop being referenced — the image a re-upload
+replaced, and the renditions a stale flip wrote — are queued in **`catalog.image_reclaim`** in the
+*same transaction* as the state change, then deleted by a sweep that runs on every image-worker
+poll. Rows are normally transient. To inspect:
+
+```sql
+SELECT id, product_id, object_key, attempts, last_error, next_attempt_at
+FROM catalog.image_reclaim ORDER BY next_attempt_at LIMIT 20;
+```
+
+A row with a climbing `attempts` and a populated `last_error` means S3 deletes are failing (task
+role missing `s3:DeleteObject`, bucket policy, outage) — fix the fault and the sweep drains on its
+own; nothing needs re-enqueuing. Rows are leased on claim, so a row whose `next_attempt_at` is in
+the future is either backing off or in flight. A **growing** table is the alarm signal: it means
+`public/` is accumulating orphaned objects (they are outside the `uploads/` lifecycle rule). A row
+is dropped untouched if its key became the product's live image again. Deleting a row by hand
+does not delete its objects — it only abandons the cleanup.
+
+**Abandoned presigns.** Presigning flips the product to `pending` and drops `image_url`
+immediately, so a client that never uploads would otherwise leave it (and any image it was
+already serving) unavailable forever. The image worker sweeps on every poll: products whose
+`image_upload_expires_at` is older than `IMAGE_UPLOAD_REAPER_GRACE_SECONDS` (900s) go back to
+`ready` if a processed `image_key` survived, else `none`, and emit `ProductUpdated`. Keep that
+grace **above `IMAGE_VISIBILITY_TIMEOUT_SECONDS`** — it exists so an upload that landed just
+before the presign expired and is still queued/processing isn't reaped out from under the worker
+(reaping clears the token its flip is guarded on, which would turn a good upload into a stale
+one). `AppSettings` refuses to start if that ordering is violated.
+
+The sweep does **not** trust time alone: each candidate is HEAD-probed against its raw
+`uploads/{product_id}/{token}.bin` object first. If the object is there the bytes arrived and only
+the event is late (backlog, redrive, a DLQ message you haven't replayed yet), so the deadline is
+pushed out an hour and the row stays `pending` — nothing is discarded. Only a genuinely absent raw
+object is reaped. A probe that errors (S3 outage, missing `s3:ListBucket`) reaps nothing. To find
+uploads currently awaiting bytes:
+
+```sql
+SELECT id, image_status, image_upload_expires_at
+FROM catalog.products WHERE image_status = 'pending' ORDER BY image_upload_expires_at;
+```
+
+Rows whose deadline is long past mean the worker isn't sweeping — check it is running. A row whose
+deadline keeps *sliding* forward means the opposite: the raw object is there, so its event is
+stuck — check `image-uploads` depth and the DLQ.
 
 **Stale-event safety.** `mark_image_ready/failed` are conditioned on the product's
 `image_upload_token`, so a late event for a **superseded** upload updates zero rows and is
@@ -142,9 +202,11 @@ is invalidated (via the relay → `catalog-cache` consumer) and the new `image_u
 | Symptom | Likely cause | Action |
 |---|---|---|
 | Products stuck `pending` | worker down, or `image-uploads` not draining | check the worker task is running + healthy; inspect queue depth |
-| `image_status='failed'` | spoofed/oversized/corrupt upload | expected — the merchant re-presigns + re-uploads a valid image |
-| `image-uploads-dlq` non-empty | repeated processing errors | inspect a DLQ message, fix the fault, redrive (§4) |
+| Product `pending` but no upload ever happened | client abandoned the presigned POST | expected — the worker's reaper restores it past `IMAGE_UPLOAD_REAPER_GRACE_SECONDS` |
+| `image_status='failed'` | spoofed/oversized/corrupt upload, or the raw object expired before a DLQ replay | expected — the merchant re-presigns + re-uploads a valid image |
+| `image-uploads-dlq` non-empty | repeated processing errors | inspect a DLQ message, fix the fault, redrive (§4) **within `IMAGE_UPLOAD_RETENTION_DAYS`** |
 | `image_url` null on a `ready`-looking image | `public/` not world-readable | re-run `make s3-setup` (ensures the public-read bucket policy) |
+| `catalog.image_reclaim` growing | S3 deletes failing (permissions/outage) — orphaned `public/` objects accumulating | read `last_error`; fix the fault, the sweep drains itself |
 
 **Monitoring.** Alarm on `image-uploads-dlq` `ApproximateNumberOfMessagesVisible > 0`; watch
 `image-uploads` queue depth + oldest-message age (worker liveness) and the worker task health

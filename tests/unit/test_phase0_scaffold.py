@@ -7,6 +7,9 @@ from pydantic import ValidationError
 
 from src.shared.config.setting import AppSettings
 
+_DB_URL_SCHEME = "postgresql+asyncpg"
+_DSN = f"{_DB_URL_SCHEME}://u:p@localhost:5432/db"
+
 _MODULES = ["catalog", "inventory", "orders", "payments", "identity", "cart"]
 _LAYERS = ["api", "application", "domain", "ports", "adapters"]
 _DB_MODULES = ["catalog", "inventory", "orders", "payments", "identity"]  # cart has no DB schema (Valkey-only)
@@ -49,3 +52,18 @@ def test_settings_load_when_database_url_present(monkeypatch):
 @pytest.mark.parametrize("module", SRC_MODULES)
 def test_every_src_package_imports(module):
     importlib.import_module(module)
+
+
+def test_reaper_grace_must_outlive_the_image_visibility_timeout(monkeypatch):
+    """An upload whose event is still in flight must never be reapable: the grace is
+    what keeps the sweep from clearing the token that flip is guarded on."""
+
+    monkeypatch.setenv("DATABASE_URL", _DSN)
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None, image_upload_reaper_grace_seconds=300, image_visibility_timeout_seconds=300)
+
+
+def test_shipped_reaper_defaults_satisfy_the_invariant(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", _DSN)
+    s = AppSettings(_env_file=None)
+    assert s.image_upload_reaper_grace_seconds > s.image_visibility_timeout_seconds

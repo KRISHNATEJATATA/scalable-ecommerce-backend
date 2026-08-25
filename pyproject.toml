@@ -26,6 +26,10 @@ dependencies = [
     "python-keycloak",
     "valkey",
     "aioboto3",
+    # Direct import: the S3 adapter catches botocore.exceptions.ClientError to map
+    # missing objects onto the port's error. Transitive via aioboto3 today, declared
+    # so a resolver change can't drop it.
+    "botocore",
     "pillow",
     "python-magic",
     "python-json-logger",

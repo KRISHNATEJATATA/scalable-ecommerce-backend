@@ -13,6 +13,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from src.catalog.domain.image_keys import PUBLIC_IMAGE_EXT, THUMBNAIL_SIZES
 from src.catalog.domain.image_status import ImageStatus
 
 # Fields that are optional-to-send but never nullable: they back NOT-NULL columns,
@@ -61,6 +62,27 @@ def public_image_url(image_key: str | None, image_status: ImageStatus, base: str
     return f"{base.rstrip('/')}/{image_key}"
 
 
+def public_thumbnail_urls(image_key: str | None, image_status: ImageStatus, base: str | None) -> dict[str, str] | None:
+    """Unsigned CDN URLs for a READY image's thumbnails, keyed by rendition name.
+
+    The worker writes ``{token}_{name}.webp`` next to the main object for every
+    entry in :data:`THUMBNAIL_SIZES`; without this the renditions exist but no
+    client can discover them (the key convention is not part of the contract).
+    Derived from the main key so there is still exactly one key layout.
+
+    ``None`` unless the key actually carries the worker's ``.webp`` extension:
+    ``READY`` alone doesn't structurally guarantee a worker-written key, and
+    appending ``_thumb_256.webp`` to anything else would advertise URLs that 404.
+    """
+    if not image_key or not image_key.endswith(f".{PUBLIC_IMAGE_EXT}"):
+        return None
+    main = public_image_url(image_key, image_status, base)
+    if main is None:
+        return None
+    stem = main.removesuffix(f".{PUBLIC_IMAGE_EXT}")
+    return {name: f"{stem}_{name}.{PUBLIC_IMAGE_EXT}" for name in THUMBNAIL_SIZES}
+
+
 class ProductResponse(BaseModel):
     """The public HTTP response shape for a product."""
 
@@ -83,6 +105,10 @@ class ProductResponse(BaseModel):
     # service from the injected public base (see :func:`public_image_url`) — not a
     # computed field, so it can't reach for the global settings at serialization time.
     image_url: str | None = None
+    # Same-shape map of the worker's thumbnail renditions (``thumb_256``/``thumb_64``
+    # → unsigned CDN URL), or ``null`` when there is no ready image. Advertised so
+    # clients don't have to reconstruct the ``_{name}.webp`` key convention.
+    image_thumbnail_urls: dict[str, str] | None = None
 
 
 class ProductCreate(BaseModel):

@@ -546,13 +546,20 @@ components:
         image_url:
           type: [string, "null"]
           description: Unsigned CDN URL for a `ready` image, else `null`.
+        image_thumbnail_urls:
+          type: [object, "null"]
+          additionalProperties:
+            type: string
+          description: >-
+            Unsigned CDN URLs for the generated thumbnails of a `ready` image, keyed by
+            rendition name (`thumb_256`, `thumb_64`); `null` when there is no ready image.
         created_at:
           type: string
           format: date-time
         updated_at:
           type: string
           format: date-time
-      required: [id, merchant_id, name, description, category, price, image_key, image_status, image_url, created_at, updated_at]
+      required: [id, merchant_id, name, description, category, price, image_key, image_status, image_url, image_thumbnail_urls, created_at, updated_at]
     ProductCreate:
       description: Merchant create payload. `merchant_id` is bound from the caller, never from input. `image_key`/`image_status` are worker-owned and not accepted here.
       type: object
@@ -600,7 +607,10 @@ components:
         content_length:
           type: integer
           minimum: 1
-          description: Declared byte size; capped by the presigned-POST policy.
+          description: >-
+            Declared byte size. Rejected above the server cap, and the presigned-POST
+            `content-length-range` policy is pinned to it — an upload larger than what
+            you declared is rejected by S3.
       required: [content_type, content_length]
     ImagePresignResponse:
       description: >-

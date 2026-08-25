@@ -21,15 +21,16 @@ from dataclasses import dataclass
 
 from PIL import Image
 
-from src.catalog.domain.image_keys import PUBLIC_IMAGE_EXT
+from src.catalog.domain.image_keys import PUBLIC_IMAGE_EXT, THUMBNAIL_SIZES
 
 # Real-bytes allow-list (what magic must report), independent of the claimed type.
 ALLOWED_MIME: frozenset[str] = frozenset({"image/jpeg", "image/png", "image/webp"})
 # Fixed output: WebP re-encode strips EXIF/trailing bytes and is CDN-friendly.
 OUTPUT_FORMAT = "WEBP"
 OUTPUT_EXT = PUBLIC_IMAGE_EXT
-# Fixed thumbnail longest-side sizes (px).
-THUMBNAIL_SIZES: dict[str, int] = {"thumb_256": 256, "thumb_64": 64}
+# Thumbnail names/sizes live in the domain key layout (``THUMBNAIL_SIZES``), so the
+# API response can advertise the same set of renditions the worker writes.
+__all__ = ["ALLOWED_MIME", "OUTPUT_EXT", "OUTPUT_FORMAT", "THUMBNAIL_SIZES", "UnsupportedImageError", "process_image"]
 
 
 class UnsupportedImageError(Exception):

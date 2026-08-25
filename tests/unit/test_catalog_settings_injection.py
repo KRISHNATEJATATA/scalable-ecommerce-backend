@@ -45,7 +45,8 @@ class _Repo:
     async def get_product(self, product_id):
         return self.row
 
-    async def set_image_pending(self, product, token, *, outbox):
+    async def set_image_pending(self, product, token, *, expires_at, outbox):
+        self.expires_at = expires_at
         return self.row
 
 

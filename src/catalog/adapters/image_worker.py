@@ -57,6 +57,7 @@ class ImageWorker:
         max_bytes: int,
         max_pixels: int,
         dedup_ttl_seconds: int,
+        upload_reaper_grace_seconds: int | None = None,
         max_messages: int = 1,
         wait_time_seconds: int = 10,
     ) -> None:
@@ -69,8 +70,22 @@ class ImageWorker:
         self._max_bytes = max_bytes
         self._max_pixels = max_pixels
         self._ttl = dedup_ttl_seconds
+        self._reaper_grace = upload_reaper_grace_seconds
         self._max_messages = max_messages
         self._wait = wait_time_seconds
+
+    def _service(self, session: Any) -> ImageIngestService:
+        """Build the application service over per-session adapters."""
+        return ImageIngestService(
+            CatalogRepository(session),
+            self._store,
+            self._valkey,
+            max_dimension=self._max_dimension,
+            max_bytes=self._max_bytes,
+            max_pixels=self._max_pixels,
+            dedup_ttl_seconds=self._ttl,
+            upload_reaper_grace_seconds=self._reaper_grace,
+        )
 
     async def _process_record(self, record: dict) -> None:
         """Ingest one S3 record via a per-message session + application service."""
@@ -80,16 +95,7 @@ class ImageWorker:
         key = unquote_plus(s3["object"]["key"])
         etag = s3["object"].get("eTag", "")
         async with self._sessionmaker() as session:
-            service = ImageIngestService(
-                CatalogRepository(session),
-                self._store,
-                self._valkey,
-                max_dimension=self._max_dimension,
-                max_bytes=self._max_bytes,
-                max_pixels=self._max_pixels,
-                dedup_ttl_seconds=self._ttl,
-            )
-            await service.ingest(key, etag)
+            await self._service(session).ingest(key, etag)
 
     async def _process_message(self, message: dict) -> None:
         body = json.loads(message["Body"])
@@ -99,12 +105,19 @@ class ImageWorker:
     async def poll_once(self) -> int:
         """Receive one batch; process + delete each. Returns messages handled.
 
+        Also runs the pipeline's two housekeeping sweeps each pass: the durable
+        rendition-cleanup queue (``catalog.image_reclaim``) and the reaper for
+        presigned uploads that expired with no bytes ever arriving. Piggybacking on
+        this loop keeps both retryable without a second service; each claims rows
+        with ``FOR UPDATE SKIP LOCKED``, so replicas split the work.
+
         Images are decoded/re-encoded serially and CPU-heavy, so a batch of ten
-        would routinely outrun the queue's 30s visibility timeout: messages
-        reappear mid-processing and burn redrive attempts until they hit the DLQ
-        despite succeeding. One message per receive keeps a single decode well
-        inside the timeout. Throughput is unchanged (processing was already
-        serial) — scale by running more worker tasks, not bigger batches.
+        would routinely outrun even the queue's generous visibility timeout
+        (``IMAGE_VISIBILITY_TIMEOUT_SECONDS``, 300s — sized for *one* worst-case
+        image): messages would reappear mid-processing and burn redrive attempts
+        until they hit the DLQ despite succeeding. One message per receive keeps the
+        in-flight work inside that ceiling. Throughput is unchanged (processing was
+        already serial) — scale by running more worker tasks, not bigger batches.
         """
         resp = await self._sqs.receive_message(
             QueueUrl=self._queue_url,
@@ -120,7 +133,18 @@ class ImageWorker:
                 continue
             await self._sqs.delete_message(QueueUrl=self._queue_url, ReceiptHandle=message["ReceiptHandle"])
             handled += 1
+        await self._housekeeping()
         return handled
+
+    async def _housekeeping(self) -> None:
+        """Run the cleanup + reaper sweeps; failures must never affect message handling."""
+        try:
+            async with self._sessionmaker() as session:
+                service = self._service(session)
+                await service.drain_reclaims()
+                await service.reap_abandoned_uploads()
+        except Exception:  # boundary: both sweeps are durable and simply retry next pass
+            log.warning("image housekeeping sweep failed; work stays queued for retry", exc_info=True)
 
     async def run(self, stop: asyncio.Event) -> None:
         """Long-poll loop until ``stop`` is set.
@@ -146,6 +170,7 @@ async def run_worker(settings: AppSettings, sessionmaker: async_sessionmaker, va
             max_bytes=settings.image_max_upload_bytes,
             max_pixels=settings.image_max_source_pixels,
             dedup_ttl_seconds=settings.consumer_dedup_ttl_seconds,
+            upload_reaper_grace_seconds=settings.image_upload_reaper_grace_seconds,
             wait_time_seconds=settings.consumer_wait_time_seconds,
         )
         await worker.run(stop)

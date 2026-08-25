@@ -216,5 +216,27 @@ size validated) → uploads raw bytes to a presigned S3 POST under
 **image worker** sniffs the real bytes (`python-magic`), re-encodes to WebP
 (stripping EXIF) and generates thumbnails off the event loop, writes
 `public/{product_id}/…`, and flips `products.image_status` to `ready`
-(spoofed/oversize → `failed`, poison messages → DLQ). Bootstrap the local bucket,
-queue and notification with `make s3-setup` (or the `s3-setup` compose service).
+(spoofed/oversize → `failed`, poison messages → DLQ). A `ready` product exposes
+`image_url` plus `image_thumbnail_urls` (`thumb_256`/`thumb_64`). The presigned
+POST's size policy is pinned to the declared `content_length` (clamped by
+`IMAGE_MAX_UPLOAD_BYTES`). Bootstrap the local bucket, lifecycle rule, queue and
+notification with `make s3-setup` (or the `s3-setup` compose service); the queue's
+visibility timeout comes from `IMAGE_VISIBILITY_TIMEOUT_SECONDS` and the S3→SQS
+send policy is scoped with `aws:SourceArn`/`aws:SourceAccount` — mirror both in
+Terraform.
+
+#### Required task-role S3 permissions
+
+| Action | On | Why |
+|---|---|---|
+| `s3:PutObject` | `arn:aws:s3:::<bucket>/*` | worker writes `public/` renditions |
+| `s3:GetObject` | `arn:aws:s3:::<bucket>/*` | worker downloads the raw upload |
+| `s3:DeleteObject` | `arn:aws:s3:::<bucket>/*` | reclaim of superseded renditions |
+| **`s3:ListBucket`** | `arn:aws:s3:::<bucket>` | **required** — see below |
+
+`s3:ListBucket` is not optional. Without it S3 answers a *missing* key with
+`AccessDenied` (403) instead of `NoSuchKey`, so the adapter cannot map it to a
+terminal `ObjectNotFoundError` — a lifecycle-expired raw upload would then retry
+until it burns its redrive attempts and DLQs, leaving the product `pending`
+forever. Grant `ListBucket` on the bucket ARN (the app never lists objects
+itself; the grant exists purely so 404s stay 404s).

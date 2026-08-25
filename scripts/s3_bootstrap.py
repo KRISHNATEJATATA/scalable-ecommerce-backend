@@ -1,10 +1,13 @@
 """Create the local S3 upload topology on LocalStack.
 
-Idempotent bootstrap for `make compose-up`: the uploads bucket, the
-``image-uploads`` SQS queue + DLQ, and the bucket's ObjectCreated→SQS
-notification scoped to the ``uploads/`` prefix (so the worker's own ``public/``
-writes never re-trigger it). Real infra is Terraform in the cloud (S3 event
-notification → SQS); this is the local mirror.
+Idempotent bootstrap for `make compose-up`: the uploads bucket (+ a lifecycle rule
+that expires raw ``uploads/`` objects), the ``image-uploads`` SQS queue + DLQ, and
+the bucket's ObjectCreated→SQS notification scoped to the ``uploads/`` prefix (so
+the worker's own ``public/`` writes never re-trigger it). Real infra is Terraform
+in the cloud (S3 event notification → SQS); this is the local mirror.
+
+Re-runnable: queue attributes are re-applied with ``set_queue_attributes`` because
+``create_queue`` only honours ``Attributes`` when it actually creates the queue.
 
 Run: ``python -m scripts.s3_bootstrap`` (compose one-shot ``s3-setup``).
 """
@@ -40,13 +43,27 @@ async def _queue_arn(sqs, url: str) -> str:
     return resp["Attributes"]["QueueArn"]
 
 
-async def _ensure_queue(sqs) -> str:
+async def _ensure_queue(sqs, bucket: str, visibility_timeout: int) -> str:
     dlq_url = (await sqs.create_queue(QueueName=DLQ_NAME))["QueueUrl"]
     dlq_arn = await _queue_arn(sqs, dlq_url)
     redrive = json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": MAX_RECEIVE_COUNT})
-    url = (await sqs.create_queue(QueueName=QUEUE_NAME, Attributes={"RedrivePolicy": redrive}))["QueueUrl"]
+    # VisibilityTimeout >= the worst-case single-image processing time (download +
+    # sniff + three WebP encodes). SQS's 30s default would redeliver a slow-but-
+    # succeeding message mid-flight and burn redrive attempts until it DLQ'd despite
+    # every attempt succeeding — see AppSettings.image_visibility_timeout_seconds.
+    attributes = {"RedrivePolicy": redrive, "VisibilityTimeout": str(visibility_timeout)}
+    # Create bare, then apply attributes: create_queue only honours Attributes when
+    # it *creates* the queue, and passing values that differ from an existing queue's
+    # is an outright QueueAlreadyExists error — so a changed redrive/visibility
+    # invariant could never land on re-run. set_queue_attributes is the idempotent path.
+    url = (await sqs.create_queue(QueueName=QUEUE_NAME))["QueueUrl"]
     queue_arn = await _queue_arn(sqs, url)
-    # Allow S3 to deliver notifications to the queue (required on real AWS).
+    # Allow S3 to deliver notifications to the queue (required on real AWS), scoped
+    # to THIS bucket + account. Without the aws:SourceArn/aws:SourceAccount
+    # conditions the S3 service principal is a confused deputy: any account's bucket
+    # could send forged ObjectCreated records to this queue (AWS's documented
+    # requirement for S3→SQS notifications).
+    account_id = queue_arn.split(":")[4]
     policy = {
         "Version": "2012-10-17",
         "Statement": [
@@ -55,11 +72,19 @@ async def _ensure_queue(sqs) -> str:
                 "Principal": {"Service": "s3.amazonaws.com"},
                 "Action": "sqs:SendMessage",
                 "Resource": queue_arn,
+                "Condition": {
+                    "ArnLike": {"aws:SourceArn": f"arn:aws:s3:::{bucket}"},
+                    "StringEquals": {"aws:SourceAccount": account_id},
+                },
             }
         ],
     }
-    await sqs.set_queue_attributes(QueueUrl=url, Attributes={"Policy": json.dumps(policy)})
-    log.info("ensured queue %s (+ dlq)", QUEUE_NAME)
+    # create_queue only applies Attributes when it *creates* the queue (and errors
+    # outright if an existing queue's differ), so the queue is created bare above and
+    # everything is applied here — the same idempotency contract as
+    # scripts/bus_bootstrap.
+    await sqs.set_queue_attributes(QueueUrl=url, Attributes={**attributes, "Policy": json.dumps(policy)})
+    log.info("ensured queue %s (+ dlq, visibility=%ss)", QUEUE_NAME, visibility_timeout)
     return queue_arn
 
 
@@ -104,6 +129,34 @@ async def _ensure_public_read(s3, bucket: str) -> None:
     log.info("ensured public-read policy on %s/%s/", bucket, PUBLIC_PREFIX)
 
 
+async def _ensure_lifecycle(s3, bucket: str, retention_days: int) -> None:
+    """Expire raw ``uploads/`` objects after ``retention_days``.
+
+    Nothing references a raw upload once the worker has written its public
+    renditions, and a **rejected** (possibly malicious) upload must not be retained
+    forever — S3 reclaims them so the app never needs a delete pass in the ingest
+    path (deleting there would break a redelivery, which must still be able to
+    download the object). Scoped to ``uploads/`` only: ``public/`` objects are live
+    CDN content. Also aborts abandoned multipart uploads, which are invisible
+    orphans otherwise.
+    """
+    await s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket,
+        LifecycleConfiguration={
+            "Rules": [
+                {
+                    "ID": "expire-raw-uploads",
+                    "Status": "Enabled",
+                    "Filter": {"Prefix": f"{UPLOAD_PREFIX}/"},
+                    "Expiration": {"Days": retention_days},
+                    "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1},
+                }
+            ]
+        },
+    )
+    log.info("ensured %s/ lifecycle expiry after %dd", UPLOAD_PREFIX, retention_days)
+
+
 async def bootstrap() -> None:
     settings = get_settings()
     if not settings.s3_bucket:
@@ -111,7 +164,8 @@ async def bootstrap() -> None:
     async with s3_client(settings) as s3, sqs_client(settings) as sqs:
         await _ensure_bucket(s3, settings.s3_bucket)
         await _ensure_public_read(s3, settings.s3_bucket)
-        queue_arn = await _ensure_queue(sqs)
+        await _ensure_lifecycle(s3, settings.s3_bucket, settings.image_upload_retention_days)
+        queue_arn = await _ensure_queue(sqs, settings.s3_bucket, settings.image_visibility_timeout_seconds)
         await _ensure_notification(s3, settings.s3_bucket, queue_arn)
 
 

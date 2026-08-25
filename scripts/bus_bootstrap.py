@@ -61,10 +61,11 @@ async def _ensure_consumer(
     # worker's lease has expired before SQS redelivers (no premature DLQ; see
     # AppSettings.consumer_lease_ttl_seconds and docs/DEPLOYMENT.md).
     attributes = {"RedrivePolicy": redrive, "VisibilityTimeout": str(visibility_timeout)}
-    queue = (await sqs.create_queue(QueueName=name, Attributes=attributes))["QueueUrl"]
-    # create_queue only applies Attributes when it *creates* the queue; an already
-    # existing queue keeps its old settings. Re-apply so a changed lease/visibility
-    # invariant actually lands on re-run (idempotent bootstrap).
+    # Create bare, then apply: create_queue honours Attributes only when it actually
+    # creates the queue, and passing values that differ from an existing queue's is a
+    # QueueAlreadyExists error — so a changed lease/visibility invariant would never
+    # land on re-run. set_queue_attributes is the idempotent path.
+    queue = (await sqs.create_queue(QueueName=name))["QueueUrl"]
     await sqs.set_queue_attributes(QueueUrl=queue, Attributes=attributes)
     queue_arn = await _queue_arn(sqs, queue)
     for event_type in event_types:

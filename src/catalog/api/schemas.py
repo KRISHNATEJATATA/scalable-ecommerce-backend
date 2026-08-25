@@ -33,4 +33,6 @@ class ImagePresignRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     content_type: str = Field(description="claimed image MIME type (jpeg/png/webp)")
-    content_length: int = Field(gt=0, description="declared byte size; capped by policy")
+    content_length: int = Field(
+        gt=0, description="declared byte size; the presigned policy is pinned to it (and the server cap)"
+    )

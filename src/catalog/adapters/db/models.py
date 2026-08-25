@@ -1,9 +1,10 @@
 """SQLAlchemy models for the ``catalog`` schema."""
 
 import uuid
+from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import CheckConstraint, Index, Numeric, String, text
+from sqlalchemy import BigInteger, CheckConstraint, DateTime, Identity, Index, Integer, Numeric, String, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, declared_attr, mapped_column
 
@@ -67,9 +68,13 @@ class Product(Base, TimestampMixin, SoftDeleteMixin, VersionIdMixin):
     # ``image_upload_token`` is the token of the CURRENTLY-pending upload — the
     # worker only applies a result whose token matches, so a late/stale event for
     # a superseded upload can't clobber newer image state.
+    # ``image_upload_expires_at`` is when that presigned POST stops being accepted;
+    # past it (plus a grace for in-flight processing) an abandoned upload is reaped
+    # so the product doesn't sit `pending` — and imageless — forever.
     image_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     image_status: Mapped[str] = mapped_column(String(16), nullable=False, server_default=ImageStatus.NONE.value)
     image_upload_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    image_upload_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Outbox(Base, OutboxMixin):
@@ -77,3 +82,28 @@ class Outbox(Base, OutboxMixin):
 
     __tablename__ = "outbox"
     __table_args__ = (outbox_unpublished_index("catalog"), {"schema": SCHEMA})
+
+
+class ImageReclaim(Base):
+    """Public image renditions that must be deleted from S3 (durable cleanup queue).
+
+    Same idea as the outbox, for object storage instead of the bus: the row is
+    written **in the same transaction** as the image flip that orphaned the key, so
+    a crash between "the DB says this image is replaced" and "S3 no longer has it"
+    can only ever leave work *to do*, never work silently lost. ``public/`` is live
+    CDN content outside the ``uploads/`` lifecycle rule, so nothing else would ever
+    reclaim these objects. Drained with retries + backoff by the image worker.
+    """
+
+    __tablename__ = "image_reclaim"
+    __table_args__ = (Index("ix_image_reclaim_due", "next_attempt_at"), {"schema": SCHEMA})
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    product_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    object_key: Mapped[str] = mapped_column(String(1024), nullable=False, unique=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    last_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("now()"))

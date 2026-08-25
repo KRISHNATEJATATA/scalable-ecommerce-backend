@@ -20,10 +20,17 @@ import contextlib
 import logging
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 from pydantic import ValidationError
 
-from src.catalog.application.dto import ProductCreate, ProductResponse, ProductUpdate, public_image_url
+from src.catalog.application.dto import (
+    ProductCreate,
+    ProductResponse,
+    ProductUpdate,
+    public_image_url,
+    public_thumbnail_urls,
+)
 from src.catalog.application.image_processing import ALLOWED_MIME
 from src.catalog.application.mappers import to_domain
 from src.catalog.application.outbox import product_updated_outbox
@@ -124,11 +131,15 @@ class CatalogService:
     def _to_response(self, product: object) -> ProductResponse:
         """Map a domain product (or decoded cache entry) to the response schema.
 
-        The single place ``image_url`` is resolved, from the injected public base —
-        so a cached entry serialized under an older config is re-resolved on read.
+        The single place ``image_url`` (and its thumbnail map) is resolved, from the
+        injected public base — so a cached entry serialized under an older config is
+        re-resolved on read.
         """
         response = product if isinstance(product, ProductResponse) else ProductResponse.model_validate(product)
         response.image_url = public_image_url(response.image_key, response.image_status, self._image_base_url)
+        response.image_thumbnail_urls = public_thumbnail_urls(
+            response.image_key, response.image_status, self._image_base_url
+        )
         return response
 
     async def get_product(self, product_id: uuid.UUID) -> ProductResponse | None:
@@ -397,7 +408,11 @@ class CatalogService:
         presigned = await self._image_store.presign_upload(
             product_id,
             content_type=content_type,
-            max_bytes=self._image_max_upload_bytes,
+            # Clamp the policy to what the caller *declared*, not just the global
+            # ceiling: otherwise declaring 100 bytes still bought a 5 MiB upload and
+            # the validated field was advisory. The declared size is already known to
+            # be <= the cap by the check above, so this only ever tightens it.
+            max_bytes=min(content_length, self._image_max_upload_bytes),
             ttl_seconds=self._image_upload_ttl_seconds,
         )
         # Flipping to ``pending`` drops the public image; emit ProductUpdated in the
@@ -410,7 +425,11 @@ class CatalogService:
             category=product.category,
             product_version=product.version_id + _VERSION_STEP,
         )
-        await self._repo.set_image_pending(product, presigned["token"], outbox=outbox)
+        # Record when the presign dies, so an upload that never arrives is reaped
+        # back to the product's previous image state instead of pinning it (and its
+        # existing image) to ``pending`` forever.
+        expires_at = datetime.now(UTC) + timedelta(seconds=self._image_upload_ttl_seconds)
+        await self._repo.set_image_pending(product, presigned["token"], expires_at=expires_at, outbox=outbox)
         return ImageUploadTicket(
             url=presigned["url"],
             fields=presigned["fields"],
