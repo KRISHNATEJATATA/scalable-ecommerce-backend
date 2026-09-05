@@ -21,10 +21,16 @@ from src.shared.errors.exceptions import (
     DependencyUnavailableError,
     InsufficientStockError,
     InvalidCursorError,
+    InvalidPaymentMethodError,
     InvalidQueryParamError,
     InvalidReservationError,
     InvalidUploadError,
+    KeycloakConflictError,
+    KeycloakEntityNotFoundError,
+    PaymentIdempotencyConflictError,
     ReservationConflictError,
+    ReservationContendedError,
+    UnknownPaymentRefError,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,10 +61,13 @@ async def _bad_request_handler(_: Request, exc: InvalidQueryParamError | Invalid
     return _problem_response(400, title="Bad Request", detail=str(exc))
 
 
-async def _detail_bad_request_handler(_: Request, exc: InvalidUploadError | InvalidReservationError) -> JSONResponse:
+async def _detail_bad_request_handler(
+    _: Request, exc: InvalidUploadError | InvalidReservationError | InvalidPaymentMethodError
+) -> JSONResponse:
     # Requests rejected by server-side validation before they reach durable state:
     # an upload whose declared type/size fails policy, a reservation whose quantity
-    # is non-positive. 400 with the exception's own detail — never a 500.
+    # is non-positive, a payment token shaped like raw card data. 400 with the
+    # exception's own detail — never a 500.
     return _problem_response(400, title="Bad Request", detail=exc.detail)
 
 
@@ -72,6 +81,26 @@ async def _reservation_conflict_handler(_: Request, exc: ReservationConflictErro
     # Also 409, but a different `title`: the line already holds a different qty,
     # so the caller must release the stale hold rather than wait for stock.
     return _problem_response(409, title="Reservation Conflict", detail=exc.detail)
+
+
+async def _reservation_contended_handler(_: Request, exc: ReservationContendedError) -> JSONResponse:
+    # 409, and deliberately NOT counted as an oversell block: exhausting the
+    # reserve retries means concurrent holds kept colliding on this line —
+    # transient pressure, not a stock answer.
+    return _problem_response(409, title="Reservation Contention", detail=exc.detail)
+
+
+async def _payment_idempotency_conflict_handler(_: Request, exc: PaymentIdempotencyConflictError) -> JSONResponse:
+    # 409: the key pins whatever it first charged — replaying it with a different
+    # order/amount is a caller bug a real gateway would also refuse.
+    return _problem_response(409, title="Idempotency Conflict", detail=exc.detail)
+
+
+async def _unknown_payment_ref_handler(_: Request, exc: UnknownPaymentRefError) -> JSONResponse:
+    # 404, not a silent 202: a webhook for an unknown ref is a misconfiguration
+    # (wrong gateway environment, forged body) that must be visible. The provider
+    # re-delivers, so once the row exists it resolves.
+    return _problem_response(404, title="Not Found", detail=exc.detail)
 
 
 async def _concurrent_update_handler(_: Request, exc: ConcurrentUpdateError) -> JSONResponse:
@@ -98,6 +127,19 @@ async def _stale_data_handler(_: Request, exc: StaleDataError) -> JSONResponse:
 async def _dependency_unavailable_handler(_: Request, exc: DependencyUnavailableError) -> JSONResponse:
     logger.warning("Dependency unavailable: %s", exc.detail)
     return _problem_response(503, title="Service Unavailable", detail=exc.detail)
+
+
+async def _keycloak_not_found_handler(_: Request, exc: KeycloakEntityNotFoundError) -> JSONResponse:
+    # 404, not the 500 boundary: an admin acting on a sub/role Keycloak doesn't
+    # have is a caller-fixable outcome (stale list, typo), not a server fault.
+    return _problem_response(404, title="Not Found", detail=exc.detail)
+
+
+async def _keycloak_conflict_handler(_: Request, exc: KeycloakConflictError) -> JSONResponse:
+    # 409: e.g. account creation against an email Keycloak already has. The
+    # caller picks a different address; a 500 here read as "broken server" and
+    # paged on-call for what is user input.
+    return _problem_response(409, title="Conflict", detail=exc.detail)
 
 
 async def _http_exception_handler(_: Request, exc: StarletteHTTPException) -> JSONResponse:
@@ -129,9 +171,14 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(InvalidReservationError, _detail_bad_request_handler)
     app.add_exception_handler(InsufficientStockError, _insufficient_stock_handler)
     app.add_exception_handler(ReservationConflictError, _reservation_conflict_handler)
+    app.add_exception_handler(ReservationContendedError, _reservation_contended_handler)
+    app.add_exception_handler(PaymentIdempotencyConflictError, _payment_idempotency_conflict_handler)
+    app.add_exception_handler(UnknownPaymentRefError, _unknown_payment_ref_handler)
     app.add_exception_handler(ConcurrentUpdateError, _concurrent_update_handler)
     app.add_exception_handler(StaleDataError, _stale_data_handler)
     app.add_exception_handler(DependencyUnavailableError, _dependency_unavailable_handler)
+    app.add_exception_handler(KeycloakEntityNotFoundError, _keycloak_not_found_handler)
+    app.add_exception_handler(KeycloakConflictError, _keycloak_conflict_handler)
     app.add_exception_handler(StarletteHTTPException, _http_exception_handler)
     app.add_exception_handler(RequestValidationError, _validation_exception_handler)
     app.add_exception_handler(Exception, _unhandled_exception_handler)

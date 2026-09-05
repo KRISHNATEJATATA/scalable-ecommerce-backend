@@ -32,6 +32,45 @@ class InvalidUploadError(ValueError):
         self.detail = detail
 
 
+class InvalidPaymentMethodError(ValueError):
+    """The payment-method token is unusable → 400.
+
+    Today's one producer: a token shaped like **raw card data** (a 12-21 digit
+    PAN, optionally spaced/dashed). Card data must never reach the gateway
+    adapter, let alone be stored (PCI SAQ-A) — a hosted-checkout token is the only
+    accepted shape, so this rejects the misuse at the boundary.
+    """
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+class PaymentIdempotencyConflictError(Exception):
+    """A charge replayed under an existing idempotency key with different order/amount → 409.
+
+    Real gateways reject this exact mismatch (the key pins the first request's
+    parameters); surfacing it keeps a buggy retry from silently paying the wrong
+    amount for the wrong order while believing it resumed the original."""
+
+    def __init__(self) -> None:
+        detail = "this idempotency key was already used for a different order/amount"
+        super().__init__(detail)
+        self.detail = detail
+
+
+class UnknownPaymentRefError(Exception):
+    """A webhook references no payment we issued → 404.
+
+    Deliberately NOT swallowed as a 202-ack: a webhook for an unknown ref is a
+    misconfiguration (wrong gateway environment, forged payload) that operators
+    must see. The gateway will re-deliver; once the row exists it resolves."""
+
+    def __init__(self, detail: str = "no payment matches this reference") -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
 class InvalidReservationError(ValueError):
     """A reservation request is malformed (e.g. a non-positive quantity) → 400.
 

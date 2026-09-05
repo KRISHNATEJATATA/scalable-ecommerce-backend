@@ -20,4 +20,5 @@ def to_domain(row: Any) -> Payment:
         gateway_ref=row.gateway_ref,
         created_at=row.created_at,
         updated_at=row.updated_at,
+        failure_reason=getattr(row, "failure_reason", None),
     )

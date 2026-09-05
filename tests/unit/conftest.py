@@ -22,9 +22,15 @@ from src.shared.config.setting import get_settings
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULES = ["identity", "catalog", "inventory", "orders", "payments"]
 
+# Every table the tests can write, truncated (with CASCADE for the intra-module
+# FKs) so no rows leak between tests — payments accumulate per order_id today,
+# and outbox/image_reclaim rows must not survive a test that asserted on them.
 _TRUNCATE = text(
-    "TRUNCATE catalog.products, orders.order_items, orders.orders, "
-    "inventory.reservations, inventory.inventory, inventory.outbox CASCADE"
+    "TRUNCATE catalog.products, catalog.outbox, catalog.image_reclaim, "
+    "orders.order_items, orders.orders, orders.outbox, "
+    "inventory.reservations, inventory.inventory, inventory.outbox, "
+    "identity.users, identity.outbox, "
+    "payments.payments, payments.outbox CASCADE"
 )
 
 

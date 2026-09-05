@@ -35,7 +35,9 @@ from src.orders.adapters.db.repository import OrdersRepository
 from src.orders.application.service import OrdersService
 from src.orders.ports.repository import OrdersRepositoryPort
 from src.payments.adapters.db.repository import PaymentsRepository
+from src.payments.adapters.stub_gateway import StubPaymentGateway
 from src.payments.application.service import PaymentsService
+from src.payments.ports.gateway import PaymentGatewayPort
 from src.payments.ports.repository import PaymentsRepositoryPort
 from src.shared.auth.dependencies import PrincipalDep
 from src.shared.db.session import get_session

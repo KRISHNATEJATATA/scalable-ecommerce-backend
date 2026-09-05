@@ -24,5 +24,6 @@ class PaymentResponse(BaseModel):
     status: str
     amount: Decimal
     gateway_ref: str | None
+    failure_reason: str | None = None
     created_at: datetime
     updated_at: datetime

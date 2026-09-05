@@ -286,6 +286,25 @@ class AppSettings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _require_reconciliation_max_age_above_grace(self) -> "AppSettings":
+        """Fail-fast: the reconciliation sweep window must be non-empty.
+
+        Rows older than ``payment_reconciliation_max_age_seconds`` are abandoned
+        (guarded flip to ``failed``) instead of asked about again. If max_age were
+        <= grace, the lookup window ``[grace, max_age]`` would be empty and every
+        charge past grace would be abandoned on the first pass — including ones a
+        slow-but-alive provider was still confirming. The relationship is what
+        makes abandonment safe, so it is enforced, not documented and hoped for.
+        """
+        if self.payment_reconciliation_max_age_seconds <= self.payment_reconciliation_grace_seconds:
+            raise ValueError(
+                "payment_reconciliation_max_age_seconds must exceed payment_reconciliation_grace_seconds "
+                f"({self.payment_reconciliation_max_age_seconds} <= {self.payment_reconciliation_grace_seconds}): "
+                "charges past grace would be abandoned instead of reconciled"
+            )
+        return self
+
 
 @lru_cache
 def get_settings() -> AppSettings:

@@ -31,6 +31,9 @@ services:
       KEYCLOAK_ADMIN_CLIENT_ID: ecommerce-admin
       KEYCLOAK_ADMIN_CLIENT_SECRET: change-me-local-only
       CORS_ALLOW_ORIGINS: '["http://localhost:3000"]'
+      PAYMENT_STUB_FAIL_TOKEN_SUBSTRING: decline
+      PAYMENT_WEBHOOK_SECRET: dev-webhook-secret-change-me
+      PAYMENT_RECONCILIATION_GRACE_SECONDS: "30"
     depends_on:
       postgres:
         condition: service_healthy
@@ -234,6 +237,28 @@ services:
     ports:
       - "9104:9100"
     command: ["python", "-m", "src.inventory.adapters.reaper"]
+
+  # The `service`-role payment reconciler: resolves charges still `pending` past
+  # their grace window by asking the gateway directly (a missed webhook must not
+  # strand the order). Same guarded transitions as the webhook, so races are safe.
+  payment-reconciler:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ecommerce:ecommerce@postgres:5432/ecommerce
+      PAYMENT_STUB_FAIL_TOKEN_SUBSTRING: decline
+      PAYMENT_RECONCILIATION_GRACE_SECONDS: "30"
+      PAYMENT_RECONCILIATION_POLL_INTERVAL_SECONDS: "60"
+      PAYMENT_RECONCILIATION_BATCH_SIZE: "50"
+      PAYMENT_RECONCILIATION_MAX_AGE_SECONDS: "604800"
+      WORKER_METRICS_PORT: "9100"
+    ports:
+      - "9105:9100"
+    command: ["python", "-m", "src.payments.adapters.reconciler"]
 
   # Local mail catcher: Keycloak's "update account" email (admin user creation)
   # needs an SMTP server or the create rolls back. UI on http://localhost:8025.

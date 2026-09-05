@@ -38,7 +38,10 @@ class Payment(Base, TimestampMixin):
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
     gateway_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    # pending → succeeded | failed; transitions are terminal (guarded UPDATE on
+    # ``status='pending'``), so a duplicate/out-of-order webhook is a no-op.
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    failure_reason: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
 
 class Outbox(Base, OutboxMixin):
