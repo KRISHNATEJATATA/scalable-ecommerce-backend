@@ -64,6 +64,18 @@ def test_registry_covers_every_listed_event() -> None:
     assert {m.model_fields["type"].default for m in EVENT_MODELS} == _EXPECTED
 
 
+def test_registry_build_rejects_duplicate_type_version_pairs() -> None:
+    """A copy-pasted ``Literal`` version must fail loudly, not silently shadow the old model."""
+    from src.events.registry import _build_registry  # private helper under test
+
+    with pytest.raises(RuntimeError, match="duplicate event registration"):
+        _build_registry((UserCreated, UserCreated))
+
+    # The real registry built clean and keys V2 correctly.
+    key = (ProductCreatedV2.model_fields["type"].default, ProductCreatedV2.model_fields["schema_version"].default)
+    assert REGISTRY[key] is ProductCreatedV2
+
+
 def test_every_event_carries_the_four_envelope_fields() -> None:
     for model in EVENT_MODELS:
         assert _ENVELOPE <= set(model.model_fields), model.__name__

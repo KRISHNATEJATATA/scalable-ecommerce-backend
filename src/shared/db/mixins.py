@@ -8,10 +8,11 @@ Two distinct optimistic-lock mechanisms exist on purpose:
 - ``VersionIdMixin``: SQLAlchemy's built-in ``version_id_col`` (ORM-managed,
   bumped automatically on every UPDATE). Use for aggregates updated through
   the ORM, e.g. ``catalog.Product``.
-- ``ManualVersionMixin``: a plain ``version`` column checked by hand in a raw
-  ``UPDATE ... WHERE version = :v`` compare-and-swap. Use for hot-path rows
-  updated via a single atomic statement outside the ORM's unit of work, e.g.
-  ``inventory.inventory``.
+- ``ManualVersionMixin``: a plain ``version`` column bumped by hand inside raw
+  single-statement writes whose *arithmetic guard* is the real concurrency
+  control (e.g. ``inventory.inventory``: ``WHERE on_hand - reserved >= :qty``).
+  The column exists so a future compare-and-swap (``WHERE version = :v``) can be
+  layered on without a migration — today nothing branches on it.
 """
 
 import uuid
@@ -19,7 +20,9 @@ from datetime import datetime
 
 from sqlalchemy import DateTime, Index, Integer, String, func, text
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, validates
+
+from src.shared.db.outbox import MAX_OUTBOX_PAYLOAD_BYTES, OutboxPayloadTooLargeError
 
 
 class TimestampMixin:
@@ -63,6 +66,22 @@ class OutboxMixin:
     payload: Mapped[str] = mapped_column(String, nullable=False)  # serialized JSON event body
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    @validates("payload")
+    def _reject_oversized_payload(self, _key: str, payload: str) -> str:
+        """Refuse a payload the bus can never carry (SNS/SQS cap at 256 KB).
+
+        Enforced here rather than per call site so every current and future
+        producer inherits it: one oversized row would otherwise sit unpublished
+        ahead of its schema's lane in the relay and block that module's events
+        indefinitely.
+        """
+        if len(payload.encode("utf-8")) > MAX_OUTBOX_PAYLOAD_BYTES:
+            raise OutboxPayloadTooLargeError(
+                f"payload of {len(payload.encode('utf-8'))} bytes exceeds "
+                f"MAX_OUTBOX_PAYLOAD_BYTES ({MAX_OUTBOX_PAYLOAD_BYTES}); the bus cannot carry it"
+            )
+        return payload
 
 
 def outbox_unpublished_index(module: str) -> Index:

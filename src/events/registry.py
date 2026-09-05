@@ -86,7 +86,24 @@ def _key(model: type[DomainEvent]) -> tuple[str, int]:
     return (model.model_fields["type"].default, model.model_fields["schema_version"].default)
 
 
-REGISTRY: dict[tuple[str, int], type[DomainEvent]] = {_key(m): m for m in EVENT_MODELS}
+def _build_registry(models: tuple[type[DomainEvent], ...]) -> dict[tuple[str, int], type[DomainEvent]]:
+    """Key the models by ``(type, schema_version)``, refusing silent collisions.
+
+    A dict comprehension would let a copy-pasted ``Literal`` version silently
+    shadow the older model — messages of the shadowed version would then fail
+    validation into the DLQ with nothing pointing at the cause. Fail at import
+    instead.
+    """
+    registry: dict[tuple[str, int], type[DomainEvent]] = {}
+    for model in models:
+        key = _key(model)
+        if key in registry:
+            raise RuntimeError(f"duplicate event registration: {key} maps to both {registry[key]!r} and {model!r}")
+        registry[key] = model
+    return registry
+
+
+REGISTRY: dict[tuple[str, int], type[DomainEvent]] = _build_registry(EVENT_MODELS)
 
 
 def _lookup(event_type: Any, schema_version: Any) -> type[DomainEvent]:

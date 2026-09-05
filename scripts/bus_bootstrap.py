@@ -57,9 +57,12 @@ async def _ensure_consumer(
     dlq = (await sqs.create_queue(QueueName=f"{name}-dlq"))["QueueUrl"]
     dlq_arn = await _queue_arn(sqs, dlq)
     redrive = json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": MAX_RECEIVE_COUNT})
-    # VisibilityTimeout >= the consumer's processing-lease TTL, so a crashed
-    # worker's lease has expired before SQS redelivers (no premature DLQ; see
-    # AppSettings.consumer_lease_ttl_seconds and docs/DEPLOYMENT.md).
+    # VisibilityTimeout strictly greater than the processing-lease TTL: the lease is
+    # claimed *after* receive, so at equality it always expires slightly later than
+    # the message becomes visible — a crash mid-handle would then burn a full extra
+    # visibility cycle AND one of the five redrive receives before real work retries.
+    # 2× keeps the redelivery safely after lease expiry; see
+    # AppSettings.consumer_lease_ttl_seconds and docs/DEPLOYMENT.md.
     attributes = {"RedrivePolicy": redrive, "VisibilityTimeout": str(visibility_timeout)}
     # Create bare, then apply: create_queue honours Attributes only when it actually
     # creates the queue, and passing values that differ from an existing queue's is a
@@ -81,7 +84,7 @@ async def _ensure_consumer(
 
 async def bootstrap() -> None:
     settings = get_settings()
-    visibility_timeout = settings.consumer_lease_ttl_seconds
+    visibility_timeout = settings.consumer_lease_ttl_seconds * 2
     async with sns_client(settings) as sns, sqs_client(settings) as sqs:
         topics = await _ensure_topics(sns, settings.bus_topic_prefix)
         for name, event_types in CONSUMERS.items():
