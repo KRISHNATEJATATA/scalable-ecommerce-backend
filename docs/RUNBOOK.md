@@ -366,6 +366,36 @@ SELECT status, count(*) FROM payments.payments GROUP BY status;
 — a sustained non-zero count means it is down or falling behind (postgres_exporter
 keeps answering when the worker is dead).
 
+### 10. Cart events worker (cart snapshot projection)
+
+The `service`-role **cart consumer** (`python -m src.cart.adapters.cart_consumer`)
+drains the **`cart-events`** SQS queue subscribed to `ProductUpdated` +
+`ProductDeleted` and projects each event into every Valkey cart holding that
+product: `ProductUpdated` refreshes the line's `name`/`unit_price` snapshot (only
+lines still present, only strictly-newer `product_version` — unordered SNS delivery
+makes stale updates routine), while `ProductDeleted` is an ungated tombstone that
+always prunes. `image_url` is deliberately not refreshed (the event doesn't carry
+it); the snapshot re-aligns on the next add. The consumer is idempotent twice over
+(`event:{consumer}:{event_id}` dedupe plus naturally idempotent projections) —
+replay just rewrites the same snapshot or re-prunes an absent line.
+
+**Staleness bound.** Projection is eventual: bounded by the outbox relay poll
+interval + queue latency. A cart read shortly after a product edit may serve the
+prior price until the event drains — accepted, and self-healing on the next event.
+There is no negative-cache equivalent here: a product with no carts to update is a
+no-op, never a tombstone.
+
+| Symptom | Likely cause | Action |
+|---|---|---|
+| Cart prices/names stale well past edits | cart consumer down / `cart-events` not draining | check the worker task is running + healthy; inspect queue depth and oldest-message age |
+| `cart-events-dlq` non-empty | repeated handler errors (Valkey unreachable) | inspect a DLQ message, fix Valkey connectivity, redrive (§4) — projections are idempotent, replay is safe |
+| Carts never expire | `CART_TTL_SECONDS` misconfigured sky-high, or a client polling every cart in a loop | fix the setting; every read refreshes the rolling TTL by design |
+
+**Monitoring.** Alarm on `cart-events-dlq` `ApproximateNumberOfMessagesVisible > 0`;
+watch the `cart-events` queue depth + oldest-message age (worker liveness). Losing
+the worker freezes snapshots (stale prices, deleted products lingering in carts)
+but never loses a cart — cart state itself lives in Valkey, not in the queue.
+
 ## Post-incident
 - Re-enable automated backups on the promoted instance.
 - Rotate any exposed secrets (JWT keys, DB creds) via Secrets Manager.

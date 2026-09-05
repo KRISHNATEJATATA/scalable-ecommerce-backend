@@ -38,6 +38,7 @@ depth):
 | Relay | `python -m src.shared.bus.relay` | Postgres `outbox` | ships unpublished rows → SNS (SKIP LOCKED) |
 | Image worker | `python -m src.catalog.adapters.image_worker` | `image-uploads` | sniff · re-encode · thumbnails → `image_status` |
 | Cache worker | `python -m src.catalog.adapters.cache_worker` | `catalog-cache` | invalidate Valkey read-cache on `ProductUpdated`/`ProductDeleted` |
+| Cart consumer | `python -m src.cart.adapters.cart_consumer` | `cart-events` | refresh/prune Valkey cart snapshots on `ProductUpdated`/`ProductDeleted` |
 | Reservation reaper | `python -m src.inventory.adapters.reaper` | Postgres `reservations` | release holds past `expires_at` (SKIP LOCKED) so a stalled saga can't leak stock |
 | Payment reconciler | `python -m src.payments.adapters.reconciler` | Postgres `payments` | resolve charges still `pending` past their grace window by asking the gateway (missed-webhook backstop) |
 
@@ -52,7 +53,7 @@ for liveness rather than on counter silence — a worker that never runs emits n
 or `METRICS_PUSHGATEWAY_URL` (`--once`); see `docs/RUNBOOK.md` §8. Set
 `RESERVATION_TTL_SECONDS` **longer than the checkout saga's step timeouts**.
 
-The **image and cache workers** drain a standard SQS queue with a DLQ; set the queue
+The **image, cache, and cart workers** drain a standard SQS queue with a DLQ; set the queue
 **visibility timeout ≥ the consumer's processing lease** (`CONSUMER_LEASE_TTL_SECONDS`)
 so a crashed worker's in-flight message is redelivered rather than lost or
 double-processed. The **relay, reaper, and payment reconciler poll Postgres instead**
@@ -64,7 +65,11 @@ Losing the cache worker degrades read latency (more DB reads, staleness bounded 
 `PRODUCT_CACHE_TTL_SECONDS`) but is not a correctness incident; losing the relay or
 image worker stalls events/uploads until it recovers (both replay safely). Losing
 the reconciler strands paid charges in `pending` (and their orders with them) until
-it returns — alarm on the stuck-pending count in RUNBOOK §9.
+it returns — alarm on the stuck-pending count in RUNBOOK §9. The cart consumer is
+pure Valkey (no Postgres): size it by memory, not connections.
+`CART_MAX_ITEMS` / `CART_MAX_QTY_PER_LINE` cap one caller's memory amplification;
+`CART_TTL_SECONDS` is the rolling inactivity expiry (~30d) — eviction empties a
+cart, which is acceptable here and never is for an order.
 
 **Topic ARNs.** Terraform provisions the per-event-type SNS topics, so give the relay task
 role `sns:Publish` only and point `BUS_TOPIC_ARN_PREFIX` at the ARN namespace
@@ -76,8 +81,8 @@ empty and `scripts/bus_bootstrap.py` creates the topics on LocalStack.
 
 **Worker metrics.** Only the API serves `/metrics`, so every worker above needs its own
 export or its counters are invisible. Set `WORKER_METRICS_PORT` on the long-running worker
-services and scrape it like any other target (docker-compose sets it on all four workers and
-publishes 9101–9104). Scheduled `--once` tasks (the reaper) exit
+services and scrape it like any other target (docker-compose sets it on all six workers and
+publishes 9101–9106). Scheduled `--once` tasks (the reaper) exit
 between scrapes, so they push at exit instead — point `METRICS_PUSHGATEWAY_URL` at a
 Pushgateway. Both are opt-in; unset means no port bound and no push attempted. Alert rules
 and the postgres_exporter query behind the reaper's liveness signal ship in
