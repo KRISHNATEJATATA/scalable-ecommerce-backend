@@ -1,0 +1,30 @@
+{
+  "$schema": "https://raw.githubusercontent.com/RobertCraigie/pyright/master/schemas/pyrightconfig.schema.json",
+  // Baseline strictness policy (see review 2026-09-05): this repo never ran a
+  // type checker — CI is Ruff + pytest + import-linter. This config keeps the
+  // rules that catch real defects and silences third-party-stub friction plus
+  // strictness the codebase never adopted. Rules that caught the only two real
+  // finds to date (reportReturnType, reportAttributeAccessIssue) stay on.
+  "venvPath": ".",
+  "venv": ".venv",
+  "typeCheckingMode": "standard",
+  // --- silenced: SQLAlchemy/Alembic/Starlette/Valkey stub friction ------------
+  // Unparameterized generics (async_sessionmaker, bare dict/Select/ColumnElement).
+  "reportMissingTypeArgument": false,
+  // Untyped deps (Valkey client, boto, alembic env) surface as Unknown/Any.
+  "reportUnknownMemberType": false,
+  "reportUnknownVariableType": false,
+  "reportUnknownParameterType": false,
+  "reportUnknownArgumentType": false,
+  "reportExplicitAny": false,
+  "reportAny": false,
+  // --- silenced: strictness the codebase never adopted ------------------------
+  // Exception attrs set in __init__ without class-level annotations.
+  "reportUnannotatedClassAttribute": false,
+  // Narrow-handler vs Starlette's broad ExceptionHandler stub (dispatches by
+  // registered class at runtime; 19 sites, all runtime-correct per tests).
+  "reportArgumentType": false,
+  "reportMissingParameterType": false,
+  "reportImplicitOverride": false,
+  "reportUnusedCallResult": false
+}
