@@ -109,6 +109,26 @@ class AppSettings(BaseSettings):
     # --- Feature flags (plain env booleans; not a flag service) ---
     enable_reviews: bool = False
 
+    # --- Payments (stub gateway behind PaymentGatewayPort) ---
+    # Tokens containing this substring decline — the stub's only failure knob,
+    # enough to drive both event paths end to end.
+    payment_stub_fail_token_substring: str = "decline"
+    # HMAC-SHA256 secret verifying gateway webhook bodies
+    # (``X-Payment-Signature: sha256=<hex>``). Unset → webhooks are refused
+    # (fail closed), never processed unsigned.
+    payment_webhook_secret: str | None = None
+    # How long a charge may sit ``pending`` before the reconciliation poller asks
+    # the gateway what happened (covers normal webhook latency; longer than any
+    # plausible delivery delay without racing one).
+    payment_reconciliation_grace_seconds: int = Field(default=30, gt=0)
+    payment_reconciliation_poll_interval_seconds: float = Field(default=60.0, gt=0)
+    payment_reconciliation_batch_size: int = Field(default=50, gt=0)
+    # Upper bound of the reconciliation window: a charge still ``pending`` past
+    # this age is *abandoned* (guarded flip to ``failed``) instead of asked about
+    # again, so rows the gateway never saw stop consuming a batch slot on every
+    # pass. Must exceed ``payment_reconciliation_grace_seconds`` (enforced below).
+    payment_reconciliation_max_age_seconds: int = Field(default=7 * 24 * 3600, gt=0)
+
     # --- S3 / uploads (Phase 7-8) ---
     s3_bucket: str | None = None
     s3_region: str = "us-east-1"

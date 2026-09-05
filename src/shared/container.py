@@ -176,6 +176,22 @@ def get_payments_repository(session: SessionDep) -> PaymentsRepositoryPort:
     return PaymentsRepository(session)
 
 
-def get_payments_service(repo: Annotated[PaymentsRepositoryPort, Depends(get_payments_repository)]) -> PaymentsService:
-    """Provide the payments service over its repository port."""
-    return PaymentsService(repo)
+def get_payment_gateway(request: Request) -> PaymentGatewayPort:
+    """Provide the gateway behind the Strategy port — swap the stub for a real
+    provider by replacing this one provider; no caller changes."""
+    return StubPaymentGateway(request.app.state.settings.payment_stub_fail_token_substring)
+
+
+def get_payments_service(
+    repo: Annotated[PaymentsRepositoryPort, Depends(get_payments_repository)],
+    request: Request,
+) -> PaymentsService:
+    """Provide the payments service over its repository + gateway ports."""
+    settings = request.app.state.settings
+    return PaymentsService(
+        repo,
+        get_payment_gateway(request),
+        webhook_secret=settings.payment_webhook_secret,
+        reconciliation_grace_seconds=settings.payment_reconciliation_grace_seconds,
+        reconciliation_max_age_seconds=settings.payment_reconciliation_max_age_seconds,
+    )
