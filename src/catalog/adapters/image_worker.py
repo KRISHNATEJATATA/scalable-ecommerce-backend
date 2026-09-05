@@ -195,7 +195,10 @@ def main() -> None:  # pragma: no cover - process entrypoint
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, stop.set)
+            try:
+                loop.add_signal_handler(sig, stop.set)
+            except NotImplementedError:  # Windows Proactor loop has no add_signal_handler
+                signal.signal(sig, lambda *_: stop.set())
         try:
             await run_worker(settings, sessionmaker, valkey, stop)
         finally:

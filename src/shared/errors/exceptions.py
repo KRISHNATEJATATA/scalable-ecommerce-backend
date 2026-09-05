@@ -96,6 +96,24 @@ class ReservationConflictError(Exception):
         self.detail = detail
 
 
+class ReservationContendedError(Exception):
+    """The reservation lost its uniqueness race repeatedly — churn on that line, not
+    stock pressure → 409, retry shortly.
+
+    Distinct from :class:`InsufficientStockError` so the oversell counter stays an
+    honest *stock* signal: exhausting the reserve retry loop means concurrent
+    holds kept colliding on the same order line, which says nothing about whether
+    free stock covered the request. Counting it as an oversell block would inflate
+    exactly the metric the atomic decrement exists to keep meaningful.
+    """
+
+    def __init__(self, sku: str) -> None:
+        detail = f"reservation for {sku!r} is under heavy contention; retry shortly"
+        super().__init__(detail)
+        self.sku = sku
+        self.detail = detail
+
+
 class ConcurrentUpdateError(Exception):
     """An optimistic-lock (``version_id``) conflict lost the race → 409, retryable.
 

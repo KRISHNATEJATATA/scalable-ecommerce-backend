@@ -121,7 +121,10 @@ class ProductCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1, max_length=255)
-    description: str | None = None
+    # Bounded like every other free-text field: an unbounded description lets one
+    # merchant persist multi-megabyte blobs that are then cached whole and shipped
+    # on every read of the product.
+    description: str | None = Field(default=None, max_length=5000)
     category: str | None = Field(default=None, max_length=255)
     price: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
 
@@ -142,7 +145,7 @@ class ProductUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid", json_schema_extra=_patch_schema)
 
     name: str | None = Field(default=None, min_length=1, max_length=255)
-    description: str | None = None
+    description: str | None = Field(default=None, max_length=5000)
     category: str | None = Field(default=None, max_length=255)
     price: Decimal | None = Field(default=None, gt=0, max_digits=12, decimal_places=2)
 

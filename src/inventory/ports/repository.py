@@ -48,9 +48,13 @@ class InventoryRepositoryPort(Protocol):
         expires_at: datetime,
         outbox: OutboxMessage,
     ) -> Any | None:
-        """``None`` = insufficient stock. Raises ``ReservationConflictError`` when the
-        order line already holds a different quantity, so the service can tell a
-        caller contradiction apart from stock pressure."""
+        """``None`` = insufficient stock (the oversell guard's answer, counted as such).
+
+        Raises ``ReservationConflictError`` when the order line already holds a
+        different quantity (a caller contradiction), and
+        :class:`ReservationContendedError` when repeated uniqueness races mean the
+        line is under churn — transient pressure that must not be reported, or
+        counted, as a stock rejection."""
         ...
 
     async def release(self, reservation_id: uuid.UUID, outbox_factory: OutboxFactory) -> bool:

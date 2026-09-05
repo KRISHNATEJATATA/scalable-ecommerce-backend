@@ -1,9 +1,12 @@
 """Repository-layer tests against Testcontainers-Postgres.
 
-The repository is the highest seam that exists this phase — api/ has no routes
-yet — so keyset correctness, whitelist/cursor rejection, soft-delete, the N+1
-guard, and the atomic decrement are all asserted here. HTTP-seam + concurrency
-races land with tickets 07/10/13/17.
+Covers the keyset correctness, whitelist/cursor rejection,
+soft-delete, the N+1 guard, and the atomic decrement primitive. Newer
+repository methods are asserted in their feature files instead
+(``test_catalog_products.py`` for catalog writes + image flips,
+``test_inventory_reservations.py`` for the reservation lifecycle incl. the
+concurrency races, ``test_payments.py`` for payment writes, ``test_auth.py``
+for identity) — this file stays the read-path/pagination contract.
 
 Uses the shared session-scoped Testcontainers-Postgres fixtures from
 ``tests/unit/conftest.py`` (never SQLite — the design relies on Postgres CHECK

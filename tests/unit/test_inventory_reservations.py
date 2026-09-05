@@ -27,6 +27,7 @@ from src.shared.errors.exceptions import (
     InsufficientStockError,
     InvalidReservationError,
     ReservationConflictError,
+    ReservationContendedError,
     StockMutationError,
 )
 
@@ -378,6 +379,33 @@ async def test_a_check_violation_from_the_db_is_still_reported_as_invalid(sessio
             expires_at=datetime.now(UTC) + timedelta(minutes=5),
             outbox=stock_reserved_outbox("sku-checkbypass", uuid.uuid4(), 1),
         )
+
+
+async def test_retry_exhaustion_raises_contention_and_does_not_count_as_an_oversell(session):
+    """Losing the uniqueness race twice is churn on the line, not a stock answer.
+
+    Staged deterministically: an existing hold for the same line makes every
+    INSERT hit ``uq_reservations_active_order_sku``, while a stubbed lookup never
+    finds it (the mid-flight-release case pushed to its limit). The reserve must
+    raise ``ReservationContendedError`` — and leave ``oversell_blocked_total``
+    alone, since free stock was never the problem.
+    """
+    await _seed(session, "sku-churn", 5)
+    order_id = uuid.uuid4()
+    await _service(session).reserve("sku-churn", 1, order_id)  # the line's live hold
+
+    repo = InventoryRepository(session)
+
+    async def _never_found(*args, **kwargs):  # noqa: ANN002, ANN003
+        return None
+
+    repo._find_active = _never_found
+    oversells_before = _metric("inventory_oversell_blocked_total")
+
+    with pytest.raises(ReservationContendedError):
+        await InventoryService(repo, reservation_ttl_seconds=900).reserve("sku-churn", 1, order_id)
+
+    assert _metric("inventory_oversell_blocked_total") == oversells_before
 
 
 async def test_retry_succeeds_when_the_conflicting_hold_is_released_mid_flight(session, async_engine):

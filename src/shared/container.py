@@ -92,6 +92,7 @@ def get_catalog_service(
         image_store,
         cache,
         lock_ttl_seconds=settings.product_cache_lock_ttl_seconds,
+        max_fill_wait_seconds=settings.product_cache_max_fill_wait_seconds,
         image_base_url=settings.image_public_base_url,
         image_max_upload_bytes=settings.image_max_upload_bytes,
         image_upload_ttl_seconds=settings.image_upload_ttl_seconds,

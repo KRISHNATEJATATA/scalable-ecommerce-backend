@@ -43,6 +43,7 @@ from src.shared.db.outbox import OutboxMessage
 from src.shared.errors.exceptions import (
     InvalidReservationError,
     ReservationConflictError,
+    ReservationContendedError,
     StockMutationError,
 )
 
@@ -221,7 +222,11 @@ class InventoryRepository:
             await self._session.commit()
             await self._session.refresh(reservation)
             return reservation
-        return None
+        # Both attempts lost the uniqueness race with no duplicate to return: real
+        # churn on this order line. Raised, not returned as ``None`` — ``None``
+        # means *stock* refused the request (the oversell counter's meaning), and
+        # contention says nothing about stock levels.
+        raise ReservationContendedError(sku)
 
     async def release(self, reservation_id: uuid.UUID, outbox_factory: OutboxFactory) -> bool:
         """Return a held reservation's stock; ``False`` if it wasn't ``held`` (no-op replay).

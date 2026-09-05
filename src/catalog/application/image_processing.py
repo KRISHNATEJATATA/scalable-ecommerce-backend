@@ -55,14 +55,21 @@ def sniff_mime(raw: bytes) -> str:
     return magic.from_buffer(raw, mime=True)
 
 
-def _encode_webp(img: Image.Image, max_dimension: int) -> tuple[bytes, int, int]:
-    """Clamp to ``max_dimension`` (longest side) and encode to WebP; returns (bytes, w, h)."""
+def _clamped(img: Image.Image, max_dimension: int) -> Image.Image:
+    """A copy of ``img`` whose longest side is ``max_dimension`` (aspect ratio preserved)."""
     clamped = img.copy()
     clamped.thumbnail((max_dimension, max_dimension))  # in-place, preserves aspect ratio
+    return clamped
+
+
+def _encode_webp(img: Image.Image) -> bytes:
+    """Encode one already-sized image to WebP bytes.
+
+    A fresh save with no exif/icc argument drops EXIF + trailing payloads.
+    """
     buf = io.BytesIO()
-    # A fresh save with no exif/icc argument drops EXIF + trailing payloads.
-    clamped.save(buf, format=OUTPUT_FORMAT, method=4)
-    return buf.getvalue(), clamped.width, clamped.height
+    img.save(buf, format=OUTPUT_FORMAT, method=4)
+    return buf.getvalue()
 
 
 def process_image(
@@ -81,6 +88,9 @@ def process_image(
     is checked from the **header** (``Image.open`` reads dimensions without
     decoding pixels) and rejected BEFORE ``load()`` allocates the full raster, so
     a small file declaring huge dimensions can't exhaust memory.
+
+    Thumbnails are derived from the already-clamped main image, so the full-raster
+    copy exists exactly once regardless of rendition count.
     """
     if len(raw) > max_bytes:  # defense in depth; the S3 presign policy is the first gate
         raise UnsupportedImageError(f"upload exceeds {max_bytes} bytes")
@@ -105,9 +115,18 @@ def process_image(
     except Exception as exc:  # boundary: any decode failure is a rejected upload
         raise UnsupportedImageError("could not decode image") from exc
 
-    main, width, height = _encode_webp(rgb, max_dimension)
-    thumbnails = {name: _encode_webp(rgb, size)[0] for name, size in THUMBNAIL_SIZES.items()}
-    return ProcessedImage(mime=mime, width=width, height=height, main=main, thumbnails=thumbnails)
+    main_image = _clamped(rgb, max_dimension)
+    # Thumbnails derive from the already-clamped main, never the full-res source:
+    # copying a worst-case 40MP raster once per rendition would multiply the
+    # worker's peak memory (and re-downscale it) for a 256px/64px result.
+    thumbnails = {name: _encode_webp(_clamped(main_image, size)) for name, size in THUMBNAIL_SIZES.items()}
+    return ProcessedImage(
+        mime=mime,
+        width=main_image.width,
+        height=main_image.height,
+        main=_encode_webp(main_image),
+        thumbnails=thumbnails,
+    )
 
 
 def _self_check() -> None:  # pragma: no cover - runnable smoke test

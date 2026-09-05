@@ -46,6 +46,15 @@ class Product(Base, TimestampMixin, SoftDeleteMixin, VersionIdMixin):
         Index("ix_products_name_id", "name", "id", postgresql_where=text("deleted_at IS NULL")),
         Index("ix_products_category", "category"),
         Index("ix_products_merchant_id", "merchant_id"),
+        # Mirror of the index the e2a7f1c48d90 migration creates: the abandoned-upload
+        # reaper scans due pending uploads only. Declared here so autogenerate sees it
+        # in the metadata — a migration-only index would otherwise be dropped by the
+        # next `alembic revision --autogenerate`.
+        Index(
+            "ix_products_pending_upload_expiry",
+            "image_upload_expires_at",
+            postgresql_where=text(f"image_status = '{ImageStatus.PENDING.value}'"),
+        ),
         {"schema": SCHEMA},
     )
 

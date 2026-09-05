@@ -7,7 +7,7 @@ the cache and the next read skips the DB; concurrent misses on one hot key drive
 when the fill is slower than the lock TTL (the holder renews the lock); and an
 invalidation that races a fill deletes the lock so the fill's stale read is dropped
 rather than cached. The adapter's Valkey Lua (compare-and-delete/-extend/-set) is
-exercised against a real Valkey in the manual smoke, not here.
+exercised against a real Valkey in ``tests/unit/test_catalog_cache_adapter.py``.
 """
 
 from __future__ import annotations
@@ -168,6 +168,30 @@ async def test_waiters_do_not_fall_back_to_db_while_fill_active() -> None:
 
     assert all(r is not None for r in results)
     assert repo.get_calls == 1  # no waiter fell back to the DB
+
+
+@pytest.mark.asyncio
+async def test_waiter_deadline_serves_from_db_when_a_fill_wedges() -> None:
+    """A wedged fill must not hang waiters forever: past ``max_fill_wait_seconds``
+    each caller reads the DB itself (bounded duplicate read, nothing stored).
+
+    Renewals are a Valkey op and succeed even while the DB behind the fill never
+    answers, so without this ceiling a brownout would convert into a request
+    pileup spinning on Valkey. Staged deterministically: the holder never fills,
+    the deadline is tiny, the loader answers instantly.
+    """
+    pid = uuid.uuid4()
+    cache = FakeProductCache()
+    await cache.acquire_fill_lock(pid, "wedged-holder")  # an active lock that will never produce a value
+    repo = CountingRepo(_row(pid))
+    service = CatalogService(repo, cache=cache, max_fill_wait_seconds=0.15)
+
+    result = await service.get_product(pid)
+
+    assert result is not None and result.id == pid  # served from the DB, not hung
+    assert repo.get_calls == 1
+    assert pid not in cache.data  # no lock ownership → the duplicate read stores nothing
+    assert await cache.fill_lock_held(pid) is True  # the (stuck) holder's lock is untouched
 
 
 @pytest.mark.asyncio

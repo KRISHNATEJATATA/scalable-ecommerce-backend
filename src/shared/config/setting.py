@@ -61,6 +61,11 @@ class AppSettings(BaseSettings):
     product_cache_negative_ttl_seconds: int = Field(
         default=10, gt=0
     )  # 404 tombstone TTL (short: a later create shows up fast)
+    # Ceiling on how long a cache miss waits for another caller's fill before it
+    # serves itself from the DB. Without it a wedged DB read renews the fill lock
+    # forever while every waiter spins on Valkey — a brownout would convert into a
+    # request pileup instead of duplicate (bounded) DB reads.
+    product_cache_max_fill_wait_seconds: float = Field(default=2.0, gt=0)
     # SQS queue the catalog-cache invalidation consumer drains. LocalStack locally.
     catalog_cache_queue_url: str | None = None
 

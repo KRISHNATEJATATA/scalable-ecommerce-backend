@@ -119,15 +119,24 @@ class CatalogRepository:
 
     # --- writes: state change + outbox row committed in ONE transaction -------
 
-    async def _commit_versioned(self) -> None:
-        """Commit an ORM write on the versioned ``Product`` aggregate.
+    async def _commit_versioned(self, *, product: Product | None = None) -> None:
+        """Flush (+ optionally refresh) then commit the versioned ``Product`` aggregate.
 
         ``version_id_col`` turns a lost update into ``StaleDataError`` at flush.
         Translate it at the adapter boundary (and roll back the now-unusable
         transaction) so the API answers a retryable **409** instead of letting a
-        SQLAlchemy exception reach the 500 handler.
+        SQLAlchemy exception reach the 500 handler. The flush happens *inside*
+        this guard on purpose: an explicit early flush must not raise where the
+        translation can't see it.
+
+        When ``product`` is given it is refreshed **before** the commit, so server
+        defaults / updated columns are read inside the same transaction — a
+        connection blip after durability can't turn a committed write into a 500.
         """
         try:
+            await self._session.flush()
+            if product is not None:
+                await self._session.refresh(product)
             await self._session.commit()
         except StaleDataError as exc:
             await self._session.rollback()
@@ -157,8 +166,7 @@ class CatalogRepository:
         )
         self._session.add(product)
         self._session.add(self._outbox_row(outbox))
-        await self._session.commit()
-        await self._session.refresh(product)
+        await self._commit_versioned(product=product)
         return product
 
     async def update_product(self, product: Product, changes: dict[str, object], outbox: OutboxMessage) -> Product:
@@ -172,8 +180,7 @@ class CatalogRepository:
         for field, value in changes.items():
             setattr(product, field, value)
         self._session.add(self._outbox_row(outbox))
-        await self._commit_versioned()
-        await self._session.refresh(product)
+        await self._commit_versioned(product=product)
         return product
 
     async def soft_delete_product(self, product: Product, outbox: OutboxMessage) -> None:
@@ -399,7 +406,6 @@ class CatalogRepository:
             {"id": product_id, "token": upload_token, "delay": delay_seconds, "pending": ImageStatus.PENDING.value},
         )
         await self._session.commit()
-        await self._session.commit()
 
     async def current_image_key(self, product_id: uuid.UUID) -> str | None:
         """The **live** product's current ``image_key`` (``None`` if absent/deleted).
@@ -496,7 +502,11 @@ class CatalogRepository:
 
         Returns the ``RETURNING`` row (``None`` when the guards rejected the write).
         """
-        row = result.mappings().first()
+        mapping = result.mappings().first()
+        # Plain dict, not the RowMapping view: the declared contract is
+        # Mapping[str, Any] (what the outbox factory consumes), and the view
+        # must not outlive the commit below.
+        row = dict(mapping) if mapping is not None else None
         if row is not None and outbox is not None:
             self._session.add(self._outbox_row(outbox(row)))
         await self._session.commit()

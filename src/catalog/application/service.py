@@ -86,8 +86,10 @@ class CatalogService:
     # instead of hitting the DB. It waits *while the lock is actively held* (the
     # holder renews it during a slow read), so there is no arbitrary time ceiling
     # that could let a waiter race the DB during a legitimately slow fill. The wait
-    # is still bounded: a crashed holder stops renewing, the lock lapses, and one
-    # waiter promotes itself to filler.
+    # is still bounded two ways: a crashed holder stops renewing, the lock lapses,
+    # and one waiter promotes itself to filler — and a wedged fill (renewals keep
+    # succeeding while the DB never answers) hits ``max_fill_wait_seconds``, after
+    # which waiters read the DB themselves rather than hang.
     _FILL_WAIT_SECONDS = 0.05
 
     def __init__(
@@ -97,6 +99,7 @@ class CatalogService:
         cache: ProductCachePort | None = None,
         *,
         lock_ttl_seconds: int | None = None,
+        max_fill_wait_seconds: float | None = None,
         image_base_url: str | None = None,
         image_max_upload_bytes: int | None = None,
         image_upload_ttl_seconds: int | None = None,
@@ -121,12 +124,22 @@ class CatalogService:
         # injected settings the cache adapter uses (passed by the container), not a
         # second read of the global settings, so the renew cadence can't drift from
         # the actual lock TTL under an injected/overridden config.
-        if lock_ttl_seconds is None:
-            # The field's declared default, not ``get_settings()``: every real call
-            # site injects the configured TTL, so building a service must not require
-            # a fully-configured environment (and can't drift from the config default).
-            lock_ttl_seconds = AppSettings.model_fields["product_cache_lock_ttl_seconds"].default
-        self._lock_renew_seconds = max(0.5, lock_ttl_seconds / 2)
+        # The field's declared default, not ``get_settings()``: every real call
+        # site injects the configured TTL, so building a service must not require
+        # a fully-configured environment (and can't drift from the config default).
+        # Bound to a local so the ``None`` case is narrowed once, here, instead of
+        # at each use (the model_fields default is untyped ``Any``).
+        lock_ttl: int = (
+            lock_ttl_seconds
+            if lock_ttl_seconds is not None
+            else AppSettings.model_fields["product_cache_lock_ttl_seconds"].default
+        )
+        self._lock_renew_seconds = max(0.5, lock_ttl / 2)
+        self._max_fill_wait_seconds = (
+            max_fill_wait_seconds
+            if max_fill_wait_seconds is not None
+            else AppSettings.model_fields["product_cache_max_fill_wait_seconds"].default
+        )
 
     def _to_response(self, product: object) -> ProductResponse:
         """Map a domain product (or decoded cache entry) to the response schema.
@@ -204,15 +217,18 @@ class CatalogService:
         """Fetch one product straight from the repository (no cache).
 
         Any repository error is wrapped in :class:`_RepositoryFailure` so the
-        cache-fault boundary in :meth:`_get_product_cached` can't swallow it.
+        cache-fault boundary in :meth:`_get_product_cached` can't swallow it. The
+        row→response mapping sits inside the same boundary: a shaping failure
+        (e.g. an unresolvable public image base) must be labelled as what it is,
+        not misread as a cache fault and silently retried against the DB.
         """
         try:
             row = await self._repo.get_product(product_id)
+            if row is None:
+                return None
+            return self._to_response(to_domain(row))
         except Exception as exc:
             raise _RepositoryFailure(str(exc)) from exc
-        if row is None:
-            return None
-        return self._to_response(to_domain(row))
 
     async def _read_through(self, product_id: uuid.UUID) -> ProductResponse | None:
         """Fill the cache on a miss with exactly one DB read across concurrent callers.
@@ -289,8 +305,16 @@ class CatalogService:
         read, so there is no fixed timeout that could let us race the DB mid-fill.
         Once the lock is gone we serve the freshly-cached value (a real hit or a
         negative-cached 404), or promote to filler if there is none (holder crashed).
+
+        The total wait is still capped at ``max_fill_wait_seconds``: renewals are a
+        Valkey op and succeed even when the DB behind the fill has wedged, so an
+        unbounded wait would turn a DB brownout into a request pileup that hammers
+        Valkey twice per waiter per poll. Past the cap each caller reads the DB
+        itself — a bounded duplicate read, never stored (no lock), so correctness
+        is untouched; only load-shaping changes.
         """
         assert self._cache is not None
+        deadline = asyncio.get_running_loop().time() + self._max_fill_wait_seconds
         while await self._cache.fill_lock_held(product_id):
             cached = await self._cache.get(product_id)
             if cached is not None:
@@ -298,6 +322,11 @@ class CatalogService:
                 if hit:
                     return value
                 break  # corrupt entry evicted → stop waiting, promote to filler
+            if asyncio.get_running_loop().time() >= deadline:
+                log.warning(
+                    "product fill for %s exceeded %.1fs; serving from DB", product_id, self._max_fill_wait_seconds
+                )
+                return await self._load_product(product_id)
             await asyncio.sleep(self._FILL_WAIT_SECONDS)
         cached = await self._cache.get(product_id)
         if cached is not None:
