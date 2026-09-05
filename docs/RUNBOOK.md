@@ -233,18 +233,31 @@ SQS redelivers the message for reprocessing — the invalidation is never silent
 handler error releases the lease (only if still ours) immediately so redrive is instant. The
 token makes the lease owner-safe: a worker whose lease already expired can never overwrite or
 delete a lease a *different* worker has since claimed. `bus_bootstrap` sets the local queue's
-visibility timeout from `CONSUMER_LEASE_TTL_SECONDS`; keep the same invariant in Terraform.
+visibility timeout to **2×** `CONSUMER_LEASE_TTL_SECONDS` — the lease is claimed *after* receive,
+so strict inequality is what keeps a crash mid-handle from burning a redrive receive;
 
 **Staleness bound.** Invalidation is eventual: bounded by the outbox relay poll interval + the
 queue latency + the entry TTL (`PRODUCT_CACHE_TTL_SECONDS` + jitter) as the ultimate backstop. A
 brief read of a just-updated product may serve the prior value until the event drains — this is
-the accepted cache-aside trade-off (the write path is never blocked on cache).
+the accepted cache-aside trade-off (the write path is never blocked on cache). Two more bounded
+windows, by design:
+
+- **Stale 404 after create (~10s).** A miss is negative-cached under
+  `PRODUCT_CACHE_NEGATIVE_TTL_SECONDS`; `ProductCreated` is deliberately not consumed, so a
+  product created within that window of a prior 404 read stays invisible until the tombstone
+  expires.
+- **Fill-wait ceiling (`PRODUCT_CACHE_MAX_FILL_WAIT_SECONDS`, 2s).** Waiters normally wait for a
+  slow fill (the holder renews the lock), but a *wedged* DB read would renew forever — past the
+  ceiling each waiter serves itself from the DB. Expect duplicate DB reads (never stale writes)
+  during a brownout; alert on the "product fill ... exceeded" warnings, not on correctness.
 
 | Symptom | Likely cause | Action |
 |---|---|---|
 | Product reads serve stale data | cache worker down / `catalog-cache` not draining | check the worker task is running + healthy; inspect queue depth; TTL still bounds staleness |
 | `catalog-cache-dlq` non-empty | repeated handler errors (Valkey unreachable) | inspect a DLQ message, fix Valkey connectivity, redrive (§4) — invalidation is idempotent, replay is safe |
 | Cache never populates | `PRODUCT_CACHE_ENABLED=false` or Valkey down | app degrades to DB-only reads (correct, just slower); restore Valkey |
+| Newly created product 404s briefly | negative-cache tombstone from an earlier miss | self-heals within `PRODUCT_CACHE_NEGATIVE_TTL_SECONDS`; no action |
+| Burst of "product fill exceeded" warnings | DB reads wedging behind the fill lock | check Postgres health/locks; reads are shedding to the DB by design |
 
 **Monitoring.** Alarm on `catalog-cache-dlq` `ApproximateNumberOfMessagesVisible > 0`; watch the
 `catalog-cache` queue depth + oldest-message age (worker liveness). Losing the worker degrades
@@ -300,6 +313,58 @@ by hand: `ops/prometheus/inventory-reaper-alerts.yaml` (`InventoryReaperBacklog`
 `InventoryReaperDown`, `InventoryReaperNotRunning`), fed by the postgres_exporter query in
 `ops/prometheus/postgres-exporter-queries.yaml` — which scrapes Postgres, so it keeps
 reporting when the reaper is dead.
+
+### 9. Payment reconciliation (charges stuck `pending`)
+
+Payment confirmation is async: the gateway confirms via **webhook**
+(`POST /v1/payments/webhook`, HMAC-verified with `PAYMENT_WEBHOOK_SECRET` — refused,
+never processed unsigned). A missed webhook would strand a paid charge in
+`pending` forever, so the `service`-role **payment reconciler**
+(`python -m src.payments.adapters.reconciler`) polls in two sweeps: every pass takes
+the oldest still-`pending` charges inside the
+`[PAYMENT_RECONCILIATION_GRACE_SECONDS, PAYMENT_RECONCILIATION_MAX_AGE_SECONDS]`
+window, asks the gateway what happened (`lookup` by idempotency key), and applies
+the answer through the same guarded `pending → succeeded|failed` transition the
+webhook uses. Rows older than the max age whose `lookup` affirmatively returns
+"never saw it" are *abandoned* (guarded flip to `failed` with reason
+`abandoned_by_reconciler` + `PaymentFailed`) instead of asked about forever — a
+failed lookup still postpones, so a down gateway abandons nothing. Duplicate and
+**out-of-order** notifications are no-ops by construction; the outcome is decided
+exactly once, and its event rides the transactional outbox with the flip.
+
+Idempotency is two-layered: our `UNIQUE(payments.idempotency_key)` row dedup, plus
+the key propagated to the **gateway itself**, so a retried charge cannot double-charge
+even if our row were lost. Card data never touches these paths — only a hosted-
+checkout token (anything PAN-shaped is rejected at the boundary).
+
+| Symptom | Likely cause | Action |
+|---|---|---|
+| Charges stuck `pending` past grace | reconciler down, or gateway `lookup` failing | check the task is running + healthy; inspect its logs for repeated lookup warnings |
+| Webhooks all rejected 401 | secret drift between gateway config and `PAYMENT_WEBHOOK_SECRET` | rotate the secret on both sides; deliveries are retried by the provider |
+| 404s from `/v1/payments/webhook` | gateway pointed at the wrong environment/realm | fix the gateway config — do not widen acceptance |
+| `PaymentFailed` with reason `abandoned_by_reconciler` | checkout died between row-create and gateway charge, or the provider lost it | find the order's checkout logs; the charge never landed gateway-side, so retrying checkout with a NEW idempotency key is safe |
+| Sudden `PaymentFailed` spike | upstream decline event or fail-token misconfiguration in tests | compare against gateway-side decline metrics before assuming a code fault |
+
+```bash
+# Manual one-shot sweep (same image, service role)
+aws ecs run-task --cluster ecommerce --task-definition ecommerce-reconciler \
+  --overrides '{"containerOverrides":[{"name":"app","command":["python","-m","src.payments.adapters.reconciler","--once"]}]}'
+```
+
+```sql
+-- THE reconciliation alert: charges awaiting confirmation. Healthy = near zero.
+SELECT count(*) FROM payments.payments WHERE status = 'pending' AND created_at <= now() - interval '60 seconds';
+-- Abandoned charges (gateway affirmatively never saw them). A spike means
+-- checkouts are dying before reaching the gateway — investigate upstream.
+SELECT count(*) FROM payments.payments WHERE status = 'failed' AND failure_reason = 'abandoned_by_reconciler' AND updated_at >= now() - interval '1 day';
+-- Outcome split over time (a healthy ledger is mostly `succeeded`):
+SELECT status, count(*) FROM payments.payments GROUP BY status;
+```
+
+**Monitoring.** The reconciler exports its own counters via `WORKER_METRICS_PORT`
+(looping) or Pushgateway (`--once`). Liveness signal is the stuck-pending query above
+— a sustained non-zero count means it is down or falling behind (postgres_exporter
+keeps answering when the worker is dead).
 
 ## Post-incident
 - Re-enable automated backups on the promoted instance.

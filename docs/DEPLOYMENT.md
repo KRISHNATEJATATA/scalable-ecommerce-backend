@@ -39,6 +39,7 @@ depth):
 | Image worker | `python -m src.catalog.adapters.image_worker` | `image-uploads` | sniff · re-encode · thumbnails → `image_status` |
 | Cache worker | `python -m src.catalog.adapters.cache_worker` | `catalog-cache` | invalidate Valkey read-cache on `ProductUpdated`/`ProductDeleted` |
 | Reservation reaper | `python -m src.inventory.adapters.reaper` | Postgres `reservations` | release holds past `expires_at` (SKIP LOCKED) so a stalled saga can't leak stock |
+| Payment reconciler | `python -m src.payments.adapters.reconciler` | Postgres `payments` | resolve charges still `pending` past their grace window by asking the gateway (missed-webhook backstop) |
 
 The reaper polls Postgres, not a queue: run it as a small always-on service, or as
 an **EventBridge-scheduled one-off task** with `--once` (it exits after a single
@@ -54,12 +55,16 @@ or `METRICS_PUSHGATEWAY_URL` (`--once`); see `docs/RUNBOOK.md` §8. Set
 The **image and cache workers** drain a standard SQS queue with a DLQ; set the queue
 **visibility timeout ≥ the consumer's processing lease** (`CONSUMER_LEASE_TTL_SECONDS`)
 so a crashed worker's in-flight message is redelivered rather than lost or
-double-processed. The **relay and reaper poll Postgres instead** (`outbox` and
-`reservations`, both `FOR UPDATE SKIP LOCKED`) — no queue, no visibility timeout;
-their pacing is `RELAY_POLL_INTERVAL_SECONDS` / `RESERVATION_REAPER_POLL_INTERVAL_SECONDS`.
+double-processed. The **relay, reaper, and payment reconciler poll Postgres instead**
+(`outbox`, `reservations`, `payments`), so their pacing is
+`RELAY_POLL_INTERVAL_SECONDS` / `RESERVATION_REAPER_POLL_INTERVAL_SECONDS` /
+`PAYMENT_RECONCILIATION_POLL_INTERVAL_SECONDS`. The reconciler needs no extra IAM:
+it speaks to the gateway over HTTPS from whatever egress the task already has.
 Losing the cache worker degrades read latency (more DB reads, staleness bounded by
 `PRODUCT_CACHE_TTL_SECONDS`) but is not a correctness incident; losing the relay or
-image worker stalls events/uploads until it recovers (both replay safely).
+image worker stalls events/uploads until it recovers (both replay safely). Losing
+the reconciler strands paid charges in `pending` (and their orders with them) until
+it returns — alarm on the stuck-pending count in RUNBOOK §9.
 
 **Topic ARNs.** Terraform provisions the per-event-type SNS topics, so give the relay task
 role `sns:Publish` only and point `BUS_TOPIC_ARN_PREFIX` at the ARN namespace
@@ -92,7 +97,7 @@ Workers are single-task loops holding one session at a time, so they use the sma
 worker pool automatically (`create_engine(settings, worker=True)`) — at the API's sizing
 four workers would have burned ~60 connections for nothing. At the defaults ten API tasks
 plus four workers is ~308, which fits but leaves little headroom: past that, either shrink
-`DB_POOL_SIZE`/`WEB_CONCURRENCY` or front RDS with **RDS Proxy / PgBouncer** (tickets 19–20)
+`DB_POOL_SIZE`/`WEB_CONCURRENCY` or front RDS with **RDS Proxy / PgBouncer**
 rather than raising `max_connections`.
 
 **Health checks.** Point the ALB at `/v1/ready` and set its timeout **above**
