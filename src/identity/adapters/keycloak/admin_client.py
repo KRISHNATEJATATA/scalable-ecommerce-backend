@@ -12,11 +12,48 @@ passed straight through as the admin ``user_id``.
 from __future__ import annotations
 
 import asyncio
+import functools
+from collections.abc import Awaitable, Callable
+from typing import TypeVar
 
-from keycloak.exceptions import KeycloakGetError
+from keycloak.exceptions import KeycloakError, KeycloakGetError
 
 from keycloak import KeycloakAdmin, KeycloakOpenIDConnection
 from src.shared.config.setting import AppSettings
+from src.shared.errors.exceptions import KeycloakConflictError, KeycloakEntityNotFoundError
+
+_T = TypeVar("_T")
+
+
+def _translate(exc: KeycloakError) -> Exception:
+    """Map Keycloak's status-carrying errors onto purpose-named ones.
+
+    404 (unknown user ``sub`` / realm role) and 409 (email/username already
+    taken) are caller-fixable outcomes that must reach the admin as 404/409 —
+    falling through here meant the 500 boundary answered them. Anything else
+    (401 expired token, 403 missing service-account role, 5xx outage) stays as
+    raised: a genuine server/dependency fault.
+    """
+    code = getattr(exc, "response_code", None)
+    if code == 404:
+        return KeycloakEntityNotFoundError()
+    if code == 409:
+        return KeycloakConflictError("a Keycloak account with this email already exists")
+    return exc
+
+
+def map_admin_errors[**P](fn: Callable[P, Awaitable[_T]]) -> Callable[P, Awaitable[_T]]:
+    """Translate ``KeycloakError`` on the wrapped Admin-API call (see :func:`_translate`)."""
+
+    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> _T:
+        try:
+            return await fn(*args, **kwargs)
+        except KeycloakGetError as exc:
+            raise _translate(exc) from exc
+        except KeycloakError as exc:
+            raise _translate(exc) from exc
+
+    return functools.wraps(fn)(wrapper)
 
 
 class KeycloakIdentityAdmin:
@@ -44,16 +81,19 @@ class KeycloakIdentityAdmin:
             self._admin = KeycloakAdmin(connection=connection)
         return self._admin
 
+    @map_admin_errors
     async def grant_realm_role(self, user_sub: str, role: str) -> None:
         kc = await self._client()
         role_rep = await kc.a_get_realm_role(role)
         await kc.a_assign_realm_roles(user_sub, [role_rep])
 
+    @map_admin_errors
     async def revoke_realm_role(self, user_sub: str, role: str) -> None:
         kc = await self._client()
         role_rep = await kc.a_get_realm_role(role)
         await kc.a_delete_realm_roles_of_user(user_sub, [role_rep])
 
+    @map_admin_errors
     async def set_enabled(self, user_sub: str, enabled: bool) -> None:
         kc = await self._client()
         await kc.a_update_user(user_sub, {"enabled": enabled})
@@ -93,19 +133,23 @@ class KeycloakIdentityAdmin:
         account is deleted, so a retry starts clean instead of colliding with an
         orphaned half-provisioned user on Keycloak's own email/username uniqueness.
         The compensating delete is shielded so a cancellation can't abort the cleanup
-        itself.
+        itself. A duplicate email/username surfaces as :class:`KeycloakConflictError`
+        (409) — the account already exists — instead of a raw 500.
         """
         kc = await self._client()
         actions = ["UPDATE_PASSWORD", "VERIFY_EMAIL"]
-        user_sub = await kc.a_create_user(
-            {
-                "email": email,
-                "username": email,
-                "enabled": True,
-                "emailVerified": False,
-                "requiredActions": actions,
-            }
-        )
+        try:
+            user_sub = await kc.a_create_user(
+                {
+                    "email": email,
+                    "username": email,
+                    "enabled": True,
+                    "emailVerified": False,
+                    "requiredActions": actions,
+                }
+            )
+        except KeycloakError as exc:
+            raise _translate(exc) from exc
         try:
             await kc.a_send_update_account(user_id=user_sub, payload=actions)
         except BaseException:

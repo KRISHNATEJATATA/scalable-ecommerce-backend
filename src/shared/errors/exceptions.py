@@ -136,3 +136,29 @@ class DependencyUnavailableError(Exception):
     def __init__(self, detail: str = "a required dependency is unavailable") -> None:
         super().__init__(detail)
         self.detail = detail
+
+
+class KeycloakEntityNotFoundError(Exception):
+    """The referenced Keycloak entity (user ``sub``, realm role) does not exist → 404.
+
+    Raised instead of letting ``python-keycloak``'s raw error fall through to the
+    500 boundary: an admin acting on an unknown/deleted account is a caller-fixable
+    outcome, not a server fault.
+    """
+
+    def __init__(self, detail: str = "the referenced Keycloak entity does not exist") -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+class KeycloakConflictError(Exception):
+    """Keycloak rejected the write because it contradicts existing state → 409.
+
+    Today the one producer is account creation against an email/username that
+    already exists — a retryable-by-correction outcome that must not surface as
+    a permanent-looking 500.
+    """
+
+    def __init__(self, detail: str = "Keycloak state conflicts with this request") -> None:
+        super().__init__(detail)
+        self.detail = detail
