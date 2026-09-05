@@ -109,6 +109,11 @@ class ProductResponse(BaseModel):
     # → unsigned CDN URL), or ``null`` when there is no ready image. Advertised so
     # clients don't have to reconstruct the ``_{name}.webp`` key convention.
     image_thumbnail_urls: dict[str, str] | None = None
+    # Purchasable units (``on_hand − reserved`` from inventory), attached by the
+    # service *after* the cache-aside read on every response and never stored in
+    # the cached payload. ``null`` = unknown (no stock row), never zero; ``0`` =
+    # known out of stock. Always present on the wire (explicit ``null``).
+    available: int | None = None
 
 
 class ProductCreate(BaseModel):

@@ -32,6 +32,20 @@ class InvalidUploadError(ValueError):
         self.detail = detail
 
 
+class InvalidCartOperationError(ValueError):
+    """A cart mutation fails server-side boundary limits → 400.
+
+    Non-positive or over-cap quantities, or a new line past the max-items cap —
+    the cart is client-input-shaped state and must not become a Valkey
+    memory-amplification vector. Distinct from 404 (unknown product / absent
+    line): nothing about the catalog would make *this* request valid.
+    """
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
 class InvalidPaymentMethodError(ValueError):
     """The payment-method token is unusable → 400.
 

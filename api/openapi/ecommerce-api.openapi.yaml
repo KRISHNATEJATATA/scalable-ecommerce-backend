@@ -22,6 +22,8 @@ tags:
     description: OIDC resource-server identity — the local user mirror and Keycloak admin management
   - name: catalog
     description: Product catalog — merchant product CRUD and the shopper listing
+  - name: cart
+    description: Pre-checkout basket — per-caller Valkey state, no pagination
 paths:
   /v1/products:
     get:
@@ -237,6 +239,124 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+  /v1/cart:
+    get:
+      tags: [cart]
+      operationId: getCart
+      summary: Get the caller's cart
+      description: >-
+        Returns the caller's Valkey basket. An empty cart is `200
+        {items: [], ...}`, never 404. Carts expire after inactivity and can be
+        emptied by storage eviction — handle "suddenly empty" as normal.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: The caller's cart.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Cart"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    delete:
+      tags: [cart]
+      operationId: clearCart
+      summary: Clear the whole cart
+      description: Empties the caller's cart.
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: Cart cleared.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/cart/items:
+    post:
+      tags: [cart]
+      operationId: addCartItem
+      summary: Add a line to the cart (or increment it)
+      description: >-
+        Adds the line or increments the existing line; an increment past the
+        per-line cap clamps to the cap. Quantity out of range or a full cart →
+        400; unknown or soft-deleted product → 404.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CartAddItem"
+      responses:
+        "200":
+          description: The caller's cart.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Cart"
+        "400":
+          description: Quantity out of range, or the cart holds the max lines.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/cart/items/{product_id}:
+    parameters:
+      - $ref: "#/components/parameters/ProductId"
+    patch:
+      tags: [cart]
+      operationId: setCartItemQuantity
+      summary: Set a cart line's quantity
+      description: >-
+        Sets the line quantity; `0` removes the line. Out of range → 400; line
+        not in cart, or its product gone (the stale line is pruned as part of
+        answering), → 404.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CartUpdateItem"
+      responses:
+        "200":
+          description: The caller's cart.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Cart"
+        "400":
+          description: Quantity out of range.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [cart]
+      operationId: removeCartItem
+      summary: Remove a cart line
+      description: Removes the line. Idempotent — an absent line still answers 200.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: The caller's cart.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Cart"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
   /v1/me:
     get:
       tags: [identity]
@@ -553,13 +673,20 @@ components:
           description: >-
             Unsigned CDN URLs for the generated thumbnails of a `ready` image, keyed by
             rendition name (`thumb_256`, `thumb_64`); `null` when there is no ready image.
+        available:
+          type: [integer, "null"]
+          minimum: 0
+          description: >-
+            Purchasable units (`on_hand − reserved` from inventory), attached fresh on
+            every response (never cached). `null` = unknown (no stock row), never
+            zero; `0` = known out of stock.
         created_at:
           type: string
           format: date-time
         updated_at:
           type: string
           format: date-time
-      required: [id, merchant_id, name, description, category, price, image_key, image_status, image_url, image_thumbnail_urls, created_at, updated_at]
+      required: [id, merchant_id, name, description, category, price, image_key, image_status, image_url, image_thumbnail_urls, available, created_at, updated_at]
     ProductCreate:
       description: Merchant create payload. `merchant_id` is bound from the caller, never from input. `image_key`/`image_status` are worker-owned and not accepted here.
       type: object
@@ -648,6 +775,58 @@ components:
       # next_cursor is always present (explicitly null on the last page), so it is
       # required — clients must not have to distinguish "absent" from "null".
       required: [items, next_cursor]
+    CartItem:
+      description: One cart line — a product snapshot plus the chosen quantity.
+      type: object
+      properties:
+        product_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          description: Snapshot, refreshed automatically on product edits.
+        unit_price:
+          type: string
+          description: Decimal (money) serialized as a string.
+        image_url:
+          type: [string, "null"]
+        quantity:
+          type: integer
+          minimum: 1
+      required: [product_id, name, unit_price, image_url, quantity]
+    Cart:
+      description: "The caller's basket. Empty cart is `{items: [], ...}`, never 404."
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/CartItem"
+        updated_at:
+          type: string
+          format: date-time
+      required: [items, updated_at]
+    CartAddItem:
+      description: Add-to-cart payload — the line is created or incremented (clamped to the cap).
+      type: object
+      additionalProperties: false
+      properties:
+        product_id:
+          type: string
+          format: uuid
+        quantity:
+          type: integer
+          description: Out-of-range quantities answer 400 (server caps, not schema).
+      required: [product_id, quantity]
+    CartUpdateItem:
+      description: Set-quantity payload — `0` removes the line.
+      type: object
+      additionalProperties: false
+      properties:
+        quantity:
+          type: integer
+          description: Out-of-range quantities answer 400 (server caps, not schema).
+      required: [quantity]
     Problem:
       description: RFC 9457 Problem Details (the one flat error shape).
       type: object

@@ -39,11 +39,16 @@ from src.shared.container import get_image_store
 from src.shared.errors.exceptions import ConcurrentUpdateError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-MODULES = ["identity", "catalog"]
+MODULES = ["identity", "catalog", "inventory"]
 ISSUER = "https://keycloak.test/realms/ecommerce"
 AUDIENCE = "ecommerce-api"
 
-_TRUNCATE = text("TRUNCATE catalog.products, catalog.outbox, identity.users CASCADE")
+# Inventory rides along: product reads compose `available` through the inventory
+# service, so the stock table must exist (prod migrates every module together).
+_TRUNCATE = text(
+    "TRUNCATE catalog.products, catalog.outbox, identity.users, "
+    "inventory.reservations, inventory.inventory, inventory.outbox CASCADE"
+)
 
 
 # --- keypair + token helpers (mirrors test_auth) --------------------------

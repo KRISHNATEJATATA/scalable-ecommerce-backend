@@ -30,6 +30,16 @@ class InventoryRepositoryPort(Protocol):
         """The stock row for ``sku``, or ``None`` if the SKU has no inventory."""
         ...
 
+    async def get_many_by_skus(self, skus: list[str]) -> dict[str, Any]:
+        """The stock rows for ``skus`` as ``{sku: row}``, in one query.
+
+        SKUs with no row are simply absent from the map (unknown, not zero).
+        Exists so a product listing attaches availability with one stock query
+        instead of one per item; the single-row :meth:`get_by_sku` stays for its
+        current callers.
+        """
+        ...
+
     async def try_reserve_decrement(self, sku: str, qty: int) -> int:
         """The raw CAS primitive: bump ``reserved`` only if free stock covers ``qty``.
 

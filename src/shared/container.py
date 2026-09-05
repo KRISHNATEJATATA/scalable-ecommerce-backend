@@ -11,15 +11,21 @@ storage/payment/bus ports land with their feature tickets.
 
 from __future__ import annotations
 
+import uuid
 from typing import Annotated
 
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.cart.adapters.valkey.repository import ValkeyCartRepository
+from src.cart.application.service import CartService
+from src.cart.ports.products import CartProductPort, ProductSnapshot
+from src.cart.ports.repository import CartRepositoryPort
 from src.catalog.adapters.cache import ValkeyProductCache
 from src.catalog.adapters.db.repository import CatalogRepository
 from src.catalog.adapters.s3_images import ImageStore
 from src.catalog.application.service import CatalogService
+from src.catalog.ports.availability import StockAvailabilityPort
 from src.catalog.ports.cache import ProductCachePort
 from src.catalog.ports.repository import CatalogRepositoryPort
 from src.catalog.ports.storage import ImageStorePort
@@ -41,9 +47,45 @@ from src.payments.ports.gateway import PaymentGatewayPort
 from src.payments.ports.repository import PaymentsRepositoryPort
 from src.shared.auth.dependencies import PrincipalDep
 from src.shared.db.session import get_session
-from src.shared.errors.exceptions import AuthenticationError, AuthorizationError
+from src.shared.errors.exceptions import (
+    AuthenticationError,
+    AuthorizationError,
+    DependencyUnavailableError,
+)
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
+
+
+# --- inventory ------------------------------------------------------------
+def get_inventory_repository(session: SessionDep) -> InventoryRepositoryPort:
+    """Provide the inventory repository bound to the request session (port-typed)."""
+    return InventoryRepository(session)
+
+
+def get_inventory_service(
+    request: Request,
+    repo: Annotated[InventoryRepositoryPort, Depends(get_inventory_repository)],
+) -> InventoryService:
+    """Provide the inventory service over its repository port."""
+    return InventoryService(repo, reservation_ttl_seconds=request.app.state.settings.reservation_ttl_seconds)
+
+
+class InventoryStockAvailability(StockAvailabilityPort):
+    """Catalog's :class:`StockAvailabilityPort` built over the inventory service.
+
+    Lives here — the one place allowed to touch every module — so catalog never
+    names inventory (the ``module-independence`` contract forbids even
+    application-layer imports between them). Read-only: a missing stock row is
+    absent from the map (unknown), never zero.
+    """
+
+    def __init__(self, inventory: InventoryService) -> None:
+        self._inventory = inventory
+
+    async def available_for(self, skus: list[str]) -> dict[str, int]:
+        """Purchasable units per stocked SKU (``max(on_hand - reserved, 0)``)."""
+        rows = await self._inventory.get_many_by_skus(skus)
+        return {sku: max(row.on_hand - row.reserved, 0) for sku, row in rows.items()}
 
 
 # --- catalog --------------------------------------------------------------
@@ -86,6 +128,7 @@ def get_catalog_service(
     repo: Annotated[CatalogRepositoryPort, Depends(get_catalog_repository)],
     image_store: Annotated[ImageStorePort | None, Depends(get_image_store)],
     cache: Annotated[ProductCachePort | None, Depends(get_product_cache)],
+    inventory: Annotated[InventoryService, Depends(get_inventory_service)],
 ) -> CatalogService:
     """Provide the catalog service over its repository + image-store + cache ports."""
     settings = request.app.state.settings
@@ -93,6 +136,7 @@ def get_catalog_service(
         repo,
         image_store,
         cache,
+        availability=InventoryStockAvailability(inventory),
         lock_ttl_seconds=settings.product_cache_lock_ttl_seconds,
         max_fill_wait_seconds=settings.product_cache_max_fill_wait_seconds,
         image_base_url=settings.image_public_base_url,
@@ -110,20 +154,6 @@ def get_orders_repository(session: SessionDep) -> OrdersRepositoryPort:
 def get_orders_service(repo: Annotated[OrdersRepositoryPort, Depends(get_orders_repository)]) -> OrdersService:
     """Provide the orders service over its repository port."""
     return OrdersService(repo)
-
-
-# --- inventory ------------------------------------------------------------
-def get_inventory_repository(session: SessionDep) -> InventoryRepositoryPort:
-    """Provide the inventory repository bound to the request session (port-typed)."""
-    return InventoryRepository(session)
-
-
-def get_inventory_service(
-    request: Request,
-    repo: Annotated[InventoryRepositoryPort, Depends(get_inventory_repository)],
-) -> InventoryService:
-    """Provide the inventory service over its repository port."""
-    return InventoryService(repo, reservation_ttl_seconds=request.app.state.settings.reservation_ttl_seconds)
 
 
 # --- identity -------------------------------------------------------------
@@ -170,6 +200,64 @@ async def get_current_db_user(
 
 
 CurrentUserDep = Annotated[UserResponse, Depends(get_current_db_user)]
+
+
+# --- cart -------------------------------------------------------------------
+def get_cart_repository(request: Request) -> CartRepositoryPort:
+    """Provide the Valkey cart repository (rolling TTL from settings).
+
+    Valkey is required for carts — unlike the product read-cache there is no
+    DB to degrade to — so a missing client is 503, not a silent fallback.
+    """
+    valkey = getattr(request.app.state, "valkey", None)
+    if valkey is None:
+        raise DependencyUnavailableError("cart storage is not configured")
+    return ValkeyCartRepository(valkey, ttl_seconds=request.app.state.settings.cart_ttl_seconds)
+
+
+class CatalogCartProducts(CartProductPort):
+    """Cart's :class:`CartProductPort` built over the catalog service.
+
+    Lives here — the one place allowed to touch every module — so cart never
+    names catalog. Read-only: ``None`` means unknown or soft-deleted.
+    """
+
+    def __init__(self, catalog: CatalogService) -> None:
+        self._catalog = catalog
+
+    async def get_snapshot(self, product_id: uuid.UUID) -> ProductSnapshot | None:
+        """The product's current snapshot, or ``None`` if unknown/soft-deleted."""
+        product = await self._catalog.get_product(product_id)
+        if product is None:
+            return None
+        return ProductSnapshot(
+            product_id=product.id,
+            name=product.name,
+            unit_price=product.price,
+            image_url=product.image_url,
+        )
+
+
+def get_cart_products(
+    catalog: Annotated[CatalogService, Depends(get_catalog_service)],
+) -> CartProductPort:
+    """Provide the catalog-backed product snapshots for cart lines."""
+    return CatalogCartProducts(catalog)
+
+
+def get_cart_service(
+    request: Request,
+    repo: Annotated[CartRepositoryPort, Depends(get_cart_repository)],
+    products: Annotated[CartProductPort, Depends(get_cart_products)],
+) -> CartService:
+    """Provide the cart service over its repository + product-snapshot ports."""
+    settings = request.app.state.settings
+    return CartService(
+        repo,
+        products,
+        max_items=settings.cart_max_items,
+        max_qty_per_line=settings.cart_max_qty_per_line,
+    )
 
 
 # --- payments -------------------------------------------------------------

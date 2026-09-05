@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help install run lint test migrate compose-up compose-down hooks gen-alembic-env relay bus-setup s3-setup image-worker cache-worker reaper
+.PHONY: help install run lint typecheck test migrate compose-up compose-down hooks gen-alembic-env relay bus-setup s3-setup image-worker cache-worker cart-consumer reaper
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS=":.*?## "}; {printf "%-14s %s\n", $$1, $$2}'
@@ -17,6 +17,9 @@ lint: ## Ruff check + format check + import-linter (module boundaries)
 	ruff check src tests
 	ruff format --check src tests
 	lint-imports
+
+typecheck: ## Run basedpyright (advisory only — baseline carries pre-existing errors; NOT wired into lint/CI)
+	basedpyright src
 
 test: ## Run the unit test suite (coverage reported, not gated)
 	pytest tests/unit/
@@ -42,6 +45,9 @@ image-worker: ## Run the image worker (service role; S3 ObjectCreated → sniff/
 
 cache-worker: ## Run the catalog cache-invalidation worker (service role; ProductUpdated/Deleted → evict)
 	python -m src.catalog.adapters.cache_worker
+
+cart-consumer: ## Run the cart product-event worker (service role; ProductUpdated/Deleted → refresh/prune carts)
+	python -m src.cart.adapters.cart_consumer
 
 reaper: ## Run the reservation reaper (service role; releases expired stock holds)
 	python -m src.inventory.adapters.reaper

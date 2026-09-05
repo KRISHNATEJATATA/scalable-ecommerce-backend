@@ -133,6 +133,14 @@ class InventoryRepository:
         stmt = select(Inventory).where(Inventory.sku == sku)
         return (await self._session.execute(stmt)).scalar_one_or_none()
 
+    async def get_many_by_skus(self, skus: list[str]) -> dict[str, Inventory]:
+        """The stock rows for ``skus`` as ``{sku: row}`` (one ``WHERE sku IN`` query)."""
+        if not skus:
+            return {}
+        stmt = select(Inventory).where(Inventory.sku.in_(skus))
+        rows = (await self._session.execute(stmt)).scalars().all()
+        return {row.sku: row for row in rows}
+
     async def try_reserve_decrement(self, sku: str, qty: int) -> int:
         """The atomic conditional decrement; rowcount 1 = reserved, 0 = rejected."""
         result = await self._session.execute(_DECREMENT_SQL, {"sku": sku, "qty": qty})

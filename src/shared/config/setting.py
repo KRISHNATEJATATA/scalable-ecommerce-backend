@@ -197,6 +197,17 @@ class AppSettings(BaseSettings):
     # local queue visibility from this value.
     consumer_lease_ttl_seconds: int = Field(default=60, gt=0)
 
+    # --- Cart (Valkey-only pre-checkout basket) ---
+    # The cart is client-input-shaped state: both caps keep one caller from
+    # amplifying Valkey memory. Abandoned carts expire on a rolling TTL (every
+    # read/mutation refreshes it); eviction empties a cart — documented and
+    # acceptable for a cart, never for an order.
+    cart_max_items: int = Field(default=50, gt=0)  # max distinct lines per cart
+    cart_max_qty_per_line: int = Field(default=10, gt=0)  # max units per line
+    cart_ttl_seconds: int = Field(default=30 * 24 * 3600, gt=0)  # rolling expiry (~30d of inactivity)
+    # SQS queue the cart product-event consumer drains. LocalStack locally.
+    cart_queue_url: str | None = None
+
     # --- Inventory reservations + reaper ---
     # A reservation holds stock (bumps `reserved`) until the checkout saga commits
     # or compensates. The TTL is the backstop for a saga that never does either:

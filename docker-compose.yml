@@ -218,6 +218,30 @@ services:
       - "9103:9100"
     command: ["python", "-m", "src.catalog.adapters.cache_worker"]
 
+  # The `service`-role cart worker: drains ProductUpdated/ProductDeleted
+  # from the cart-events queue → refreshes/prunes Valkey cart snapshots.
+  # Pure Valkey (no Postgres): no migrate dependency.
+  cart-consumer:
+    build: .
+    depends_on:
+      valkey:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      bus-setup:
+        condition: service_completed_successfully
+    environment:
+      VALKEY_URL: redis://valkey:6379/0
+      CART_QUEUE_URL: http://localstack:4566/000000000000/cart-events
+      BUS_ENDPOINT_URL: http://localstack:4566
+      BUS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      WORKER_METRICS_PORT: "9100"
+    ports:
+      - "9106:9100"
+    command: ["python", "-m", "src.cart.adapters.cart_consumer"]
+
   # The `service`-role reservation reaper: releases stock holds whose TTL expired
   # (a stalled checkout saga must not leak stock into a phantom oversell-block).
   # Cron-style loop locally; an EventBridge-scheduled `--once` ECS task in prod.

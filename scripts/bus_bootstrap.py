@@ -29,6 +29,7 @@ log = logging.getLogger("bus_bootstrap")
 CONSUMERS: dict[str, list[str]] = {
     "order-events": ["OrderPlaced"],
     "catalog-cache": ["ProductUpdated", "ProductDeleted"],
+    "cart-events": ["ProductUpdated", "ProductDeleted"],
 }
 MAX_RECEIVE_COUNT = 5
 

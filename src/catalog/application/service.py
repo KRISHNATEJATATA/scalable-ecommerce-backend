@@ -34,6 +34,7 @@ from src.catalog.application.dto import (
 from src.catalog.application.image_processing import ALLOWED_MIME
 from src.catalog.application.mappers import to_domain
 from src.catalog.application.outbox import product_updated_outbox
+from src.catalog.ports.availability import StockAvailabilityPort
 from src.catalog.ports.cache import MISS, ProductCachePort
 from src.catalog.ports.repository import CatalogRepositoryPort
 from src.catalog.ports.storage import ImageStorePort
@@ -98,6 +99,7 @@ class CatalogService:
         image_store: ImageStorePort | None = None,
         cache: ProductCachePort | None = None,
         *,
+        availability: StockAvailabilityPort | None = None,
         lock_ttl_seconds: int | None = None,
         max_fill_wait_seconds: float | None = None,
         image_base_url: str | None = None,
@@ -107,6 +109,10 @@ class CatalogService:
         self._repo = repo
         self._image_store = image_store
         self._cache = cache
+        # Read-only stock composition, injected by the container over
+        # the inventory service. Catalog never names inventory — the seam is this
+        # port, and the adapter is the only cross-module edge (see container.py).
+        self._availability = availability
         # Catalog's slice of the config, injected by the container from
         # ``app.state.settings`` — never re-read from the global ``get_settings()``,
         # so ``create_app(custom_settings)`` can't end up enforcing one upload limit
@@ -172,9 +178,12 @@ class CatalogService:
         mislabelled and re-queried.
         """
         try:
-            return await self._get_product_cached(product_id)
+            response = await self._get_product_cached(product_id)
         except _RepositoryFailure as wrapper:
             raise wrapper.__cause__ from None  # type: ignore[misc]
+        if response is not None:
+            await self._attach_availability([response])
+        return response
 
     async def _get_product_cached(self, product_id: uuid.UUID) -> ProductResponse | None:
         """Cache-aside read; cache faults degrade to the DB, repo faults propagate."""
@@ -293,7 +302,7 @@ class CatalogService:
                 await load
             raise
         if response is not None:
-            await self._cache.store_if_owner(product_id, response.model_dump_json(), token)
+            await self._cache.store_if_owner(product_id, response.model_dump_json(exclude={"available"}), token)
         else:
             await self._cache.store_miss_if_owner(product_id, token)  # negative-cache the 404
         return response
@@ -341,7 +350,30 @@ class CatalogService:
         """Return a keyset page of products, optionally filtered."""
         page = await self._repo.list_products(params, filters)
         items = [self._to_response(to_domain(row)) for row in page.items]
+        await self._attach_availability(items)
         return PageResponse(items=items, next_cursor=page.next_cursor)
+
+    async def _attach_availability(self, items: list[ProductResponse]) -> None:
+        """Fill ``available`` on each response from a single batch stock lookup.
+
+        Runs *after* the cache-aside read on both the detail and list paths, and
+        the value is never part of the cached payload — a cached entry would
+        otherwise survive every reservation/release until its TTL. A product
+        with no stock row keeps ``available=None`` (unknown, never zero); without
+        the port (bare service in a test) every item reports unknown.
+        """
+        if not items:
+            return
+        if self._availability is None:
+            for item in items:
+                item.available = None
+            return
+        # SKU mapping: products carry no SKU column; inventory rows are keyed by
+        # the product's canonical UUID rendered as a string.
+        skus = [str(item.id) for item in items]
+        stocked = await self._availability.available_for(skus)
+        for item in items:
+            item.available = stocked.get(str(item.id))
 
     async def create_product(self, *, merchant_id: uuid.UUID, data: ProductCreate) -> ProductResponse:
         """Create a product owned by ``merchant_id`` and emit ``ProductCreated``."""

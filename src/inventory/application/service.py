@@ -55,6 +55,15 @@ class InventoryService:
             return None
         return InventoryResponse.model_validate(to_domain(row))
 
+    async def get_many_by_skus(self, skus: list[str]) -> dict[str, InventoryResponse]:
+        """Resolve stock rows for ``skus`` as ``{sku: response}`` (one query).
+
+        SKUs with no row are absent from the map — the caller (a read
+        projection) reports those as unknown, never as zero.
+        """
+        rows = await self._repo.get_many_by_skus(skus)
+        return {sku: InventoryResponse.model_validate(to_domain(row)) for sku, row in rows.items()}
+
     async def reserve(self, sku: str, qty: int, order_id: uuid.UUID) -> ReservationResponse:
         """Hold ``qty`` of ``sku`` for ``order_id`` until the TTL expires.
 
