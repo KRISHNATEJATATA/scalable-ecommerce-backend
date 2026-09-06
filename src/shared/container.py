@@ -370,7 +370,15 @@ def get_payments_repository(session: SessionDep) -> PaymentsRepositoryPort:
 def get_payment_gateway(request: Request) -> PaymentGatewayPort:
     """Provide the gateway behind the Strategy port — swap the stub for a real
     provider by replacing this one provider; no caller changes."""
-    return StubPaymentGateway(request.app.state.settings.payment_stub_fail_token_substring)
+    # One instance per process, lazily built on app.state: the stub's
+    # idempotency map is process-local, so a per-request instance would give
+    # the webhook and the reconciler a *different* window than the charge —
+    # late confirmations would resolve to nothing.
+    gateway = getattr(request.app.state, "payment_gateway", None)
+    if gateway is None:
+        gateway = StubPaymentGateway(request.app.state.settings.payment_stub_fail_token_substring)
+        request.app.state.payment_gateway = gateway
+    return gateway
 
 
 def get_payments_service(

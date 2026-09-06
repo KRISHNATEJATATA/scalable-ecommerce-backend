@@ -259,6 +259,19 @@ async def test_a_webhook_for_an_unknown_reference_is_a_visible_404(session):
         await _service(session).handle_webhook(body, _sign(body))
 
 
+async def test_a_signed_non_object_webhook_body_is_a_404_not_a_500(session):
+    body = b'["payment.succeeded"]'  # valid JSON, not an object
+    with pytest.raises(UnknownPaymentRefError):
+        await _service(session).handle_webhook(body, _sign(body))
+
+
+async def test_a_non_ascii_signature_header_is_a_401_not_a_type_error(session):
+    kwargs = _charge_kwargs()
+    body = _webhook_body(kwargs["idempotency_key"])
+    with pytest.raises(AuthenticationError):
+        await _service(session).handle_webhook(body, "sha256=é" * 32)
+
+
 # --- reconciliation ----------------------------------------------------------------
 
 

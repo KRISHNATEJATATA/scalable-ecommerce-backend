@@ -154,8 +154,13 @@ class PaymentsService:
             payload: Any = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise UnknownPaymentRefError(f"webhook body is not a valid event: {exc}") from exc
+        if not isinstance(payload, dict):  # a signed-but-non-object body must 404, not AttributeError→500
+            raise UnknownPaymentRefError("webhook body is not a valid event: expected a JSON object")
 
-        outcome = _WEBHOOK_TYPE_TO_OUTCOME.get(payload.get("type"))
+        # A non-string `type` (list/dict — a signed body the gateway would never
+        # send) must fall into the 404 arm too, not TypeError (unhashable) → 500.
+        event_type = payload.get("type")
+        outcome = _WEBHOOK_TYPE_TO_OUTCOME.get(event_type) if isinstance(event_type, str) else None
         idempotency_key = payload.get("idempotency_key")
         if outcome is None or not isinstance(idempotency_key, str):
             raise UnknownPaymentRefError("webhook 'type'/'idempotency_key' missing or unrecognised")
@@ -272,7 +277,9 @@ class PaymentsService:
             )
         expected = hmac.new(self._webhook_secret.encode(), body, hashlib.sha256).hexdigest()
         received = signature.removeprefix("sha256=") if signature else ""
-        if not received or not hmac.compare_digest(expected, received):
+        # compare_digest raises on non-ASCII str; encode both sides so a garbage
+        # header answers 401 instead of surfacing a TypeError.
+        if not received or not hmac.compare_digest(expected.encode(), received.encode()):
             raise AuthenticationError("invalid webhook signature")
 
     async def _apply(self, payment_id: uuid.UUID, result: GatewayCharge) -> PaymentResponse:
