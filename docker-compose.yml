@@ -284,6 +284,29 @@ services:
       - "9105:9100"
     command: ["python", "-m", "src.payments.adapters.reconciler"]
 
+  # The `service`-role saga recovery poller: settles checkout orders still
+  # `pending` past the step timeout (a crashed saga must not leave stock held
+  # and an order undecided). Cron-style loop locally; an EventBridge-scheduled
+  # `--once` ECS task in prod. Mirrors the reaper; needs Valkey to clear carts.
+  saga-recovery:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ecommerce:ecommerce@postgres:5432/ecommerce
+      VALKEY_URL: redis://valkey:6379/0
+      RESERVATION_TTL_SECONDS: "900"
+      CHECKOUT_SAGA_STEP_TIMEOUT_SECONDS: "60"
+      WORKER_METRICS_PORT: "9100"
+    ports:
+      - "9107:9100"
+    command: ["python", "-m", "src.shared.saga_recovery"]
+
   # Local mail catcher: Keycloak's "update account" email (admin user creation)
   # needs an SMTP server or the create rolls back. UI on http://localhost:8025.
   mailpit:

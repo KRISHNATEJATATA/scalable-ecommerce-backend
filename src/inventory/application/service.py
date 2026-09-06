@@ -103,6 +103,23 @@ class InventoryService:
         """Give a held reservation's stock back (saga compensation); ``False`` on replay."""
         return await self._repo.release(reservation_id, stock_released_outbox)
 
+    async def release_for_order(self, order_id: uuid.UUID) -> int:
+        """Release every still-``held`` reservation of one order (saga compensation).
+
+        Returns how many were released. Owns no counter: compensation volume is
+        visible through the saga's own compensation-rate signal, and a replay
+        releasing nothing is the normal (not the alertable) case.
+        """
+        return await self._repo.release_for_order(order_id, stock_released_outbox)
+
+    async def commit_for_order(self, order_id: uuid.UUID) -> int:
+        """Consume every still-``held`` reservation of one order (saga success).
+
+        The recovery poller's finish for a checkout whose payment succeeded but
+        whose per-line commits never ran. Returns how many were consumed.
+        """
+        return await self._repo.commit_for_order(order_id)
+
     async def commit_reservation(self, reservation_id: uuid.UUID) -> bool:
         """Consume a held reservation on payment success; ``False`` on replay."""
         return await self._repo.commit_reservation(reservation_id)

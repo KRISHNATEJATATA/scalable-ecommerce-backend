@@ -103,6 +103,18 @@ class PaymentsService:
         items = [PaymentResponse.model_validate(to_domain(row)) for row in page.items]
         return PageResponse(items=items, next_cursor=page.next_cursor)
 
+    async def get_by_idempotency_key(self, idempotency_key: str) -> PaymentResponse | None:
+        """The payment attempt under ``idempotency_key``, or ``None`` if never charged.
+
+        The saga recovery poller's question: it settles a crashed checkout from
+        the payment row's terminal state without re-presenting the payment
+        token (which is never stored).
+        """
+        row = await self._repo.get_by_idempotency_key(idempotency_key)
+        if row is None:
+            return None
+        return _response(row)
+
     # --- the saga's Payment step --------------------------------------------------
 
     async def charge(

@@ -30,8 +30,10 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime
+from typing import Any, cast
 
 from sqlalchemy import select
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import text
@@ -107,6 +109,18 @@ _CONSUME_SQL = text(
     "WHERE sku = :sku AND reserved >= :qty AND on_hand >= :qty"
 )
 
+# One order's holds (no SKIP LOCKED: the saga recovery poller already owns the
+# order via its lease on orders.orders, so no second claimant can be here).
+_CLAIM_ORDER_SQL = text(
+    f"SELECT id, sku, qty, order_id FROM {SCHEMA}.reservations "  # noqa: S608
+    "WHERE order_id = :order_id AND status = :held FOR UPDATE"
+)
+
+_MARK_COMMITTED_BATCH_SQL = text(
+    f"UPDATE {SCHEMA}.reservations SET status = :committed, updated_at = now() "  # noqa: S608
+    "WHERE id = ANY(:ids)"
+)
+
 # FOR UPDATE SKIP LOCKED so N reaper replicas never claim the same expired hold.
 _CLAIM_EXPIRED_SQL = text(
     f"SELECT id, sku, qty, order_id FROM {SCHEMA}.reservations "  # noqa: S608
@@ -143,8 +157,10 @@ class InventoryRepository:
 
     async def try_reserve_decrement(self, sku: str, qty: int) -> int:
         """The atomic conditional decrement; rowcount 1 = reserved, 0 = rejected."""
-        result = await self._session.execute(_DECREMENT_SQL, {"sku": sku, "qty": qty})
-        return result.rowcount
+        # DML via execute() is a CursorResult at runtime; the static type is the
+        # broader Result (whose ``rowcount`` the stubs hide).
+        result = cast(CursorResult[Any], await self._session.execute(_DECREMENT_SQL, {"sku": sku, "qty": qty}))
+        return int(result.rowcount or 0)
 
     # --- reservation lifecycle: state change + outbox row in ONE transaction ---
 
@@ -310,6 +326,57 @@ class InventoryRepository:
         await self._session.commit()
         return len(rows)
 
+    async def release_for_order(self, order_id: uuid.UUID, outbox_factory: OutboxFactory) -> int:
+        """Release every still-``held`` reservation of one order; returns how many.
+
+        The saga's compensation path (payment failed, or the recovery poller
+        settling a crashed checkout): same one-transaction shape as the reaper
+        sweep, scoped to the order instead of expiry. A replay finds no ``held``
+        rows and releases nothing — idempotent, emits nothing.
+        """
+        rows = (
+            await self._session.execute(_CLAIM_ORDER_SQL, {"order_id": order_id, "held": ReservationStatus.HELD.value})
+        ).all()
+        if not rows:
+            # No rollback on the empty replay: a zero-row claim holds no locks,
+            # and rolling back here would expire the caller's already-loaded
+            # rows — their later attribute access becomes a synchronous lazy
+            # load with no greenlet (MissingGreenlet). The next statement's
+            # commit closes the implicit transaction.
+            return 0
+        for row in rows:
+            await self._require_one(_UNRESERVE_SQL, {"sku": row.sku, "qty": row.qty}, what="order release unreserve")
+            self._session.add(self._outbox_row(outbox_factory(row.sku, row.order_id, row.qty)))
+        await self._session.execute(
+            _MARK_RELEASED_BATCH_SQL,
+            {"released": ReservationStatus.RELEASED.value, "ids": [row.id for row in rows]},
+        )
+        await self._session.commit()
+        return len(rows)
+
+    async def commit_for_order(self, order_id: uuid.UUID) -> int:
+        """Consume every still-``held`` reservation of one order; returns how many.
+
+        The saga's success path when the payment already succeeded but the crash
+        came before the per-line commits (or the recovery poller finishing a
+        crashed checkout). No event: the order/payment events announce the
+        outcome. A replay finds no ``held`` rows — idempotent.
+        """
+        rows = (
+            await self._session.execute(_CLAIM_ORDER_SQL, {"order_id": order_id, "held": ReservationStatus.HELD.value})
+        ).all()
+        if not rows:
+            # No rollback on the empty replay — same reason as release_for_order.
+            return 0
+        for row in rows:
+            await self._require_one(_CONSUME_SQL, {"sku": row.sku, "qty": row.qty}, what="order commit consume")
+        await self._session.execute(
+            _MARK_COMMITTED_BATCH_SQL,
+            {"committed": ReservationStatus.COMMITTED.value, "ids": [row.id for row in rows]},
+        )
+        await self._session.commit()
+        return len(rows)
+
     async def _find_active(self, order_id: uuid.UUID, sku: str, qty: int) -> Reservation | None:
         """This order line's existing non-released reservation, or ``None`` if it's gone.
 
@@ -347,10 +414,11 @@ class InventoryRepository:
         status flip and the ``StockReleased`` event while the stock never moved —
         permanently losing those units. Roll back and surface it instead.
         """
-        result = await self._session.execute(sql, params)
-        if result.rowcount != 1:
+        result = cast(CursorResult[Any], await self._session.execute(sql, params))
+        rowcount = int(result.rowcount or 0)
+        if rowcount != 1:
             await self._session.rollback()
-            raise StockMutationError(f"{what} affected {result.rowcount} rows, expected 1: {params}")
+            raise StockMutationError(f"{what} affected {rowcount} rows, expected 1: {params}")
 
     @staticmethod
     def _outbox_row(outbox: OutboxMessage) -> Outbox:

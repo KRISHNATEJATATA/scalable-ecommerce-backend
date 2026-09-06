@@ -17,7 +17,11 @@ _probe = Counter("test_worker_probe_total", "Probe counter for the worker export
 
 
 def _settings(**overrides) -> AppSettings:
-    return AppSettings(secret_key="x" * 32, **overrides)
+    # Required fields (database_url) come from the developer .env the settings
+    # module reads; these tests only need the worker-metrics knobs.
+    # NOTE: AppSettings ignores unknown kwargs (extra="ignore"), which is why
+    # the former bogus `secret_key=` here never failed a test.
+    return AppSettings(**overrides)
 
 
 def test_exporter_is_off_unless_configured(monkeypatch):

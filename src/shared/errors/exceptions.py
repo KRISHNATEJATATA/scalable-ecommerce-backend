@@ -73,6 +73,31 @@ class PaymentIdempotencyConflictError(Exception):
         self.detail = detail
 
 
+class CheckoutIdempotencyConflictError(Exception):
+    """A checkout replayed under an existing key with a different body → 409.
+
+    The key pins the first request's body (payment token + cart snapshot hash):
+    replaying it with the same body returns the stored response, replaying it
+    with a different body is a caller bug, not a new order."""
+
+    def __init__(self) -> None:
+        detail = "this Idempotency-Key was already used with a different request body"
+        super().__init__(detail)
+        self.detail = detail
+
+
+class OrderStateConflictError(Exception):
+    """The order's state refuses the transition → 409.
+
+    Cancelling a `paid`/`shipped` order, checking out an empty cart, or any
+    other well-formed request the lifecycle rejects. A retry after fixing the
+    caller-side state can legitimately succeed."""
+
+    def __init__(self, detail: str = "the order's state does not allow this operation") -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
 class UnknownPaymentRefError(Exception):
     """A webhook references no payment we issued → 404.
 

@@ -25,14 +25,16 @@ class Base(DeclarativeBase):
 class Order(Base, TimestampMixin):
     """Checkout aggregate root. ``user_id`` is an id-value ref to ``identity.users``.
 
-    ``UNIQUE(idempotency_key)`` is the durable guard for idempotent checkout: a
-    replay with the same key returns the stored response; the same key with a
-    different body is rejected (409) at the service layer.
+    ``UNIQUE(user_id, idempotency_key)`` is the durable guard for idempotent
+    checkout: a replay with the same key returns the stored response, while the
+    same key with a different body is rejected (409) by comparing
+    ``idempotency_body_hash``. Composite (not global on the key alone) so two
+    different users may reuse the same client-supplied key.
     """
 
     __tablename__ = "orders"
     __table_args__ = (
-        UniqueConstraint("idempotency_key", name="uq_orders_idempotency_key"),
+        UniqueConstraint("user_id", "idempotency_key", name="uq_orders_user_id_idempotency_key"),
         Index("ix_orders_user_id_status", "user_id", "status"),
         # ``list_orders`` is always user-scoped and keyset-ordered by
         # ``(created_at, id)`` — this is the index that ORDER BY seeks on.
@@ -43,6 +45,11 @@ class Order(Base, TimestampMixin):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    # sha256 over the checkout body (the payment token — the cart is
+    # server-side, so the token is the whole body). Lets the DB backstop answer
+    # "same key, different body → 409" even after the Valkey fast-path record
+    # was evicted.
+    idempotency_body_hash: Mapped[str] = mapped_column(String(64), nullable=False, server_default="")
     status: Mapped[OrderStatus] = mapped_column(
         Enum(
             OrderStatus,
@@ -77,10 +84,26 @@ class OrderItem(Base):
 
 
 class SagaLog(Base, TimestampMixin):
-    """Persisted checkout-saga step log: drives recovery/compensation after a crash or timeout."""
+    """Persisted checkout-saga step log: drives recovery/compensation after a crash or timeout.
+
+    One row per step attempt (``reserve``/``charge``/``commit``/``mark_paid``).
+    ``status`` vocabulary: ``started`` → ``completed``, ``failed`` →
+    ``compensated``, or ``unknown`` (a charge timeout with no recorded outcome —
+    left pending for the reconciler/recovery poller, never compensated). The
+    recovery poller claims stuck ``started`` rows (order still ``pending`` past
+    the step timeout) with ``FOR UPDATE SKIP LOCKED`` — the row lock is the
+    lease, so concurrent poller replicas split the batch instead of
+    double-resuming a saga.
+    """
 
     __tablename__ = "saga_log"
-    __table_args__ = {"schema": SCHEMA}
+    __table_args__ = (
+        # Every journal read is ``WHERE order_id`` (heartbeat in the recovery
+        # claim, cancel's in-flight guard, the batch's re-check): without this
+        # each is a full scan of the log.
+        Index("ix_saga_log_order_id", "order_id"),
+        {"schema": SCHEMA},
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     order_id: Mapped[uuid.UUID] = mapped_column(ForeignKey(f"{SCHEMA}.orders.id", ondelete="CASCADE"), nullable=False)

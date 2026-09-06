@@ -17,6 +17,7 @@ from src.shared.errors.error_builder import PROBLEM_CONTENT_TYPE, build_problem
 from src.shared.errors.exceptions import (
     AuthenticationError,
     AuthorizationError,
+    CheckoutIdempotencyConflictError,
     ConcurrentUpdateError,
     DependencyUnavailableError,
     InsufficientStockError,
@@ -28,6 +29,7 @@ from src.shared.errors.exceptions import (
     InvalidUploadError,
     KeycloakConflictError,
     KeycloakEntityNotFoundError,
+    OrderStateConflictError,
     PaymentIdempotencyConflictError,
     ReservationConflictError,
     ReservationContendedError,
@@ -96,6 +98,18 @@ async def _payment_idempotency_conflict_handler(_: Request, exc: PaymentIdempote
     # 409: the key pins whatever it first charged — replaying it with a different
     # order/amount is a caller bug a real gateway would also refuse.
     return _problem_response(409, title="Idempotency Conflict", detail=exc.detail)
+
+
+async def _checkout_idempotency_conflict_handler(_: Request, exc: CheckoutIdempotencyConflictError) -> JSONResponse:
+    # 409: the Idempotency-Key pins the first checkout body — same key with a
+    # different body is a caller bug, never a second order.
+    return _problem_response(409, title="Idempotency Conflict", detail=exc.detail)
+
+
+async def _order_state_conflict_handler(_: Request, exc: OrderStateConflictError) -> JSONResponse:
+    # 409: the request was well-formed, the order lifecycle refused it (cancel a
+    # paid order, checkout an empty cart). Caller-fixable, retryable after repair.
+    return _problem_response(409, title="Conflict", detail=exc.detail)
 
 
 async def _unknown_payment_ref_handler(_: Request, exc: UnknownPaymentRefError) -> JSONResponse:
@@ -176,6 +190,8 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(ReservationConflictError, _reservation_conflict_handler)
     app.add_exception_handler(ReservationContendedError, _reservation_contended_handler)
     app.add_exception_handler(PaymentIdempotencyConflictError, _payment_idempotency_conflict_handler)
+    app.add_exception_handler(CheckoutIdempotencyConflictError, _checkout_idempotency_conflict_handler)
+    app.add_exception_handler(OrderStateConflictError, _order_state_conflict_handler)
     app.add_exception_handler(UnknownPaymentRefError, _unknown_payment_ref_handler)
     app.add_exception_handler(ConcurrentUpdateError, _concurrent_update_handler)
     app.add_exception_handler(StaleDataError, _stale_data_handler)

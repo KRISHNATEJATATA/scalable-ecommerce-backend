@@ -218,6 +218,18 @@ class AppSettings(BaseSettings):
     reservation_reaper_poll_interval_seconds: float = Field(default=10.0, gt=0)
     reservation_reaper_batch_size: int = Field(default=100, gt=0)
 
+    # --- Checkout saga (orders) ---
+    # Per-step timeout for the orchestrated saga (reserve → charge → commit).
+    # Must stay well under RESERVATION_TTL_SECONDS (enforced below): a step that
+    # runs longer than the hold lets the reaper reclaim stock from a live
+    # checkout. The recovery poller settles orders still `pending` past this age.
+    checkout_saga_step_timeout_seconds: int = Field(default=60, gt=0)
+    checkout_saga_recovery_batch_size: int = Field(default=50, gt=0)
+    # Valkey fast-path TTL for `Idempotency-Key → (body_hash, status, response)`.
+    # Eviction only loses the fast path: the DB UNIQUE backstop still prevents a
+    # duplicate order, degrading to re-reading the stored order (or 409).
+    checkout_idempotency_ttl_seconds: int = Field(default=86400, gt=0)  # ~24h
+
     # --- Worker metrics export ---
     # Workers don't serve `/metrics` (that's the API process), so their counters
     # are invisible unless exported. Long-running workers get a scrape port;
@@ -294,6 +306,24 @@ class AppSettings(BaseSettings):
                 "image_upload_reaper_grace_seconds must exceed image_visibility_timeout_seconds "
                 f"({self.image_upload_reaper_grace_seconds} <= {self.image_visibility_timeout_seconds}): "
                 "an in-flight upload would be reaped mid-processing"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_saga_step_timeout_below_reservation_ttl(self) -> "AppSettings":
+        """Fail-fast: a saga step must finish before its stock hold can expire.
+
+        The reaper releases any hold past `expires_at` with no knowledge of the
+        saga. If a step routinely ran longer than the TTL, a slow-but-alive
+        checkout would get its stock reclaimed mid-flight and compensate a sale
+        that should have succeeded. The relationship is what makes the hold
+        safe, so it is enforced, not documented and hoped for.
+        """
+        if self.checkout_saga_step_timeout_seconds >= self.reservation_ttl_seconds:
+            raise ValueError(
+                "checkout_saga_step_timeout_seconds must stay below reservation_ttl_seconds "
+                f"({self.checkout_saga_step_timeout_seconds} >= {self.reservation_ttl_seconds}): "
+                "a live checkout would lose its stock to the reaper mid-saga"
             )
         return self
 

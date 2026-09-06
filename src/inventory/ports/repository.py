@@ -91,3 +91,17 @@ class InventoryRepositoryPort(Protocol):
         concurrent reaper replicas split the batch instead of double-releasing.
         """
         ...
+
+    async def release_for_order(self, order_id: uuid.UUID, outbox_factory: OutboxFactory) -> int:
+        """Release every still-``held`` reservation of one order (saga compensation).
+
+        Returns how many were released; ``0`` on replay (nothing was ``held``).
+        """
+        ...
+
+    async def commit_for_order(self, order_id: uuid.UUID) -> int:
+        """Consume every still-``held`` reservation of one order (saga success).
+
+        Returns how many were consumed; ``0`` on replay. No event emitted.
+        """
+        ...

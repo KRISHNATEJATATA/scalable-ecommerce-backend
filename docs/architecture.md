@@ -7,21 +7,34 @@ to **Keycloak (OIDC)**, so a future auth-service split is essentially free.
 
 ## Layered layout (`src/`)
 
+**Modular monolith, microservices-ready**: one deployable service split into
+modules with hard boundaries — **schema-per-module, no cross-module DB joins,
+no cross-module ORM/domain imports** (enforced by `import-linter` via
+`.importlinter`). Modules communicate in-process now, and through **events**
+later; extraction to microservices is documented in an ADR, not built.
+
 ```
 src/
-├── config/        # pydantic-settings (setting.py) + ECS JSON logging (logging.py)
-├── clients/       # async infra clients (postgres, valkey, s3)
-├── models/        # SQLAlchemy ORM models
-├── repositories/  # all DB queries live here — routes/services never query directly
-├── services/      # business logic; returns response schemas, never ORM models
-├── routes/        # thin: validate (Pydantic) → call service → return response model
-├── middleware/    # security headers, request-id, proxy headers
-├── errors/        # RFC 9457 Problem Details (error_builder.py, exception_handlers.py)
-├── admin/         # admin-only surface
-└── container.py   # DI wiring: repositories/services instantiated once, injected via Depends
+├── shared/        # thin shared kernel: config (pydantic-settings) + ECS JSON logging,
+│                  #   RFC 9457 errors, middleware, auth (JWKS/Principal), db/valkey/s3
+│                  #   clients, outbox bus + relay, container.py (DI composition root)
+├── catalog/       # api/ application/ domain/ ports/ adapters/ — schema: catalog
+├── inventory/     # reservations, atomic decrement, reaper — schema: inventory
+├── orders/        # order aggregate + checkout saga + saga_log — schema: orders
+├── payments/      # stub gateway, webhook, reconciliation poller — schema: payments
+├── identity/      # User (OIDC sub), JIT provisioning — schema: identity
+├── cart/          # pre-checkout basket, Valkey-only (no Postgres schema)
+└── events/        # versioned JSON-Schema event contracts (registry + models)
 ```
 
-**Request flow — do not skip layers:** `Route → Schema → Service → Repository → Model`.
+Within a module, dependency flow is **api → application (use-cases) → domain →
+ports ← adapters (db/s3/bus/gateway)**. The domain imports nothing outward;
+ports/adapters exist only at varying edges. **Request flow — do not skip
+layers:** `Route → Schema → Service → Repository → Model`. Services return
+Pydantic schemas, never ORM models; all DB queries live in the module's
+`adapters/db`. Cross-module calls (the saga → inventory/payments/cart) go
+through the calling module's **own ports**, implemented at the composition root
+(`src/shared/container.py`) — never a sibling import.
 
 ```mermaid
 flowchart TD
@@ -38,13 +51,17 @@ flowchart TD
     Log["Logging<br/>ECS JSON · trace-id · redaction"]
   end
   PG[("PostgreSQL<br/>asyncpg")]
-  VK[("Valkey<br/>rate-limit · idempotency")]
+  VK[("Valkey<br/>rate-limit · idempotency · product cache · cart")]
   S3[("S3 / LocalStack S3<br/>aioboto3")]
-  SQS[["SNS/SQS · ElasticMQ/LocalStack<br/>event bus · DLQs"]]
+  SQS[["SNS/SQS · LocalStack<br/>event bus · DLQs"]]
   KC[("Keycloak (OIDC IdP)<br/>token issuance · JWKS · Admin API")]
   Relay["Relay (service role)<br/>outbox → SNS · SKIP LOCKED"]
   IMG["Image worker (service role)<br/>S3 event → sniff · re-encode · thumbnails"]
   CW["Cache worker (service role)<br/>ProductUpdated/Deleted → invalidate Valkey"]
+  CART["Cart consumer (service role)<br/>ProductUpdated/Deleted → refresh/prune carts"]
+  REAPER["Reservation reaper (service role)<br/>expired holds → release"]
+  RECON["Payment reconciler (service role)<br/>pending charges → ask gateway"]
+  SREC["Saga recovery poller (service role)<br/>crashed checkouts → settle"]
 
   Client --> MW --> Route
   Route --> Schema --> Service
@@ -64,6 +81,11 @@ flowchart TD
   IMG -->|mark image_status ready/failed| PG
   SQS -.->|ProductUpdated/Deleted| CW
   CW -->|invalidate product cache key| VK
+  SQS -.->|ProductUpdated/Deleted| CART
+  CART -->|refresh/prune cart snapshot| VK
+  REAPER -->|release expired holds| PG
+  RECON -->|settle pending charges| PG
+  SREC -->|settle crashed sagas| PG
   Route -.-> Errors
   App -.-> Log
 ```
@@ -136,10 +158,11 @@ PKCE against Keycloak; the API only validates the tokens Keycloak issues.
 
 ## Valkey usage
 
-Ephemeral shared state: rate-limit counters, idempotency keys, event-dedup keys,
-and the **product read-cache** (no JWT `jti` denylist — Keycloak + short token TTL
-own revocation). Prod = ElastiCache for Valkey replication group (Multi-AZ) so the
-one shared dependency isn't a SPOF.
+Ephemeral shared state: rate-limit counters, checkout idempotency fast-path
+records, event-dedup keys, the **product read-cache**, and **cart state** (no
+JWT `jti` denylist — Keycloak + short token TTL own revocation; JWKS caching is
+a process-wide `PyJWKClient`, not Valkey). Prod = ElastiCache for Valkey
+replication group (Multi-AZ) so the one shared dependency isn't a SPOF.
 
 ### Product read-cache (cache-aside)
 
@@ -173,6 +196,46 @@ evicted and refilled rather than silently degrading every read. If Valkey is
 unavailable the read **degrades to a direct DB read** rather than erroring. The
 listing hot path stays uncached. Staleness is bounded by the relay poll + the
 entry TTL.
+
+## Checkout saga (orchestrated)
+
+Checkout is an **orchestrated saga** (`src/orders/application/checkout_saga.py`),
+not choreography: one state machine drives a cart to exactly one terminal order
+(`paid` or `cancelled`). **Order-first**: the saga creates the `pending` order
+(to anchor reservations and the idempotency guard), reserves each line through
+the inventory service, charges through the payments service, commits the holds,
+then marks the order `paid` — journaling every step to the persisted
+**`saga_log`** as it goes. Each step has a compensating action (release holds +
+cancel order); only unpaid sagas compensate — a `paid` order unwinds via the
+future returns/refunds reverse saga, never via cancel.
+
+- **Idempotency rides two layers.** The Valkey fast path
+  (`idempotency:{user_id}:{key}`, holding `{body_hash, status, response}`)
+  answers exact replays without touching Postgres; **`UNIQUE(user_id,
+  idempotency_key)`** plus the stored `idempotency_body_hash` is the durable
+  truth that survives Valkey eviction. Same key + same body replays the stored
+  response; same key + different body → **409** — at either layer. Valkey
+  faults degrade to a miss (the DB backstop still guards), never fail checkout.
+  The hash covers the payment token (the cart is server-side, and a completed
+  checkout clears the cart, so hashing cart lines would 409 every exact retry);
+  the token itself is never stored.
+- **Recovery, not re-presentation.** A crash between steps leaves a `pending`
+  order with holds against it. The `service`-role **saga recovery poller**
+  (`src/shared/saga_recovery.py`) claims `pending` orders older than the saga
+  step timeout (`FOR UPDATE SKIP LOCKED`, so N replicas split the batch) and
+  settles each from its **payment row's terminal state** — commit + mark paid
+  when the charge succeeded, release + cancel otherwise. It never re-presents
+  the payment token (which is never stored); still-`pending` payments are left
+  for the payment reconciler. It lives in `shared` deliberately: settling
+  composes four modules, and only shared code may do that.
+- **Timeouts are relationships, enforced at startup**: the per-step saga
+  timeout (`CHECKOUT_SAGA_STEP_TIMEOUT_SECONDS`) must stay below
+  `RESERVATION_TTL_SECONDS`, so a live checkout can't lose its stock to the
+  reaper mid-saga.
+- **Cross-module calls go through the saga's own ports**
+  (`src/orders/ports/checkout.py`), implemented at the composition root over
+  the inventory/payments/cart services — the saga module never imports a
+  sibling module.
 
 ## Domain events
 
@@ -223,6 +286,29 @@ producers put on the wire and a test fails if the code drifts from it, so the pr
 a bump is always an explicit diff. Procedure: `docs/DEPLOYMENT.md` § "Rolling out a new event
 version"; recovery if it's violated: `docs/RUNBOOK.md` § 4.
 
+## Workers (service role)
+
+All long-running workers are separate `service`-role processes — ECS tasks in
+prod, compose services locally — never `BackgroundTasks`:
+
+- **Outbox relay** (`src.shared.bus.relay`): claims unpublished outbox rows
+  (`FOR UPDATE SKIP LOCKED`) → publishes to SNS.
+- **Image worker** (`src.catalog.adapters.image_worker`): S3 ObjectCreated →
+  sniff / re-encode / thumbnails → marks the image ready/failed (emitting
+  `ProductUpdated` through the outbox).
+- **Catalog cache worker** (`src.catalog.adapters.cache_worker`): drains
+  `ProductUpdated`/`ProductDeleted` → evicts the product read-cache key.
+- **Cart consumer** (`src.cart.adapters.cart_consumer`): drains the same
+  product events → refreshes/prunes Valkey cart snapshots (pure Valkey, no DB).
+- **Reservation reaper** (`src.inventory.adapters.reaper`): releases stock
+  holds past `expires_at`. Cron-style loop locally; EventBridge-scheduled
+  `--once` ECS task in prod.
+- **Payment reconciler** (`src.payments.adapters.reconciler`): charges still
+  `pending` past their grace window are asked about at the gateway directly
+  (the missed-webhook backstop; same guarded transitions as the webhook).
+- **Saga recovery poller** (`src.shared.saga_recovery`): settles checkout
+  orders still `pending` past the saga step timeout (see Checkout saga).
+
 ## Correctness invariants (never simplify away)
 
 - **Atomic conditional decrement** on inventory (see ADR 0010) — the single
@@ -237,9 +323,11 @@ version"; recovery if it's violated: `docs/RUNBOOK.md` § 4.
   releasing a *paid* order's stock.
 - **Optimistic locking**: `Inventory.version` (manual CAS) and `Product.version_id`
   (ORM-managed) — two mechanisms on purpose, don't unify them.
-- **Idempotent checkout**: `UNIQUE(user_id, idempotency_key)` on `Order` is the
-  durable guard (Valkey only short-circuits fast retries); a live hold is likewise
-  unique per `(order_id, sku)`.
+- **Idempotent checkout**: `UNIQUE(user_id, idempotency_key)` on `Order` —
+  composite, not global on the key alone, so one user's key can't block another
+  user's identical key — is the durable guard, with `idempotency_body_hash`
+  answering "same key, different body → 409" even after the Valkey fast-path
+  record is evicted; a live hold is likewise unique per `(order_id, sku)`.
 - DB constraints belong in the DB: `CHECK(price > 0)`,
   `CHECK(on_hand >= 0)`, `CHECK(reserved <= on_hand)`, explicit `ON DELETE`.
   The identity mirror is keyed by `UNIQUE(oidc_sub)` and deliberately carries
@@ -261,8 +349,8 @@ version"; recovery if it's violated: `docs/RUNBOOK.md` § 4.
 
 ## Extension points
 
-- New resource = add model → repository → service → router, wired in
-  `container.py`. Layers keep the change local.
+- New resource = add model → repository → service → router inside its module,
+  wired in `src/shared/container.py`. Layers keep the change local.
 - Auth-service split: identity already lives in Keycloak and the app only
   validates tokens against JWKS, so a separate issuer is a non-event.
 - Read cache / search / additional workers are additive behind the existing
@@ -271,5 +359,6 @@ version"; recovery if it's violated: `docs/RUNBOOK.md` § 4.
 ## Deploy target
 
 Docker image → ECR (tagged by git SHA, not `latest`) → **ECS Fargate**, behind an
-ALB, multiple identical tasks. Alembic runs as a one-off migration task, not at
-app boot. Terraform is the IaC. See [`DEPLOYMENT.md`](DEPLOYMENT.md).
+ALB, multiple identical tasks. Alembic runs as a one-off migration task (one
+independent chain per module), not at app boot. Terraform is the IaC. See
+[`DEPLOYMENT.md`](DEPLOYMENT.md).

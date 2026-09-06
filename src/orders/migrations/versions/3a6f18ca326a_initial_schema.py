@@ -96,4 +96,7 @@ def downgrade() -> None:
     op.drop_table("outbox", schema="orders")
     op.drop_index("ix_orders_user_id_status", table_name="orders", schema="orders")
     op.drop_table("orders", schema="orders")
+    # Drop the enum explicitly: without this a `downgrade base` + `upgrade head`
+    # round-trip fails with "type already exists" on re-create.
+    sa.Enum(name="order_status", schema="orders").drop(op.get_bind(), checkfirst=True)
     # ### end Alembic commands ###

@@ -16,6 +16,7 @@ from src.cart.api import routes as cart_routes
 from src.catalog.api import routes as catalog_routes
 from src.identity.adapters.keycloak.admin_client import KeycloakIdentityAdmin
 from src.identity.api import routes as identity_routes
+from src.orders.api import routes as orders_routes
 from src.payments.api import routes as payments_routes
 from src.shared.api import health, metrics
 from src.shared.auth.jwks import build_jwks_client
@@ -99,6 +100,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.include_router(catalog_routes.router, prefix=settings.api_v1_prefix)
     app.include_router(cart_routes.router, prefix=settings.api_v1_prefix)
     app.include_router(payments_routes.router, prefix=settings.api_v1_prefix)
+    app.include_router(orders_routes.router, prefix=settings.api_v1_prefix)
+    app.include_router(orders_routes.checkout_router, prefix=settings.api_v1_prefix)
     app.include_router(metrics.router)
 
     return app

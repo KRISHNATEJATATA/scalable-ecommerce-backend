@@ -12,7 +12,8 @@ storage/payment/bus ports land with their feature tickets.
 from __future__ import annotations
 
 import uuid
-from typing import Annotated
+from decimal import Decimal
+from typing import Annotated, cast
 
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -38,7 +39,17 @@ from src.inventory.adapters.db.repository import InventoryRepository
 from src.inventory.application.service import InventoryService
 from src.inventory.ports.repository import InventoryRepositoryPort
 from src.orders.adapters.db.repository import OrdersRepository
+from src.orders.adapters.idempotency import ValkeyIdempotencyStore
+from src.orders.application.checkout_saga import CheckoutSaga
 from src.orders.application.service import OrdersService
+from src.orders.ports.checkout import (
+    BasketPort,
+    ChargePort,
+    ChargeResult,
+    CheckoutLine,
+    IdempotencyPort,
+    StockHoldsPort,
+)
 from src.orders.ports.repository import OrdersRepositoryPort
 from src.payments.adapters.db.repository import PaymentsRepository
 from src.payments.adapters.stub_gateway import StubPaymentGateway
@@ -90,8 +101,15 @@ class InventoryStockAvailability(StockAvailabilityPort):
 
 # --- catalog --------------------------------------------------------------
 def get_catalog_repository(session: SessionDep) -> CatalogRepositoryPort:
-    """Provide the catalog repository bound to the request session (port-typed)."""
-    return CatalogRepository(session)
+    """Provide the catalog repository bound to the request session (port-typed).
+
+    The cast is structural, not a bypass: ``CatalogRepository`` satisfies
+    ``CatalogRepositoryPort`` at runtime (the catalog tests assert
+    ``isinstance`` for it), but SQLAlchemy's ``Mapped[...]`` descriptors make
+    the ORM's ``Product`` fail the checker's structural match against the
+    protocol's ``ProductRecord`` view of the same attributes.
+    """
+    return cast(CatalogRepositoryPort, CatalogRepository(session))
 
 
 def get_image_store(request: Request) -> ImageStorePort | None:
@@ -151,9 +169,92 @@ def get_orders_repository(session: SessionDep) -> OrdersRepositoryPort:
     return OrdersRepository(session)
 
 
-def get_orders_service(repo: Annotated[OrdersRepositoryPort, Depends(get_orders_repository)]) -> OrdersService:
-    """Provide the orders service over its repository port."""
-    return OrdersService(repo)
+class OrderBaskets(BasketPort):
+    """Orders' :class:`BasketPort` built over the cart service.
+
+    Lives here — the one place allowed to touch every module — so orders never
+    names cart. The cart's price/name snapshots become the order lines verbatim:
+    later catalog edits never rewrite order history.
+    """
+
+    def __init__(self, cart: CartService) -> None:
+        self._cart = cart
+
+    async def get_lines(self, user_id: uuid.UUID) -> list[CheckoutLine]:
+        """The user's current cart lines as checkout lines (``[]`` when empty)."""
+        cart = await self._cart.get_cart(user_id)
+        return [
+            CheckoutLine(
+                product_id=item.product_id,
+                name=item.name,
+                unit_price=item.unit_price,
+                quantity=item.quantity,
+            )
+            for item in cart.items
+        ]
+
+    async def clear(self, user_id: uuid.UUID) -> None:
+        """Empty the basket after a successful checkout."""
+        await self._cart.clear_cart(user_id)
+
+
+class OrderStockHolds(StockHoldsPort):
+    """Orders' :class:`StockHoldsPort` built over the inventory service.
+
+    Lives here so orders never names inventory. SKU mapping ``str(product.id)``
+    is the composition seam from ADR 0011 — the saga is its production caller.
+    """
+
+    def __init__(self, inventory: InventoryService) -> None:
+        self._inventory = inventory
+
+    async def reserve(self, sku: str, qty: int, order_id: uuid.UUID) -> uuid.UUID:
+        """Hold ``qty`` of ``sku`` for ``order_id``; returns the reservation id."""
+        return (await self._inventory.reserve(sku, qty, order_id)).id
+
+    async def release_for_order(self, order_id: uuid.UUID) -> int:
+        """Release every still-held reservation of one order (compensation)."""
+        return await self._inventory.release_for_order(order_id)
+
+    async def commit_for_order(self, order_id: uuid.UUID) -> int:
+        """Consume every still-held reservation of one order (success)."""
+        return await self._inventory.commit_for_order(order_id)
+
+
+class OrderCharges(ChargePort):
+    """Orders' :class:`ChargePort` built over the payments service.
+
+    Lives here so orders never names payments. Terminal states map to the
+    saga's vocabulary; a still-``pending`` attempt is reported as-is so the
+    recovery poller defers to the payment reconciler.
+    """
+
+    def __init__(self, payments: PaymentsService) -> None:
+        self._payments = payments
+
+    async def charge(
+        self, *, order_id: uuid.UUID, idempotency_key: str, amount: Decimal, payment_token: str
+    ) -> ChargeResult:
+        """Charge through the gateway (idempotent on ``idempotency_key``)."""
+        payment = await self._payments.charge(
+            order_id=order_id,
+            idempotency_key=idempotency_key,
+            amount=amount,
+            payment_method_token=payment_token,
+        )
+        return ChargeResult(status=payment.status)
+
+    async def find_by_idempotency_key(self, idempotency_key: str) -> ChargeResult | None:
+        """The recorded charge outcome, or ``None`` if never charged."""
+        payment = await self._payments.get_by_idempotency_key(idempotency_key)
+        if payment is None:
+            return None
+        return ChargeResult(status=payment.status)
+
+
+# The saga's provider functions live at the bottom of this file (after the
+# cart/payments providers they depend on); the port-adapter classes above are
+# import-only and safe anywhere.
 
 
 # --- identity -------------------------------------------------------------
@@ -285,3 +386,67 @@ def get_payments_service(
         reconciliation_grace_seconds=settings.payment_reconciliation_grace_seconds,
         reconciliation_max_age_seconds=settings.payment_reconciliation_max_age_seconds,
     )
+
+
+# --- checkout saga (orders) ------------------------------------------------
+# Kept after the cart/payments/inventory providers: these functions reference
+# them, and defined-after-use in source reads like a bug to the type checker
+# even though FastAPI resolves the strings lazily.
+def get_order_basket(
+    cart: Annotated[CartService, Depends(get_cart_service)],
+) -> BasketPort:
+    """Provide the cart-backed basket lines for checkout."""
+    return OrderBaskets(cart)
+
+
+def get_order_stock_holds(
+    inventory: Annotated[InventoryService, Depends(get_inventory_service)],
+) -> StockHoldsPort:
+    """Provide the inventory-backed stock holds for the saga."""
+    return OrderStockHolds(inventory)
+
+
+def get_order_charges(
+    payments: Annotated[PaymentsService, Depends(get_payments_service)],
+) -> ChargePort:
+    """Provide the payments-backed charges for the saga."""
+    return OrderCharges(payments)
+
+
+def get_order_idempotency(request: Request) -> IdempotencyPort | None:
+    """Provide the Valkey idempotency fast path, or ``None`` if Valkey is down/absent.
+
+    ``None`` only loses the fast path — the DB UNIQUE backstop still prevents
+    duplicate orders, degrading to re-reading the stored row.
+    """
+    valkey = getattr(request.app.state, "valkey", None)
+    if valkey is None:
+        return None
+    return ValkeyIdempotencyStore(valkey, ttl_seconds=request.app.state.settings.checkout_idempotency_ttl_seconds)
+
+
+def get_checkout_saga(
+    repo: Annotated[OrdersRepositoryPort, Depends(get_orders_repository)],
+    basket: Annotated[BasketPort, Depends(get_order_basket)],
+    holds: Annotated[StockHoldsPort, Depends(get_order_stock_holds)],
+    charges: Annotated[ChargePort, Depends(get_order_charges)],
+    idempotency: Annotated[IdempotencyPort | None, Depends(get_order_idempotency)],
+    request: Request,
+) -> CheckoutSaga:
+    """Provide the checkout saga orchestrator over its ports."""
+    return CheckoutSaga(
+        repo,
+        basket,
+        holds,
+        charges,
+        idempotency,
+        step_timeout_seconds=request.app.state.settings.checkout_saga_step_timeout_seconds,
+    )
+
+
+def get_orders_service(
+    repo: Annotated[OrdersRepositoryPort, Depends(get_orders_repository)],
+    holds: Annotated[StockHoldsPort, Depends(get_order_stock_holds)],
+) -> OrdersService:
+    """Provide the orders service over its repository + stock-holds ports (cancel needs both)."""
+    return OrdersService(repo, holds)
