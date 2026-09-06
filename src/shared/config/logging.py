@@ -16,7 +16,9 @@ sensitive keys automatically.
 """
 
 import logging
+import re
 import sys
+import traceback
 import uuid
 from contextvars import ContextVar
 
@@ -41,7 +43,10 @@ def current_trace_id() -> str:
 
 
 # minimal boundary redaction. Full key/PII scrubbing hardens in Phase 9.
-_REDACT_KEYS = ("password", "token", "authorization", "secret", "cookie", "jwt")
+_REDACT_KEYS = ("password", "token", "authorization", "secret", "cookie", "jwt", "email")
+# Key substrings can't catch a bare address ("email" isn't inside
+# "buyer@example.com"), so PII-shaped values get their own pattern.
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 
 
 class ContextFilter(logging.Filter):
@@ -53,13 +58,38 @@ class ContextFilter(logging.Filter):
 
 
 class RedactFilter(logging.Filter):
-    """Redact obvious secrets that slipped into a log message."""
+    """Redact obvious secrets that slipped into a log record.
+
+    Covers the **whole record**, not just the message: ``log.exception(...)``
+    renders ``exc_info`` into the traceback *inside the formatter*, so a poison
+    event failing contract validation would otherwise print the offending
+    payload (a customer email) inside the pydantic ``ValidationError`` text.
+    On a sensitive-key hit the rendered traceback is dropped and replaced by a
+    marker — the DLQ/queue retains the raw body for inspection either way.
+
+    ``exc_text`` (the pre-rendered traceback some handlers cache), ``exc_info``
+    itself, and ``stack_info`` are cleared on a hit, so no handler — ecs-logging
+    or a plain stdlib formatter — can re-render the payload.
+    """
 
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage().lower()
-        if any(key in msg for key in _REDACT_KEYS):
-            record.msg = "[REDACTED: message contained a sensitive key]"
-            record.args = ()
+        rendered_traceback = record.exc_text or (
+            "".join(traceback.format_exception(*record.exc_info)) if record.exc_info else ""
+        )
+        stack_info = record.stack_info or ""
+        hay = f"{msg}\n{rendered_traceback.lower()}\n{stack_info.lower()}"
+        hit = any(key in hay for key in _REDACT_KEYS) or _EMAIL_RE.search(hay) is not None
+        if not hit:
+            return True
+        record.msg = "[REDACTED: record contained a sensitive key]"
+        record.args = ()
+        # Drop every traceback carrier, whether or not exc_info is still set:
+        # some handlers cache the rendered text into exc_text, and the stdlib
+        # formatter renders exc_info directly while ecs-logging ignores exc_text.
+        record.exc_info = None
+        record.exc_text = "[REDACTED: traceback contained a sensitive key]"
+        record.stack_info = None
         return True
 
 

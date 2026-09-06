@@ -32,7 +32,11 @@ class AppSettings(BaseSettings):
     environment: Literal["local", "dev", "staging", "prod"] = "local"
     debug: bool = False
     log_level: str = "INFO"
-
+    # 5xx Problem bodies are always sanitized (a generic message; internals only
+    # in the logs). ``true`` may keep raw exception text in the 5xx ``detail``
+    # for debugging — refused outright outside local/dev, so a misconfigured
+    # deploy can never leak SQL/driver errors to callers.
+    verbose_error_details: bool = False
     # --- Database (required: fail-fast on missing config) ---
     database_url: PostgresDsn = Field(
         ...,
@@ -324,6 +328,21 @@ class AppSettings(BaseSettings):
                 "checkout_saga_step_timeout_seconds must stay below reservation_ttl_seconds "
                 f"({self.checkout_saga_step_timeout_seconds} >= {self.reservation_ttl_seconds}): "
                 "a live checkout would lose its stock to the reaper mid-saga"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _refuse_verbose_errors_outside_dev(self) -> "AppSettings":
+        """Fail-fast: verbose 5xx details are a dev-only debugging aid.
+
+        Any environment a real caller can reach (staging included) must not hand
+        raw exception text (SQL statements, driver errors) to callers — reject
+        the config at startup instead of leaking at the first 500.
+        """
+        if self.environment not in ("local", "dev") and self.verbose_error_details:
+            raise ValueError(
+                "verbose_error_details is only allowed with environment local/dev: "
+                f"raw 5xx detail would leak internals ({self.environment})"
             )
         return self
 

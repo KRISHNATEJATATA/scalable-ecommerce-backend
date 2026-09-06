@@ -88,7 +88,12 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    app.add_middleware(SecurityHeadersMiddleware)
+    app.add_middleware(
+        SecurityHeadersMiddleware,
+        # Relax CSP for the docs pages only when they're actually served
+        # (non-prod); the API keeps the strict policy everywhere, incl. prod.
+        docs_csp_paths=frozenset({path for path in (app.docs_url, app.redoc_url, app.openapi_url) if path is not None}),
+    )
     app.add_middleware(RequestIDMiddleware)
 
     register_exception_handlers(app)

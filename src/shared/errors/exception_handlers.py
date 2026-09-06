@@ -6,6 +6,8 @@ Details shape defined in the API contract.
 """
 
 import logging
+import uuid
+from http import HTTPStatus
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -13,6 +15,7 @@ from sqlalchemy.orm.exc import StaleDataError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse
 
+from src.shared.config.logging import request_id_ctx
 from src.shared.errors.error_builder import PROBLEM_CONTENT_TYPE, build_problem
 from src.shared.errors.exceptions import (
     AuthenticationError,
@@ -35,6 +38,7 @@ from src.shared.errors.exceptions import (
     ReservationContendedError,
     UnknownPaymentRefError,
 )
+from src.shared.middleware.security import REQUEST_ID_HEADER
 
 logger = logging.getLogger(__name__)
 
@@ -159,7 +163,22 @@ async def _keycloak_conflict_handler(_: Request, exc: KeycloakConflictError) -> 
 
 
 async def _http_exception_handler(_: Request, exc: StarletteHTTPException) -> JSONResponse:
-    return _problem_response(exc.status_code, title=str(exc.detail))
+    # RFC 9457: `title` is the status reason ("Not Found"), `detail` carries the
+    # occurrence-specific text ("product not found"). Framework-raised headers
+    # (e.g. Starlette's 401 challenge) ride along.
+    title = _status_reason(exc.status_code)
+    response = _problem_response(exc.status_code, title=title, detail=str(exc.detail))
+    for name, value in (exc.headers or {}).items():
+        response.headers[name] = value
+    return response
+
+
+def _status_reason(status: int) -> str:
+    """The HTTP reason phrase as the Problem ``title`` (unknown codes → generic)."""
+    try:
+        return HTTPStatus(status).phrase
+    except ValueError:
+        return "Error"
 
 
 async def _validation_exception_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
@@ -171,10 +190,30 @@ async def _validation_exception_handler(_: Request, exc: RequestValidationError)
     )
 
 
-async def _unhandled_exception_handler(_: Request, exc: Exception) -> JSONResponse:
-    # Boundary catch: never leak internals; the trace_id ties the log to the response.
-    logger.exception("Unhandled exception: %s", type(exc).__name__)
-    return _problem_response(500, title="Internal Server Error")
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    # Boundary catch: 5xx bodies are sanitized — a generic message, never the raw
+    # exception text, SQL statement, or driver error; internals stay in the logs
+    # (the RedactFilter scrubs secrets/PII there), tied to the trace_id. Dev may
+    # opt into raw detail via the prod-refused `verbose_error_details` setting.
+    #
+    # This handler runs under Starlette's ServerErrorMiddleware, OUTSIDE
+    # RequestIDMiddleware: by the time we get here, its `finally` has already
+    # reset `request_id_ctx`, so the log line and `build_problem()` would stamp
+    # an empty trace_id. Re-establish the context from the id the middleware
+    # stashed on request.state (a fresh one for a request that died before the
+    # middleware ran), and mirror it back on the response — a client-reported
+    # 500 must be correlatable to its log record.
+    request_id = getattr(request.state, "request_id", None) or uuid.uuid4().hex
+    token = request_id_ctx.set(request_id)
+    try:
+        logger.exception("Unhandled exception: %s", type(exc).__name__)
+        settings = request.app.state.settings
+        detail = f"{type(exc).__name__}: {exc}" if settings.verbose_error_details else None
+        response = _problem_response(500, title="Internal Server Error", detail=detail)
+    finally:
+        request_id_ctx.reset(token)
+    response.headers[REQUEST_ID_HEADER] = request_id
+    return response
 
 
 def register_exception_handlers(app: FastAPI) -> None:

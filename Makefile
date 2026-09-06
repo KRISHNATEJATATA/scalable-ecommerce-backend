@@ -18,8 +18,9 @@ lint: ## Ruff check + format check + import-linter (module boundaries)
 	ruff format --check src tests
 	lint-imports
 
-typecheck: ## Run basedpyright (advisory only — baseline carries pre-existing errors; NOT wired into lint/CI)
+typecheck: ## Run basedpyright + ty (advisory only — both carry pre-existing baseline errors; NOT wired into lint/CI)
 	basedpyright src
+	ty check src
 
 test: ## Run the unit test suite (coverage reported, not gated)
 	pytest tests/unit/
