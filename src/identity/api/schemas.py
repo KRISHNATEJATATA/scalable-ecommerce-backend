@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from src.identity.application.dto import AdminUserResponse as AdminUserResponse  # admin directory item for OpenAPI
 from src.identity.application.dto import UserResponse as UserResponse
 
 

@@ -10,13 +10,19 @@ JIT lookups find an existing row.
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import json
 import uuid
 
-from src.identity.application.dto import UserResponse
+from src.identity.application.dto import AdminUserResponse, UserResponse
 from src.identity.application.mappers import to_domain
 from src.identity.application.outbox import user_created_outbox
+from src.identity.domain.user import DirectoryUser
 from src.identity.ports.admin import IdentityAdminPort
 from src.identity.ports.repository import IdentityRepositoryPort
+from src.shared.db.pagination import PageResponse
+from src.shared.errors.exceptions import InvalidCursorError
 
 
 class IdentityService:
@@ -103,3 +109,56 @@ class IdentityAdminService:
         Keycloak drives password setup via an ``UPDATE_PASSWORD`` required action.
         """
         return await self._admin.create_user(email)
+
+    async def list_users(
+        self, *, limit: int, cursor: str | None, search: str | None
+    ) -> PageResponse[AdminUserResponse]:
+        """List the Keycloak directory (admin-gated at the route) as a cursor page.
+
+        No ``sort`` param: Keycloak's users endpoint has none — directory order is
+        Keycloak's. Roles are read live from Keycloak role mappings, so items are
+        always role-current (unlike token claims); ``disabled`` mirrors Keycloak
+        ``enabled=false``. ``search`` is forwarded untouched (Keycloak ``search``
+        semantics). A full page carries ``next_cursor`` for the next offset; a
+        short page is the last one.
+        """
+        offset = 0 if cursor is None else _decode_offset_cursor(cursor)
+        users = await self._admin.list_users(search, offset, limit)
+        sem = asyncio.Semaphore(_ROLE_GATHER_CONCURRENCY)
+
+        async def _is_merchant(user: DirectoryUser) -> bool:
+            async with sem:
+                return await self._admin.has_realm_role(user.sub, "merchant")
+
+        flags = await asyncio.gather(*(_is_merchant(u) for u in users))
+        items = [
+            AdminUserResponse(sub=u.sub, email=u.email, merchant_role=flag, disabled=not u.enabled)
+            for u, flag in zip(users, flags, strict=True)
+        ]
+        next_cursor = _encode_offset_cursor(offset + limit) if len(items) == limit else None
+        return PageResponse(items=items, next_cursor=next_cursor)
+
+
+# one codec, two helpers, module-local — the shared pagination codec
+# is DB-UUID keyset-shaped; this endpoint pages a Keycloak offset instead.
+# ponytail: bounds the *intra-request* role-gather (thundering herd ≤10); the
+# cross-request token-refresh race on the shared client connection is pre-existing
+# and self-heals via the client's 401 retry.
+_ROLE_GATHER_CONCURRENCY = 10
+
+
+def _encode_offset_cursor(offset: int) -> str:
+    """Opaque cursor: base64url JSON of the Keycloak Admin API offset (its ``first``)."""
+    return base64.urlsafe_b64encode(json.dumps({"offset": offset}).encode()).decode()
+
+
+def _decode_offset_cursor(cursor: str) -> int:
+    """Decode an offset cursor; any malformed/tampered value → :class:`InvalidCursorError` (→ 400)."""
+    try:
+        parsed = json.loads(base64.urlsafe_b64decode(cursor.encode()))
+        offset = parsed["offset"]
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("cursor offset must be a non-negative int")
+    except Exception as exc:  # malformed base64 / JSON / wrong shape / bad offset
+        raise InvalidCursorError(cursor) from exc
+    return offset

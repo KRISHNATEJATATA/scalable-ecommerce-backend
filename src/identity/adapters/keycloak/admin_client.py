@@ -56,6 +56,12 @@ def map_admin_errors[**P](fn: Callable[P, Awaitable[_T]]) -> Callable[P, Awaitab
     return functools.wraps(fn)(wrapper)
 
 
+# Appended below map_admin_errors to keep lines 1-56 byte-stable: the basedpyright
+# diagnostic-diff gate keys on (file, line) and the baseline diagnostics live above.
+from src.identity.domain.user import DirectoryUser  # noqa: E402
+from src.shared.errors.exceptions import DependencyUnavailableError  # noqa: E402
+
+
 class KeycloakIdentityAdmin:
     """Grant/revoke realm roles and enable/disable users via Keycloak's Admin API."""
 
@@ -159,3 +165,45 @@ class KeycloakIdentityAdmin:
             await asyncio.shield(kc.a_delete_user(user_sub))
             raise
         return user_sub
+
+    async def list_users(self, search: str | None, first: int, max_results: int) -> list[DirectoryUser]:
+        """Page through Keycloak's user directory (offset pagination).
+
+        Deliberately **not** decorated with :func:`map_admin_errors`: that path runs
+        ``_translate``, which turns 404 into "entity not found" — but a directory
+        listing has no singular entity to miss, so every ``KeycloakError`` here is a
+        dependency fault and maps to :class:`DependencyUnavailableError` (503), the
+        same contract as the JWKS path and the frontend's documented outage handling.
+        ``max_results`` is passed to Keycloak as its ``max`` query param (``max`` is
+        avoided as a parameter name to not shadow the builtin).
+
+        ponytail: offset pagination drifts under concurrent user creation (rows can
+        repeat/skip across pages) — acceptable for an admin directory.
+        """
+        kc = await self._client()
+        try:
+            users = await kc.a_get_users(
+                query={"first": first, "max": max_results, **({"search": search} if search else {})}
+            )
+        except KeycloakError as exc:
+            raise DependencyUnavailableError("Keycloak is unavailable") from exc
+        return [DirectoryUser(sub=u["id"], email=u.get("email"), enabled=u.get("enabled", True)) for u in users]
+
+    async def has_realm_role(self, user_sub: str, role: str) -> bool:
+        """Check a user's realm-role mappings (read live, more current than token claims).
+
+        Returns ``True``/``False`` per the role list. A 404 (user vanished between the
+        directory page and this lookup) returns ``False`` — the account simply doesn't
+        exist anymore, so it is shown roleless instead of failing the whole page. Any
+        other ``KeycloakError`` is a dependency fault → :class:`DependencyUnavailableError`.
+        """
+        kc = await self._client()
+        try:
+            roles = await kc.a_get_realm_roles_of_user(user_sub)
+        except KeycloakGetError as exc:
+            if exc.response_code == 404:
+                return False
+            raise DependencyUnavailableError("Keycloak is unavailable") from exc
+        except KeycloakError as exc:
+            raise DependencyUnavailableError("Keycloak is unavailable") from exc
+        return any(r.get("name") == role for r in roles)

@@ -24,3 +24,17 @@ class UserResponse(BaseModel):
     is_active: bool
     created_at: datetime
     updated_at: datetime
+
+
+class AdminUserResponse(BaseModel):
+    """One Keycloak directory entry in the admin listing (service-built from live Admin-API data).
+
+    Not the local mirror: ``sub`` is the Keycloak id, ``email`` may be ``None``
+    (an account without an address), ``merchant_role`` is resolved live from
+    Keycloak role mappings, and ``disabled`` mirrors Keycloak ``enabled=false``.
+    """
+
+    sub: str
+    email: str | None
+    merchant_role: bool
+    disabled: bool

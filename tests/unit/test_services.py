@@ -10,10 +10,14 @@ HTTP ``dependency_overrides`` round-trip rides.
 
 from __future__ import annotations
 
+import base64
+import json
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
+
+import pytest
 
 from src.catalog.adapters.db.repository import ProductRow
 from src.catalog.api.schemas import ProductResponse
@@ -21,9 +25,10 @@ from src.catalog.application.mappers import to_domain as product_to_domain
 from src.catalog.application.service import CatalogService
 from src.catalog.domain.product import Product
 from src.identity.api.schemas import UserResponse
+from src.identity.application.dto import AdminUserResponse
 from src.identity.application.mappers import to_domain as user_to_domain
-from src.identity.application.service import IdentityService
-from src.identity.domain.user import User
+from src.identity.application.service import IdentityAdminService, IdentityService, _encode_offset_cursor
+from src.identity.domain.user import DirectoryUser, User
 from src.inventory.api.schemas import InventoryResponse
 from src.inventory.application.mappers import to_domain as inventory_to_domain
 from src.inventory.application.service import InventoryService
@@ -37,6 +42,7 @@ from src.payments.application.mappers import to_domain as payment_to_domain
 from src.payments.application.service import PaymentsService
 from src.payments.domain.payment import Payment
 from src.shared.db.pagination import Page, PageParams, PageResponse
+from src.shared.errors.exceptions import InvalidCursorError
 
 _NOW = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -294,3 +300,99 @@ def test_payments_mapper_maps_orm_row_to_domain_payment():
         row.amount,
         row.gateway_ref,
     )
+
+
+# --- identity admin directory listing (fake port, no Keycloak) -------------
+
+
+class _FakeIdentityAdmin:
+    """Fake IdentityAdminPort: a canned directory sliced by (first, max), calls recorded."""
+
+    def __init__(self, users, merchant_subs=()):
+        self._users = users
+        self._merchant_subs = set(merchant_subs)
+        self.calls = []
+
+    async def grant_realm_role(self, user_sub, role): ...
+
+    async def revoke_realm_role(self, user_sub, role): ...
+
+    async def set_enabled(self, user_sub, enabled): ...
+
+    async def get_user_email(self, user_sub): ...
+
+    async def create_user(self, email): ...
+
+    async def list_users(self, search, first, max_results):
+        self.calls.append((search, first, max_results))
+        return self._users[first : first + max_results]
+
+    async def has_realm_role(self, user_sub, role):
+        return role == "merchant" and user_sub in self._merchant_subs
+
+
+def _dir_user(sub, email="u@example.com", enabled=True):
+    return DirectoryUser(sub=sub, email=email, enabled=enabled)
+
+
+async def test_admin_list_users_maps_items_roles_and_next_cursor():
+    users = [
+        _dir_user("sub-1"),
+        _dir_user("sub-2", enabled=False),
+        _dir_user("sub-3", email=None),
+    ]
+    admin = _FakeIdentityAdmin(users, merchant_subs={"sub-1", "sub-2"})
+    svc = IdentityAdminService(_FakeSingleRepo(), admin)
+    page = await svc.list_users(limit=3, cursor=None, search=None)
+    assert isinstance(page, PageResponse)
+    assert all(isinstance(item, AdminUserResponse) for item in page.items)
+    assert [(i.sub, i.email, i.merchant_role, i.disabled) for i in page.items] == [
+        ("sub-1", "u@example.com", True, False),
+        ("sub-2", "u@example.com", True, True),
+        ("sub-3", None, False, False),
+    ]
+    assert admin.calls == [(None, 0, 3)]
+    assert page.next_cursor == _encode_offset_cursor(3)
+
+
+async def test_admin_list_users_second_page_returns_next_slice():
+    admin = _FakeIdentityAdmin([_dir_user(f"sub-{i}") for i in range(1, 5)])
+    svc = IdentityAdminService(_FakeSingleRepo(), admin)
+    first = await svc.list_users(limit=2, cursor=None, search=None)
+    second = await svc.list_users(limit=2, cursor=first.next_cursor, search=None)
+    assert [i.sub for i in second.items] == ["sub-3", "sub-4"]
+    assert admin.calls == [(None, 0, 2), (None, 2, 2)]
+    assert second.next_cursor == _encode_offset_cursor(4)
+
+
+async def test_admin_list_users_forwards_search_untouched():
+    admin = _FakeIdentityAdmin([_dir_user("sub-9")])
+    svc = IdentityAdminService(_FakeSingleRepo(), admin)
+    page = await svc.list_users(limit=10, cursor=None, search="sub-9")
+    assert admin.calls == [("sub-9", 0, 10)]
+    assert [i.sub for i in page.items] == ["sub-9"]
+    assert page.next_cursor is None
+
+
+async def test_admin_list_users_short_page_has_no_next_cursor():
+    svc = IdentityAdminService(_FakeSingleRepo(), _FakeIdentityAdmin([_dir_user("sub-1")]))
+    page = await svc.list_users(limit=5, cursor=None, search=None)
+    assert len(page.items) == 1
+    assert page.next_cursor is None
+
+
+@pytest.mark.parametrize(
+    "bad_cursor",
+    [
+        "garbage!!",
+        _encode_offset_cursor(-1),
+        base64.urlsafe_b64encode(json.dumps({"offset": "1"}).encode()).decode(),
+        base64.urlsafe_b64encode(json.dumps({"offset": True}).encode()).decode(),
+        base64.urlsafe_b64encode(json.dumps({"nope": 1}).encode()).decode(),
+        base64.urlsafe_b64encode(json.dumps([0]).encode()).decode(),
+    ],
+)
+async def test_admin_list_users_rejects_bad_cursors(bad_cursor):
+    svc = IdentityAdminService(_FakeSingleRepo(), _FakeIdentityAdmin([_dir_user("sub-1")]))
+    with pytest.raises(InvalidCursorError):
+        await svc.list_users(limit=5, cursor=bad_cursor, search=None)

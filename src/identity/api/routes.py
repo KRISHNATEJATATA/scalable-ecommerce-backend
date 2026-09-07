@@ -13,13 +13,15 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, Request, status
 
-from src.identity.api.schemas import CreateUserRequest, CreateUserResponse, UserResponse
+from src.identity.api.schemas import AdminUserResponse, CreateUserRequest, CreateUserResponse, UserResponse
 from src.identity.application.service import IdentityAdminService
+from src.shared.api.query import reject_unknown_query_params
 from src.shared.auth.dependencies import require_role
 from src.shared.auth.principal import Principal
 from src.shared.container import CurrentUserDep, get_identity_admin_service
+from src.shared.db.pagination import DEFAULT_LIMIT, MAX_LIMIT, PageResponse
 
 router = APIRouter(tags=["identity"])
 
@@ -45,6 +47,25 @@ async def create_user(
     """Create a new Keycloak account (admin only); Keycloak defaults the role to ``consumer``."""
     sub = await service.create_user(body.email)
     return CreateUserResponse(sub=sub)
+
+
+@router.get("/admin/users", response_model=PageResponse[AdminUserResponse], dependencies=[_require_admin])
+async def list_admin_users(
+    request: Request,
+    service: AdminServiceDep,
+    _admin_user: CurrentUserDep,
+    limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
+    cursor: str | None = None,
+    search: Annotated[str | None, Query(max_length=200)] = None,
+) -> PageResponse[AdminUserResponse]:
+    """List the Keycloak directory (admin only) as a ``{items, next_cursor}`` page.
+
+    Items carry ``{sub, email, merchant_role, disabled}`` resolved live from the
+    Keycloak Admin API; unknown query params are a 400. No ``sort`` param —
+    Keycloak's users endpoint has none (deviation documented in frontend-handoff).
+    """
+    reject_unknown_query_params(request, frozenset({"limit", "cursor", "search"}))
+    return await service.list_users(limit=limit, cursor=cursor, search=search)
 
 
 @router.post(

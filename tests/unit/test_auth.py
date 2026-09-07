@@ -29,11 +29,18 @@ from testcontainers.postgres import PostgresContainer
 from src.app import create_app
 from src.identity.adapters.db.repository import IdentityRepository
 from src.identity.application.outbox import user_created_outbox
+from src.identity.domain.user import DirectoryUser
 from src.shared.config.setting import AppSettings, get_settings
+from src.shared.errors.exceptions import DependencyUnavailableError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ISSUER = "https://keycloak.test/realms/ecommerce"
 AUDIENCE = "ecommerce-api"
+
+# Canned directory subs for the admin listing tests (stable literals, not
+# uuid4(), so a failing assertion shows a reproducible sub).
+MERCHANT_SUB = "00000000-0000-0000-0000-000000000001"
+DISABLED_SUB = "00000000-0000-0000-0000-000000000002"
 
 
 # --- keypair + token helpers ----------------------------------------------
@@ -94,6 +101,16 @@ class _FakeAdmin:
         self.enabled: dict[str, bool] = {}
         self.emails: dict[str, str] = {}
         self.created: list[tuple[str, str]] = []
+        # Directory for the admin listing: 20 entries so the default page is a
+        # FULL page (next_cursor set). One merchant; one disabled consumer with
+        # no email (covers email=None + disabled = not enabled).
+        self.directory: list[DirectoryUser] = [
+            DirectoryUser(sub=MERCHANT_SUB, email="merchant@test.io", enabled=True),
+            DirectoryUser(sub=DISABLED_SUB, email=None, enabled=False),
+            *[DirectoryUser(sub=f"pad-{i:02d}", email=f"pad-{i:02d}@test.io", enabled=True) for i in range(18)],
+        ]
+        self.realm_roles: set[tuple[str, str]] = {(MERCHANT_SUB, "merchant")}
+        self.listed: list[tuple[str | None, int, int]] = []
 
     async def grant_realm_role(self, user_sub: str, role: str) -> None:
         self.granted.append((user_sub, role))
@@ -112,6 +129,13 @@ class _FakeAdmin:
         self.created.append(email)
         self.emails[sub] = email
         return sub
+
+    async def list_users(self, search: str | None, first: int, max_results: int) -> list[DirectoryUser]:
+        self.listed.append((search, first, max_results))
+        return self.directory[first : first + max_results]
+
+    async def has_realm_role(self, user_sub: str, role: str) -> bool:
+        return (user_sub, role) in self.realm_roles
 
 
 # --- Postgres (identity module only) --------------------------------------
@@ -491,3 +515,117 @@ async def test_disable_provisions_an_already_inactive_mirror(sessionmaker):
     async with sessionmaker() as session:
         row = await IdentityRepository(session).get_or_create(sub, f"off-{uuid.uuid4()}@test.io", is_active=False)
     assert row.is_active is False
+
+
+# --- admin user directory (GET /v1/admin/users) ----------------------------
+
+
+async def test_admin_listing_returns_first_page_and_cursors(app_ctx, rsa_key):
+    """200: a full default page of 20 with exactly the four contract fields + next_cursor."""
+    token = _make_token(rsa_key, roles=["admin"])
+    async with _client(app_ctx) as client:
+        resp = await client.get("/v1/admin/users", headers=_auth(token))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert set(body) == {"items", "next_cursor"}
+    assert len(body["items"]) == 20
+    assert isinstance(body["next_cursor"], str) and body["next_cursor"]
+    for item in body["items"]:
+        assert set(item) == {"sub", "email", "merchant_role", "disabled"}
+    by_sub = {item["sub"]: item for item in body["items"]}
+    # disabled mirrors Keycloak enabled=false; email may be None.
+    assert by_sub[DISABLED_SUB]["disabled"] is True
+    assert by_sub[DISABLED_SUB]["email"] is None
+    assert by_sub[MERCHANT_SUB]["disabled"] is False
+    # merchant_role is resolved live from Keycloak role mappings, not token claims.
+    assert by_sub[MERCHANT_SUB]["merchant_role"] is True
+    assert by_sub[DISABLED_SUB]["merchant_role"] is False
+    # Port received the default page window (offset 0, limit 20, no search).
+    fake = app_ctx.state.identity_admin
+    assert fake.listed == [(None, 0, 20)]
+    # The returned cursor must translate to first=20 at the port on the next page.
+    async with _client(app_ctx) as client:
+        second = await client.get("/v1/admin/users", headers=_auth(token), params={"cursor": body["next_cursor"]})
+    assert second.status_code == 200, second.text
+    assert fake.listed[-1] == (None, 20, 20)
+    # The directory holds exactly 20 users: page two is empty and terminal.
+    assert second.json() == {"items": [], "next_cursor": None}
+
+
+async def test_admin_listing_forwards_search(app_ctx, rsa_key):
+    """``?search=`` is forwarded untouched to the Keycloak port."""
+    token = _make_token(rsa_key, roles=["admin"])
+    async with _client(app_ctx) as client:
+        resp = await client.get("/v1/admin/users", headers=_auth(token), params={"search": "alice"})
+    assert resp.status_code == 200, resp.text
+    assert app_ctx.state.identity_admin.listed == [("alice", 0, 20)]
+
+
+async def test_admin_listing_rejects_consumer_403(app_ctx, rsa_key):
+    token = _make_token(rsa_key, roles=["consumer"])
+    async with _client(app_ctx) as client:
+        resp = await client.get("/v1/admin/users", headers=_auth(token))
+    assert resp.status_code == 403
+    body = resp.json()
+    assert body["status"] == 403 and "type" in body
+    # The gate fires before the handler: the directory was never touched.
+    assert app_ctx.state.identity_admin.listed == []
+
+
+async def test_admin_listing_requires_token_401(app_ctx):
+    async with _client(app_ctx) as client:
+        resp = await client.get("/v1/admin/users")
+    assert resp.status_code == 401
+    assert resp.headers["WWW-Authenticate"] == "Bearer"
+    assert app_ctx.state.identity_admin.listed == []
+
+
+async def test_admin_listing_rejects_malformed_cursor_400(app_ctx, rsa_key):
+    token = _make_token(rsa_key, roles=["admin"])
+    async with _client(app_ctx) as client:
+        resp = await client.get("/v1/admin/users", headers=_auth(token), params={"cursor": "garbage!!"})
+    assert resp.status_code == 400, resp.text
+    body = resp.json()
+    assert body["status"] == 400 and "type" in body and "trace_id" in body
+
+
+async def test_admin_listing_rejects_unknown_query_param_400(app_ctx, rsa_key):
+    token = _make_token(rsa_key, roles=["admin"])
+    async with _client(app_ctx) as client:
+        resp = await client.get("/v1/admin/users", headers=_auth(token), params={"bogus": "1"})
+    assert resp.status_code == 400, resp.text
+    body = resp.json()
+    assert body["status"] == 400
+    assert "bogus" in body["detail"]
+    # The guard raises before the service call.
+    assert app_ctx.state.identity_admin.listed == []
+
+
+async def test_admin_listing_rejects_limit_over_max_422(app_ctx, rsa_key):
+    token = _make_token(rsa_key, roles=["admin"])
+    async with _client(app_ctx) as client:
+        resp = await client.get("/v1/admin/users", headers=_auth(token), params={"limit": "101"})
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert isinstance(body["details"], list) and body["details"]
+
+
+async def test_admin_listing_maps_keycloak_outage_to_503(app_ctx, rsa_key):
+    """HTTP-layer proof: DependencyUnavailableError from the port surfaces as a 503 Problem Detail."""
+
+    class _Outage(_FakeAdmin):
+        async def list_users(self, search: str | None, first: int, max_results: int) -> list[DirectoryUser]:
+            raise DependencyUnavailableError("Keycloak is unavailable")
+
+    app_ctx.state.identity_admin = _Outage()
+    token = _make_token(rsa_key, roles=["admin"])
+    async with _client(app_ctx) as client:
+        resp = await client.get("/v1/admin/users", headers=_auth(token))
+    assert resp.status_code == 503, resp.text
+    body = resp.json()
+    assert body["status"] == 503 and "type" in body and "trace_id" in body
+
+
+async def test_admin_listing_is_in_openapi(app_ctx):
+    # The GET operation specifically (the POST create route shares this path).
+    assert "get" in app_ctx.openapi()["paths"]["/v1/admin/users"]
