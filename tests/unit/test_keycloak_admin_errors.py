@@ -112,7 +112,7 @@ def _admin_with_fake(monkeypatch, fake: _RecordingKeycloak) -> KeycloakIdentityA
     return admin
 
 
-async def test_list_users_maps_reps_and_passes_query(monkeypatch) -> None:
+async def test_list_users_maps_reps_and_wraps_search_for_infix(monkeypatch) -> None:
     fake = _RecordingKeycloak(
         users=[
             {"id": "sub-1", "email": "a@example.com", "enabled": True},
@@ -126,13 +126,17 @@ async def test_list_users_maps_reps_and_passes_query(monkeypatch) -> None:
         DirectoryUser(sub="sub-1", email="a@example.com", enabled=True),
         DirectoryUser(sub="sub-2", email=None, enabled=False),
     ]
-    assert fake.get_users_query == {"first": 20, "max": 50, "search": "alice"}
+    # Keycloak's bare `search` is prefix-only; the wrap is what buys substring.
+    assert fake.get_users_query == {"first": 20, "max": 50, "search": "*alice*"}
 
 
 async def test_list_users_without_search_omits_search_key(monkeypatch) -> None:
     fake = _RecordingKeycloak(users=[], roles=[])
     admin = _admin_with_fake(monkeypatch, fake)
     assert await admin.list_users(None, 0, 100) == []
+    assert fake.get_users_query == {"first": 0, "max": 100}
+    # An empty `search` must not be wrapped into Keycloak's match-everything "*".
+    assert await admin.list_users("", 0, 100) == []
     assert fake.get_users_query == {"first": 0, "max": 100}
 
 

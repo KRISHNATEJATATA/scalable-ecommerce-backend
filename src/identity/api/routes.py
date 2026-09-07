@@ -56,13 +56,17 @@ async def list_admin_users(
     _admin_user: CurrentUserDep,
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
     cursor: str | None = None,
-    search: Annotated[str | None, Query(max_length=200)] = None,
+    search: Annotated[
+        str | None,
+        Query(max_length=200, description="Case-insensitive substring match over username/email."),
+    ] = None,
 ) -> PageResponse[AdminUserResponse]:
     """List the Keycloak directory (admin only) as a ``{items, next_cursor}`` page.
 
     Items carry ``{sub, email, merchant_role, disabled}`` resolved live from the
-    Keycloak Admin API; unknown query params are a 400. No ``sort`` param —
-    Keycloak's users endpoint has none (deviation documented in frontend-handoff).
+    Keycloak Admin API; ``search`` matches any part of username/email; unknown
+    query params are a 400. No ``sort`` param — Keycloak's users endpoint has
+    none (deviation documented in frontend-handoff).
     """
     reject_unknown_query_params(request, frozenset({"limit", "cursor", "search"}))
     return await service.list_users(limit=limit, cursor=cursor, search=search)

@@ -169,8 +169,19 @@ class KeycloakIdentityAdmin:
     async def list_users(self, search: str | None, first: int, max_results: int) -> list[DirectoryUser]:
         """Page through Keycloak's user directory (offset pagination).
 
-        Deliberately **not** decorated with :func:`map_admin_errors`: that path runs
-        ``_translate``, which turns 404 into "entity not found" — but a directory
+        ``search`` is substring (contains) matching over username/email: the term
+        is wrapped as ``*term*`` — Keycloak's documented wildcard syntax, where
+        the bare term is *prefix* matching (since Keycloak 18) and ``*`` is the
+        only wildcard (``%``/``_``/``\\`` are escaped server-side). Characters
+        typed inside the term keep their Keycloak-syntax meaning after the wrap:
+        a ``*`` acts as a wildcard (``a*b`` = "a then b") and quoting marks
+        become literal (``"x"`` no longer means exact). A multi-word term is
+        split by Keycloak into ANDed per-token matches (last token as suffix).
+        ``None``/empty pages the whole directory untouched (Keycloak trims
+        whitespace server-side, so a blank term also lists everything).
+
+        Deliberately **not** decorated with :func:`map_admin_errors`: that path
+        runs ``_translate``, which turns 404 into "entity not found" — but a directory
         listing has no singular entity to miss, so every ``KeycloakError`` here is a
         dependency fault and maps to :class:`DependencyUnavailableError` (503), the
         same contract as the JWKS path and the frontend's documented outage handling.
@@ -181,9 +192,12 @@ class KeycloakIdentityAdmin:
         repeat/skip across pages) — acceptable for an admin directory.
         """
         kc = await self._client()
+        # Keycloak treats an empty ``search`` ("") as "list everything" — same as
+        # None — so don't wrap it into a meaningless "*" (matches-everything-but-differently).
+        infix = f"*{search}*" if search else None
         try:
             users = await kc.a_get_users(
-                query={"first": first, "max": max_results, **({"search": search} if search else {})}
+                query={"first": first, "max": max_results, **({"search": infix} if infix else {})}
             )
         except KeycloakError as exc:
             raise DependencyUnavailableError("Keycloak is unavailable") from exc

@@ -118,9 +118,10 @@ class IdentityAdminService:
         No ``sort`` param: Keycloak's users endpoint has none — directory order is
         Keycloak's. Roles are read live from Keycloak role mappings, so items are
         always role-current (unlike token claims); ``disabled`` mirrors Keycloak
-        ``enabled=false``. ``search`` is forwarded untouched (Keycloak ``search``
-        semantics). A full page carries ``next_cursor`` for the next offset; a
-        short page is the last one.
+        ``enabled=false``. ``search`` is substring (contains) over username/email —
+        the admin adapter wraps the term in Keycloak's ``*term*`` infix wildcard
+        (bare ``search`` is prefix-only). A full page carries ``next_cursor`` for
+        the next offset; a short page is the last one.
         """
         offset = 0 if cursor is None else _decode_offset_cursor(cursor)
         users = await self._admin.list_users(search, offset, limit)
