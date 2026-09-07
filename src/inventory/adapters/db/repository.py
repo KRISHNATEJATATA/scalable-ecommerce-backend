@@ -83,6 +83,25 @@ _DECREMENT_SQL = text(
     "WHERE sku = :sku AND on_hand - reserved >= :qty"
 )
 
+# The merchant/admin stock upsert, one statement. The insert path seeds a fresh
+# row (reserved = 0, version = 1); the conflict path re-points ``on_hand`` only
+# when the row's current ``reserved`` still fits under the new value — the same
+# guard as the ``ck_inventory_reserved_lte_on_hand`` CHECK, so a decrement
+# racing this UPDATE cannot push ``reserved`` past it (the winner's write is the
+# one Postgres applies). ``version`` bumps only when ``on_hand`` actually
+# changes, so a same-value re-PUT lands the identical row (true idempotency).
+# WHERE false → no row RETURNED → the service reads it as "held units exceed
+# the requested on_hand".
+_UPSERT_SQL = text(
+    f"INSERT INTO {SCHEMA}.inventory (sku, on_hand, reserved, version) "  # noqa: S608
+    "VALUES (:sku, :on_hand, 0, 1) "
+    f"ON CONFLICT (sku) DO UPDATE SET on_hand = EXCLUDED.on_hand, "  # noqa: S608
+    f"version = CASE WHEN {SCHEMA}.inventory.on_hand IS DISTINCT FROM EXCLUDED.on_hand "  # noqa: S608
+    f"THEN {SCHEMA}.inventory.version + 1 ELSE {SCHEMA}.inventory.version END "  # noqa: S608
+    f"WHERE {SCHEMA}.inventory.reserved <= EXCLUDED.on_hand "  # noqa: S608
+    "RETURNING sku, on_hand, reserved, version"
+)
+
 # The status transition goes first: it is the idempotency gate. RETURNING hands
 # back the (sku, qty, order_id) to undo, so no second SELECT is needed.
 _MARK_RELEASED_SQL = text(
@@ -146,6 +165,23 @@ class InventoryRepository:
         """The stock row for ``sku``, or ``None`` if the SKU has no inventory."""
         stmt = select(Inventory).where(Inventory.sku == sku)
         return (await self._session.execute(stmt)).scalar_one_or_none()
+
+    async def upsert_stock(self, sku: str, on_hand: int) -> Inventory | None:
+        """Seed or re-point the stock row for ``sku``; ``None`` if live holds exceed ``on_hand``.
+
+        One atomic statement: a fresh SKU inserts (``reserved = 0``), an
+        existing row's ``on_hand`` is replaced only while its current
+        ``reserved`` fits under the new value, so in-flight checkouts can never
+        be erased by an upsert. The ``RETURNING`` row *is* the post-write state —
+        mapped straight back, no second query. Commits on success — this is the
+        transaction.
+        """
+        row = (await self._session.execute(_UPSERT_SQL, {"sku": sku, "on_hand": on_hand})).first()
+        if row is None:
+            await self._session.rollback()
+            return None
+        await self._session.commit()
+        return Inventory(sku=row.sku, on_hand=row.on_hand, reserved=row.reserved, version=row.version)
 
     async def get_many_by_skus(self, skus: list[str]) -> dict[str, Inventory]:
         """The stock rows for ``skus`` as ``{sku: row}`` (one ``WHERE sku IN`` query)."""

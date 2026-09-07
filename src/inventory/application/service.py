@@ -1,10 +1,10 @@
 """Inventory use-cases — the oversell-defense entry point.
 
-Called in-process by the checkout saga (there is no inventory HTTP route: no
-external caller reserves stock directly) and by the `service`-role reaper. Every
-caller goes Service → Repository; nothing outside this layer touches the
-repository. Each method is a thin policy shell over one atomic repository
-transaction:
+Called in-process by the checkout saga (no external caller reserves stock
+directly; the only HTTP surface is the merchant/admin stock upsert) and by the
+`service`-role reaper. Every caller goes Service → Repository; nothing outside
+this layer touches the repository. Each method is a thin policy shell over one
+atomic repository transaction:
 
 * :meth:`reserve` — stamps the TTL and raises :class:`InsufficientStockError`
   (→ RFC 9457 409) when the atomic decrement rejects *and* the order has no live
@@ -36,6 +36,7 @@ from src.shared.errors.exceptions import (
     InsufficientStockError,
     InvalidReservationError,
     ReservationConflictError,
+    StockBelowReservedError,
 )
 
 log = logging.getLogger(__name__)
@@ -63,6 +64,26 @@ class InventoryService:
         """
         rows = await self._repo.get_many_by_skus(skus)
         return {sku: InventoryResponse.model_validate(to_domain(row)) for sku, row in rows.items()}
+
+    async def upsert_stock(self, sku: str, on_hand: int) -> InventoryResponse:
+        """Seed or re-point a SKU's ``on_hand`` (the merchant/admin stock upsert).
+
+        Idempotent per value: re-PUT with the same ``on_hand`` lands the same
+        state. Raises :class:`StockBelowReservedError` when the row's live
+        holds would exceed the new ``on_hand`` — reserved units belong to
+        checkouts in flight and may not be erased. No event: nothing consumes
+        stock *levels* (``StockReserved``/``StockReleased`` announce lifecycle
+        transitions), and the catalog composes ``available`` fresh on every
+        read, so there is nothing to invalidate.
+        """
+        row = await self._repo.upsert_stock(sku, on_hand)
+        if row is None:
+            # The guard refused, so the row exists — but re-read it for the held
+            # count, and treat a vanished row (can't happen post-refusal) as zero
+            # rather than dereferencing None.
+            current = await self._repo.get_by_sku(sku)
+            raise StockBelowReservedError(sku, on_hand, current.reserved if current else 0)
+        return InventoryResponse.model_validate(to_domain(row))
 
     async def reserve(self, sku: str, qty: int, order_id: uuid.UUID) -> ReservationResponse:
         """Hold ``qty`` of ``sku`` for ``order_id`` until the TTL expires.

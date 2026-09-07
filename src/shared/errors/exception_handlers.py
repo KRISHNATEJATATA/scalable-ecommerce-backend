@@ -36,6 +36,7 @@ from src.shared.errors.exceptions import (
     PaymentIdempotencyConflictError,
     ReservationConflictError,
     ReservationContendedError,
+    StockBelowReservedError,
     UnknownPaymentRefError,
 )
 from src.shared.middleware.security import REQUEST_ID_HEADER
@@ -96,6 +97,13 @@ async def _reservation_contended_handler(_: Request, exc: ReservationContendedEr
     # reserve retries means concurrent holds kept colliding on this line —
     # transient pressure, not a stock answer.
     return _problem_response(409, title="Reservation Contention", detail=exc.detail)
+
+
+async def _stock_below_reserved_handler(_: Request, exc: StockBelowReservedError) -> JSONResponse:
+    # 409: the upsert was well-formed but the state refused it — units are still
+    # held by live checkouts. Raise `on_hand` (or wait for the holds to release)
+    # and retry; never a CHECK-violation 500.
+    return _problem_response(409, title="Conflict", detail=exc.detail)
 
 
 async def _payment_idempotency_conflict_handler(_: Request, exc: PaymentIdempotencyConflictError) -> JSONResponse:
@@ -228,6 +236,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(InsufficientStockError, _insufficient_stock_handler)
     app.add_exception_handler(ReservationConflictError, _reservation_conflict_handler)
     app.add_exception_handler(ReservationContendedError, _reservation_contended_handler)
+    app.add_exception_handler(StockBelowReservedError, _stock_below_reserved_handler)
     app.add_exception_handler(PaymentIdempotencyConflictError, _payment_idempotency_conflict_handler)
     app.add_exception_handler(CheckoutIdempotencyConflictError, _checkout_idempotency_conflict_handler)
     app.add_exception_handler(OrderStateConflictError, _order_state_conflict_handler)

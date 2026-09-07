@@ -30,6 +30,16 @@ class InventoryRepositoryPort(Protocol):
         """The stock row for ``sku``, or ``None`` if the SKU has no inventory."""
         ...
 
+    async def upsert_stock(self, sku: str, on_hand: int) -> Any | None:
+        """Create the stock row for ``sku`` (or re-point an existing one's ``on_hand``).
+
+        Idempotent: re-PUT with the same value lands the same state. ``None``
+        when the row exists and its ``reserved`` exceeds the requested
+        ``on_hand`` — live holds may not be erased, the caller must raise
+        ``on_hand`` or wait for the holds to release.
+        """
+        ...
+
     async def get_many_by_skus(self, skus: list[str]) -> dict[str, Any]:
         """The stock rows for ``skus`` as ``{sku: row}``, in one query.
 

@@ -154,6 +154,24 @@ class InsufficientStockError(Exception):
         self.detail = f"insufficient stock for {sku!r} (requested {qty})"
 
 
+class StockBelowReservedError(Exception):
+    """A stock upsert tried to set ``on_hand`` below the units already held → 409.
+
+    The DB's ``ck_inventory_reserved_lte_on_hand`` is the backstop; the guarded
+    upsert refuses first so the caller gets a fixable conflict (raise ``on_hand``
+    or wait for holds to release) instead of a CHECK-violation 500. Reserved
+    units belong to live checkouts — they may not be silently erased.
+    """
+
+    def __init__(self, sku: str, requested_on_hand: int, reserved: int) -> None:
+        detail = f"on_hand {requested_on_hand} for {sku!r} is below the {reserved} unit(s) currently reserved"
+        super().__init__(detail)
+        self.sku = sku
+        self.requested_on_hand = requested_on_hand
+        self.reserved = reserved
+        self.detail = detail
+
+
 class ReservationConflictError(Exception):
     """An order line already holds a *different* quantity of this SKU → 409.
 

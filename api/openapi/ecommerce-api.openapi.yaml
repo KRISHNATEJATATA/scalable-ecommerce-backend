@@ -24,6 +24,8 @@ tags:
     description: Product catalog — merchant product CRUD and the shopper listing
   - name: cart
     description: Pre-checkout basket — per-caller Valkey state, no pagination
+  - name: inventory
+    description: Stock levels per SKU — the merchant/admin stock declaration
 paths:
   /v1/products:
     get:
@@ -450,6 +452,45 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+  /v1/admin/inventory/{sku}:
+    put:
+      tags: [inventory]
+      operationId: upsertStock
+      summary: Declare a SKU's on-hand stock (merchant or admin)
+      description: >-
+        Creates the SKU's stock row or re-points its `on_hand`. Idempotent per
+        value: re-PUT with the same `on_hand` lands the same state. Answers
+        `409` when the row's currently-reserved units (live checkout holds)
+        would exceed the new `on_hand` — reserved units may not be erased; raise
+        `on_hand` or wait for the holds to release. No response event: consumers
+        compose `available` (`on_hand - reserved`) fresh on every read.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/Sku"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StockUpsertRequest"
+      responses:
+        "200":
+          description: The stock row after the upsert.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Inventory"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: The new `on_hand` is below the units currently reserved.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
   /v1/admin/users/{sub}/disable:
     post:
       tags: [identity]
@@ -577,6 +618,19 @@ components:
       schema:
         type: string
         format: uuid
+    Sku:
+      name: sku
+      in: path
+      required: true
+      description: >-
+        The SKU whose stock to declare. Checkout maps products to SKUs as the
+        product UUID string (`str(product.id)`), so a product's stock row is
+        keyed by its UUID.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 64
+        pattern: "^[A-Za-z0-9._:-]+$"
   responses:
     Unauthorized:
       description: Missing, invalid, expired, or malformed bearer token.
@@ -827,6 +881,40 @@ components:
           type: integer
           description: Out-of-range quantities answer 400 (server caps, not schema).
       required: [quantity]
+    StockUpsertRequest:
+      description: The body of `PUT /v1/admin/inventory/{sku}` — the SKU's new `on_hand`.
+      type: object
+      additionalProperties: false
+      properties:
+        on_hand:
+          type: integer
+          minimum: 0
+          maximum: 1000000000
+          description: >-
+            The total units physically on hand (`reserved` is tracked separately and
+            never accepted here). `0` = known out of stock.
+      required: [on_hand]
+    Inventory:
+      description: A stock row — `on_hand` minus `reserved` is what shoppers can buy.
+      type: object
+      properties:
+        sku:
+          type: string
+          maxLength: 64
+        on_hand:
+          type: integer
+          minimum: 0
+          description: Total units physically on hand.
+        reserved:
+          type: integer
+          minimum: 0
+          description: Units currently held by live checkout reservations.
+        version:
+          type: integer
+          description: >-
+            Manual optimistic-lock version, bumped on every stock write that
+            changes `on_hand` or `reserved` (a same-value re-PUT is a no-op).
+      required: [sku, on_hand, reserved, version]
     Problem:
       description: RFC 9457 Problem Details (the one flat error shape).
       type: object
