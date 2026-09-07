@@ -1,0 +1,44 @@
+# Prometheus scrape configuration — the single place every scrape target is named.
+# The app metrics (/metrics on the API) and each worker's WORKER_METRICS_PORT are
+# HTTP pull targets; the postgres_exporter is the liveness source that keeps
+# answering when a worker is dead (see the query file and RUNBOOK §8).
+#
+# Local: `docker compose --profile monitoring up -d prometheus` (config mounted
+# below). In prod, Terraform provisions the same three job shapes — keep the
+# job names stable, the alert rules reference them.
+
+global:
+  scrape_interval: 15s
+
+rule_files:
+  - /etc/prometheus/inventory-reaper-alerts.yaml
+
+scrape_configs:
+  # The API's /metrics: RED per endpoint (http_requests_total,
+  # http_request_duration_seconds), checkout saga counters
+  # (checkout_attempts_total, checkout_compensation_total), and the outbox-lag
+  # gauge (outbox_lag_seconds) refreshed from Postgres on the API's own poll.
+  - job_name: api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["app:8000"]
+
+  # Worker processes export their own counters (relay drains, reaper releases,
+  # recovery settlements) on WORKER_METRICS_PORT — one target per service.
+  - job_name: workers
+    static_configs:
+      - targets:
+          - relay:9100
+          - image-worker:9100
+          - cache-worker:9100
+          - cart-consumer:9100
+          - reaper:9100
+          - payment-reconciler:9100
+          - saga-recovery:9100
+
+  # The DB itself: expired-hold backlog, outbox age checks — the alert signal
+  # that outlives a dead exporter or worker (postgres_exporter with
+  # --extend.query-path pointing at postgres-exporter-queries.yaml).
+  - job_name: postgres-exporter
+    static_configs:
+      - targets: ["postgres-exporter:9187"]

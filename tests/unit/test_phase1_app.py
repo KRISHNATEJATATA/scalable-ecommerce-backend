@@ -111,6 +111,55 @@ async def test_metrics_exposed():
     assert "text/plain" in resp.headers["content-type"]
 
 
+async def test_app_runs_with_no_prometheus_and_no_database():
+    """Prometheus is optional, full stop.
+
+    The metrics are a pull model: the app registers counters in-process and
+    serves text on ``/metrics`` — no Prometheus server, client, or exporter
+    dependency anywhere in the request path. The outbox-lag poller in the
+    lifespan must likewise survive a database it cannot reach (telemetry
+    boundary: a failed refresh keeps last values and retries), so a broken DB
+    degrades the numbers, never the app.
+    """
+    import asyncio
+    from contextlib import suppress
+
+    import pytest
+    from prometheus_client import generate_latest
+    from starlette.testclient import TestClient
+
+    from src.shared.bus.metrics import poll_outbox_lag, update_outbox_lag
+
+    settings = SETTINGS.model_copy(
+        update={"keycloak_jwks_url": "http://localhost:8080/realms/ecommerce/protocol/openid-connect/certs"}
+    )
+    app = create_app(settings)
+    with TestClient(app) as client:  # exercises the lifespan incl. the poll task
+        resp = client.get("/metrics")
+        assert resp.status_code == 200
+        assert b"http_requests_total" in resp.content
+        assert b"outbox_lag_seconds" in resp.content
+        assert b"checkout_attempts_total" in resp.content
+    # (Task shutdown is exercised by TestClient's own lifespan exit: the context
+    # would hang at teardown if the poll task ignored cancellation.)
+
+    # And with the DB unreachable, the refresh raises but the poll loop — the
+    # telemetry boundary — logs and retries instead of dying with the DB.
+    class _BrokenMaker:
+        def __call__(self):
+            raise RuntimeError("db unreachable")
+
+    with pytest.raises(RuntimeError):
+        await update_outbox_lag(_BrokenMaker())  # the raw refresh propagates
+
+    poll = asyncio.create_task(poll_outbox_lag(_BrokenMaker(), 0.01))
+    await asyncio.sleep(0.05)  # several failed passes
+    poll.cancel()
+    with suppress(asyncio.CancelledError):
+        await poll
+    assert generate_latest()  # the registry still renders
+
+
 async def test_generated_openapi_documents_errors_as_rfc9457_problems():
     """Every 4xx/5xx in ``/openapi.json`` must be ``application/problem+json``.
 

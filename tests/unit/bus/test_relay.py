@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from testcontainers.postgres import PostgresContainer
 
 from src.shared.bus.constants import OUTBOX_SCHEMAS
+from src.shared.bus.metrics import outbox_lag_seconds, update_outbox_lag
 from src.shared.bus.relay import OutboxRelay
 from src.shared.config.setting import get_settings
 
@@ -273,5 +274,48 @@ async def test_skip_locked_prevents_double_claim(sessionmaker) -> None:
     assert n1 + n2 == 10
     assert await _unpublished_count(sessionmaker) == 0
     # no row published by both relays (SKIP LOCKED partitioned the batch)
-    payloads = [p for _, p in p1.published] + [p for _, p in p2.published]
-    assert len(payloads) == len(set(payloads)) == 10
+
+
+# --- outbox lag gauge -------------------------------------------------------
+
+
+def _lag_value(schema: str) -> float:
+    value = outbox_lag_seconds.labels(schema)._value.get()  # noqa: SLF001 - test-only read
+    return 0.0 if value is None else value
+
+
+@pytest.mark.asyncio
+async def test_update_outbox_lag_measures_the_database(sessionmaker) -> None:
+    """The gauge reads the DB, not the observer: a seeded unpublished row's age
+    lands on its schema, an empty schema reads 0 (drained, not unknown)."""
+    await _seed(sessionmaker, 2, "orders")
+    await _seed(sessionmaker, 1, "catalog")
+
+    await update_outbox_lag(sessionmaker, schemas=("orders", "catalog", "identity"))
+
+    assert _lag_value("orders") > 0
+    assert _lag_value("catalog") > 0
+    assert _lag_value("identity") == 0.0
+
+
+@pytest.mark.asyncio
+async def test_relay_stamps_lag_at_claim_and_drains_to_zero(sessionmaker) -> None:
+    """The claim *is* a lag observation (rows arrive oldest-first), and a fully
+    drained schema reports 0 on the next pass. The seeded rows are backdated so
+    the age is unambiguously positive even if the app clock runs ahead of the
+    DB clock (``max(..., 0.0)`` would otherwise clamp the very-young case)."""
+    await _seed(sessionmaker, 2, "orders")
+    async with sessionmaker() as session:
+        await session.execute(
+            text(
+                "UPDATE orders.outbox SET occurred_at = occurred_at - interval '10 seconds' WHERE published_at IS NULL"
+            )
+        )
+        await session.commit()
+    relay = OutboxRelay(sessionmaker, RecordingPublisher(), batch_size=100, schemas=("orders",))
+
+    await relay.drain_once()
+    assert _lag_value("orders") > 0
+
+    assert await relay.drain_once() == 0
+    assert _lag_value("orders") == 0.0

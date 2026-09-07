@@ -1,11 +1,12 @@
 """FastAPI application factory.
 
 ``create_app()`` builds and wires the app: logging, middleware (proxy headers,
-CORS, request-id, security headers), RFC 9457 exception handlers, routers, and a
-lifespan that owns the Postgres engine + Valkey client. Interactive docs are
+CORS, request-id, security headers, RED metrics), RFC 9457 exception handlers,
+routers, and a lifespan that owns the Postgres engine + Valkey client. Interactive docs are
 served in dev only and hidden in prod.
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -20,6 +21,7 @@ from src.orders.api import routes as orders_routes
 from src.payments.api import routes as payments_routes
 from src.shared.api import health, metrics
 from src.shared.auth.jwks import build_jwks_client
+from src.shared.bus.metrics import poll_outbox_lag
 from src.shared.clients import postgres_client, valkey_client
 from src.shared.clients.s3_client import s3_client
 from src.shared.config.logging import setup_logging
@@ -49,9 +51,19 @@ async def _lifespan(app: FastAPI):
     s3_cm = s3_client(settings) if settings.s3_bucket else None
     if s3_cm is not None:
         app.state.s3 = await s3_cm.__aenter__()
+    # Outbox-lag gauge refresh: sampled from the DB on a loop so /metrics keeps
+    # reporting the alarm signal even while the relay is down (a dead relay
+    # increments nothing — the DB is the source of truth). One query per tick;
+    # cancelled promptly on shutdown.
+    lag_task = asyncio.create_task(poll_outbox_lag(app.state.db_sessionmaker, settings.outbox_lag_poll_seconds))
     try:
         yield
     finally:
+        lag_task.cancel()
+        try:
+            await lag_task
+        except asyncio.CancelledError:
+            pass
         await app.state.db_engine.dispose()
         await app.state.db_probe_engine.dispose()
         await app.state.valkey.aclose()
@@ -95,6 +107,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         docs_csp_paths=frozenset({path for path in (app.docs_url, app.redoc_url, app.openapi_url) if path is not None}),
     )
     app.add_middleware(RequestIDMiddleware)
+    # RED per endpoint (rate/status/duration under the route template) — innermost
+    # so the counters see the status after every inner layer ran.
+    app.add_middleware(metrics.MetricsMiddleware)
 
     register_exception_handlers(app)
     # ...and make the published contract match those handlers, not FastAPI's default.

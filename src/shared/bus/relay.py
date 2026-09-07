@@ -3,6 +3,10 @@
 Per pass, for each publishing schema, the relay claims a batch of unpublished
 rows with ``FOR UPDATE SKIP LOCKED`` (so N relay replicas never double-claim),
 publishes each to SNS, then stamps ``published_at`` — all in one transaction.
+It also stamps the ``outbox_lag_seconds`` gauge at claim time (the claim query
+already returns the rows oldest-first); the alertable source remains the
+API-side DB poll in ``src.shared.bus.metrics``, which keeps measuring when the
+relay itself is dead.
 
 **Publish-then-mark, never the reverse.** If the process dies mid-batch (or a
 publish raises), the transaction rolls back, the rows stay unpublished, and the
@@ -19,12 +23,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from datetime import UTC, datetime
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from src.shared.bus.client import sns_client
 from src.shared.bus.constants import OUTBOX_SCHEMAS
+from src.shared.bus.metrics import outbox_lag_seconds
 from src.shared.bus.polling import poll_forever
 from src.shared.bus.publisher import SnsPublisher
 from src.shared.config.setting import AppSettings, get_settings
@@ -63,7 +69,7 @@ class OutboxRelay:
             rows = (
                 await session.execute(
                     text(
-                        f"SELECT id, event_type, payload FROM {schema}.outbox "
+                        f"SELECT id, event_type, payload, occurred_at FROM {schema}.outbox "
                         "WHERE published_at IS NULL ORDER BY occurred_at "
                         "FOR UPDATE SKIP LOCKED LIMIT :batch"
                     ),
@@ -71,7 +77,14 @@ class OutboxRelay:
                 )
             ).all()
             if not rows:
+                outbox_lag_seconds.labels(schema).set(0.0)
                 return 0
+            # The claim is the lag observation: rows are ordered by occurred_at,
+            # so the first one *was* the oldest unpublished row of this schema
+            # (a newer insert landing mid-claim is on the next pass). The
+            # API-side poll (shared.bus.metrics) re-measures from the DB on its
+            # own cadence and owns the alert signal when the relay is dead.
+            outbox_lag_seconds.labels(schema).set(max((datetime.now(UTC) - rows[0].occurred_at).total_seconds(), 0.0))
             # Publish concurrently (bounded): serial awaits held the row locks and a
             # pooled connection for batch_size × RTT (~3s at 100 × 30ms), capping a
             # replica near 30 events/s. A TaskGroup cancels siblings on the first

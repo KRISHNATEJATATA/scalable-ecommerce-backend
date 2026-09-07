@@ -106,6 +106,11 @@ publish-then-mark, so events are not lost — they ship once the relay recovers.
 `service`-role relay task; if lag persists, scale relay replicas (safe — `FOR UPDATE SKIP
 LOCKED` prevents double-claim).
 
+The signal is `outbox_lag_seconds{schema}` on the API's `/metrics` — measured **from the
+database** on a loop (`OUTBOX_LAG_POLL_SECONDS`), so it keeps climbing while the relay is down
+(a dead relay produces no samples of its own; the rows are the truth). The relay also stamps
+the same gauge at claim time on its own scrape port. Zero means drained, not unknown.
+
 Inspect the backlog (note: the timestamp column is **`occurred_at`**, not `created_at` — the
 outbox is not a `TimestampMixin` table; `event_id`/`trace_id` live inside `payload`):
 

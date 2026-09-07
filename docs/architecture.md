@@ -342,6 +342,18 @@ prod, compose services locally — never `BackgroundTasks`:
 - Errors: **RFC 9457 Problem Details** built via `src/shared/errors/error_builder.py`.
 - Logging: ECS JSON to stdout, `contextvars` trace-id, `RedactFilter` scrubs
   secrets/PII. Never log passwords/tokens/JWT claims/PII.
+- Metrics: `/metrics` serves the Prometheus registry — **RED per endpoint**
+  (`http_requests_total` / `http_request_duration_seconds`, labeled by route
+  *template*, 404s as `unmatched`) plus domain counters: checkout outcomes
+  and compensation (`checkout_attempts_total`, `checkout_compensation_total`),
+  inventory oversell/reaper (`inventory_oversell_blocked_total`,
+  `inventory_reaper_released_total`) and **outbox lag**
+  (`outbox_lag_seconds{schema}`, measured from the DB so the alert signal
+  outlives a dead relay). Worker-process counters
+  (`checkout_recovery_total` in the saga-recovery worker; the reaper's
+  releases) are exported via each worker's `WORKER_METRICS_PORT`, or a
+  Pushgateway for short-lived `--once` runs (see RUNBOOK).
+  Scrape config: `ops/prometheus/prometheus.yml`.
 - Security headers via custom ASGI middleware (HSTS, CSP, `X-Content-Type-Options`,
   `X-Frame-Options`). **No CSRF** — the Bearer token isn't an ambient cookie
   credential. CORS = explicit allow-list (the SPA origin); `allow_credentials`

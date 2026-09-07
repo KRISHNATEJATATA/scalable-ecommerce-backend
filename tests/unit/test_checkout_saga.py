@@ -20,6 +20,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from prometheus_client import REGISTRY
 from sqlalchemy import text
 
 from src.inventory.adapters.db.repository import InventoryRepository
@@ -172,6 +173,96 @@ async def _backdate_pending(session, order_id: uuid.UUID, seconds: int = 3600) -
         {"past": past, "id": order_id},
     )
     await session.commit()
+
+
+def _counter(name: str, **labels: str) -> float:
+    """One labeled Prometheus series' current value, 0 if never incremented.
+
+    The registry is process-global and shared across tests, so assertions are
+    always on deltas read around the action.
+    """
+    value = REGISTRY.get_sample_value(name, labels)
+    return 0.0 if value is None else value
+
+
+# --- metrics ---------------------------------------------------------------
+
+
+async def test_checkout_outcome_taxonomy_is_counted_once_per_call(session):
+    """paid / replayed / conflict land on ``checkout_attempts_total``; the
+    declined checkout's undo lands on ``checkout_compensation_total{step}`` —
+    one increment per checkout, never two."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    saga = _saga(session, basket)
+
+    before = {k: _counter("checkout_attempts_total", outcome=k) for k in ("paid", "replayed", "conflict")}
+    comp_before = _counter("checkout_compensation_total", step="charge")
+
+    await saga.checkout(user_id=USER_A, idempotency_key="m-paid", payment_token="tok_visa")
+    await saga.checkout(user_id=USER_A, idempotency_key="m-paid", payment_token="tok_visa")  # exact replay
+    basket.stock(USER_A, line)  # the paid checkout cleared the basket; a new checkout needs a cart
+    try:
+        await saga.checkout(user_id=USER_A, idempotency_key="m-decline", payment_token="tok_decline_card")
+    except OrderStateConflictError:
+        pass
+
+    assert _counter("checkout_attempts_total", outcome="paid") == before["paid"] + 1
+    assert _counter("checkout_attempts_total", outcome="replayed") == before["replayed"] + 1
+    assert _counter("checkout_attempts_total", outcome="conflict") == before["conflict"] + 1
+    assert _counter("checkout_compensation_total", step="charge") == comp_before + 1
+
+
+async def test_stock_refusal_counts_as_out_of_stock_not_conflict(session):
+    """The shelves refusing is its own outcome — distinct from the lifecycle's
+    409s — and its compensation is the reserve step."""
+    line = _line(qty=3)
+    await _seed(session, str(line.product_id), 1)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+
+    before = _counter("checkout_attempts_total", outcome="out_of_stock")
+    comp_before = _counter("checkout_compensation_total", step="reserve")
+
+    try:
+        await _saga(session, basket).checkout(user_id=USER_A, idempotency_key="m-short", payment_token="tok_visa")
+    except InsufficientStockError:
+        pass
+
+    assert _counter("checkout_attempts_total", outcome="out_of_stock") == before + 1
+    assert _counter("checkout_compensation_total", step="reserve") == comp_before + 1
+
+
+async def test_recovery_settlements_are_counted_with_their_compensation(session):
+    """The poller's process counts its own settlements; its compensation run is
+    labeled ``crashed``, distinct from a live drive's ``reserve``/``charge``."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    repo = OrdersRepository(session)
+    inventory = InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)
+
+    order, _ = await repo.create_pending_order(
+        user_id=USER_A,
+        idempotency_key="key-m-recover",
+        body_hash="hash",
+        total=Decimal("19.99"),
+        lines=[(line.product_id, line.name, line.unit_price, line.quantity)],
+    )
+    await inventory.reserve(str(line.product_id), line.quantity, order.id)
+    await _backdate_pending(session, order.id)
+
+    before = _counter("checkout_recovery_total", outcome="compensated")
+    comp_before = _counter("checkout_compensation_total", step="crashed")
+
+    outcome = await _saga(session, _Basket()).recover_stuck(
+        cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50
+    )
+
+    assert outcome == {"completed": 0, "compensated": 1, "deferred": 0}
+    assert _counter("checkout_recovery_total", outcome="compensated") == before + 1
+    assert _counter("checkout_compensation_total", step="crashed") == comp_before + 1
 
 
 # --- happy path ----------------------------------------------------------

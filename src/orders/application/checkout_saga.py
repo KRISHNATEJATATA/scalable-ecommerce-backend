@@ -34,6 +34,11 @@ from typing import Any
 
 from src.orders.application.dto import OrderResponse
 from src.orders.application.mappers import to_domain
+from src.orders.application.metrics import (
+    checkout_attempts_total,
+    checkout_compensation_total,
+    checkout_recovery_total,
+)
 from src.orders.application.outbox import order_placed_outbox
 from src.orders.domain.order import OrderStatus
 from src.orders.ports.checkout import (
@@ -46,6 +51,7 @@ from src.orders.ports.checkout import (
 from src.orders.ports.repository import OrdersRepositoryPort
 from src.shared.errors.exceptions import (
     CheckoutIdempotencyConflictError,
+    InsufficientStockError,
     OrderStateConflictError,
 )
 
@@ -123,49 +129,75 @@ class CheckoutSaga:
         """
         body_hash = body_hash_for(payment_token)
 
-        if self._idempotency is not None:
-            record = await self._idempotency.get(user_id, idempotency_key)
-            if record is not None:
-                if record.body_hash != body_hash:
-                    raise CheckoutIdempotencyConflictError()
-                log.info("checkout replay served from idempotency record (user=%s)", user_id)
-                response = OrderResponse.model_validate(record.response)
-                if response.status == OrderStatus.PAID:
-                    await self._clear_basket(user_id)
-                return response, False
+        # One outcome increment per call, from a single try around the WHOLE
+        # call body (the Valkey fast path included — a poisoned replay record
+        # failing model_validate must still count): the success paths tag
+        # ``paid`` / ``replayed`` at their returns, and the except arms tag
+        # every controlled failure by its exception type (``error`` catches the
+        # 500-shaped residue). ``_replay_or_resume`` raising through here is
+        # counted exactly like a fresh drive failing — same caller-visible end.
+        try:
+            if self._idempotency is not None:
+                record = await self._idempotency.get(user_id, idempotency_key)
+                if record is not None:
+                    if record.body_hash != body_hash:
+                        raise CheckoutIdempotencyConflictError()
+                    log.info("checkout replay served from idempotency record (user=%s)", user_id)
+                    response = OrderResponse.model_validate(record.response)
+                    if response.status == OrderStatus.PAID:
+                        await self._clear_basket(user_id)
+                    checkout_attempts_total.labels("replayed").inc()
+                    return response, False
 
-        existing = await self._orders.get_by_idempotency(user_id, idempotency_key)
-        if existing is not None:
-            return await self._replay_or_resume(
-                user_id=user_id,
-                idempotency_key=idempotency_key,
-                payment_token=payment_token,
-                body_hash=body_hash,
-                order=existing,
-            )
-
-        lines = await self._basket.get_lines(user_id)
-        if not lines:
-            raise OrderStateConflictError("cart is empty; nothing to check out")
-        total = _total(lines)
-        order, created = await self._orders.create_pending_order(
-            user_id=user_id,
-            idempotency_key=idempotency_key,
-            body_hash=body_hash,
-            total=total,
-            lines=[(line.product_id, line.name, line.unit_price, line.quantity) for line in lines],
-        )
-        if not created:
-            # Lost the create race: the winner's row is the truth — replay or
-            # resume it exactly as above.
-            return await self._replay_or_resume(
-                user_id=user_id,
-                idempotency_key=idempotency_key,
-                payment_token=payment_token,
-                body_hash=body_hash,
-                order=order,
-            )
-        return await self._drive(order.id, user_id, idempotency_key, payment_token, lines, body_hash)
+            existing = await self._orders.get_by_idempotency(user_id, idempotency_key)
+            if existing is not None:
+                order, created = await self._replay_or_resume(
+                    user_id=user_id,
+                    idempotency_key=idempotency_key,
+                    payment_token=payment_token,
+                    body_hash=body_hash,
+                    order=existing,
+                )
+            else:
+                lines = await self._basket.get_lines(user_id)
+                if not lines:
+                    raise OrderStateConflictError("cart is empty; nothing to check out")
+                total = _total(lines)
+                order, created = await self._orders.create_pending_order(
+                    user_id=user_id,
+                    idempotency_key=idempotency_key,
+                    body_hash=body_hash,
+                    total=total,
+                    lines=[(line.product_id, line.name, line.unit_price, line.quantity) for line in lines],
+                )
+                if not created:
+                    # Lost the create race: the winner's row is the truth — replay or
+                    # resume it exactly as above.
+                    order, created = await self._replay_or_resume(
+                        user_id=user_id,
+                        idempotency_key=idempotency_key,
+                        payment_token=payment_token,
+                        body_hash=body_hash,
+                        order=order,
+                    )
+                else:
+                    order, created = await self._drive(
+                        order.id, user_id, idempotency_key, payment_token, lines, body_hash
+                    )
+            checkout_attempts_total.labels("replayed" if not created else "paid").inc()
+            return order, created
+        except InsufficientStockError:
+            checkout_attempts_total.labels("out_of_stock").inc()
+            raise
+        except CheckoutIdempotencyConflictError:
+            checkout_attempts_total.labels("idempotency_conflict").inc()
+            raise
+        except OrderStateConflictError:
+            checkout_attempts_total.labels("conflict").inc()
+            raise
+        except Exception:
+            checkout_attempts_total.labels("error").inc()
+            raise
 
     async def _replay_or_resume(
         self,
@@ -219,6 +251,11 @@ class CheckoutSaga:
         One rule overrides compensation: once the payment has succeeded, the
         saga never unwinds money — a later failure leaves the order ``pending``
         for the recovery poller instead of cancelling a paid checkout.
+
+        Terminations are counted on ``checkout_attempts_total`` (``paid`` on the
+        success path; the post-payment conversion below lands on ``conflict``
+        — see the metrics module docstring); the compensation counter carries
+        only the failed step, so one saga is never counted twice.
         """
         total = _total(lines)
         charged = False
@@ -353,7 +390,15 @@ class CheckoutSaga:
             raise
 
     async def _compensate(self, order_id: uuid.UUID, failed_step: str) -> None:
-        """Release every hold taken for the order, then cancel it (reverse order of the drive)."""
+        """Release every hold taken for the order, then cancel it (reverse order of the drive).
+
+        ``failed_step`` is ``reserve``/``charge`` on the live path and
+        ``crashed`` from the recovery poller — it labels
+        ``checkout_compensation_total``. A user-facing cancel is the mirror
+        image of compensation (Orders glossary) and deliberately never lands
+        here.
+        """
+        checkout_compensation_total.labels(failed_step).inc()
         await self._log(order_id, "compensate", "started")
         await self._holds.release_for_order(order_id)
         await self._orders.transition_status(order_id, expect=[OrderStatus.PENDING], to_status=OrderStatus.CANCELLED)
@@ -369,7 +414,9 @@ class CheckoutSaga:
         never stored: ``succeeded`` → commit holds + mark paid; ``failed`` or
         absent (crash before any charge) → release + cancel; still ``pending``
         → leave for the payment reconciler and count as deferred (the claim
-        already re-leased the order, so the next pass retries it).
+        already re-leased the order, so the next pass retries it). Every
+        outcome increments ``checkout_recovery_total`` — in the poller process,
+        so it is exported via the worker metrics, not the API's ``/metrics``.
         """
         stuck = await self._orders.claim_stuck_pending(cutoff=cutoff, batch_size=batch_size)
         outcome = {"completed": 0, "compensated": 0, "deferred": 0}
@@ -382,6 +429,7 @@ class CheckoutSaga:
                 order = await self._orders.get_order(order_id)
                 if order is None:  # dropped mid-batch: the next lease retries it
                     outcome["deferred"] += 1
+                    checkout_recovery_total.labels("deferred").inc()
                     continue
                 # Claim→settle gap: between the claim and here, a client retry
                 # can start driving this same order (its resume path journals
@@ -390,6 +438,7 @@ class CheckoutSaga:
                 if await self._orders.has_recent_saga_activity(order_id, since=cutoff):
                     log.info("saga recovery skipped order %s: journal shows fresh activity", order_id)
                     outcome["deferred"] += 1
+                    checkout_recovery_total.labels("deferred").inc()
                     continue
                 settled = await self._settle_crashed(order)
             except Exception:  # boundary: one bad order must not stall the batch
@@ -399,8 +448,10 @@ class CheckoutSaga:
                 await self._orders.rollback()
                 log.exception("recovery failed for order %s; lease will retry it", order_id)
                 outcome["deferred"] += 1
+                checkout_recovery_total.labels("deferred").inc()
                 continue
             outcome[settled] += 1
+            checkout_recovery_total.labels(settled).inc()
         if stuck:
             log.info("saga recovery settled %d stuck order(s): %s", len(stuck), outcome)
         return outcome

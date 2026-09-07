@@ -307,6 +307,36 @@ services:
       - "9107:9100"
     command: ["python", "-m", "src.shared.saga_recovery"]
 
+  # Optional monitoring profile: scrapes the API's /metrics (RED per endpoint,
+  # checkout counters, outbox lag) and every worker's WORKER_METRICS_PORT.
+  # Start with: docker compose --profile monitoring up -d prometheus
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    profiles: ["monitoring"]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./ops/prometheus/inventory-reaper-alerts.yaml:/etc/prometheus/inventory-reaper-alerts.yaml:ro
+      - ./ops/prometheus/postgres-exporter-queries.yaml:/etc/prometheus/postgres-exporter-queries.yaml:ro
+
+  # Same profile, second half: the DB-side exporter whose queries (expired-hold
+  # backlog) keep answering when a worker is dead — the reaper's liveness alert.
+  # Needs PROMETHEUS extension + the query file; add DATA_SOURCE_NAME when using.
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    profiles: ["monitoring"]
+    environment:
+      DATA_SOURCE_NAME: postgresql://ecommerce:ecommerce@postgres:5432/ecommerce?sslmode=disable
+      EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yaml
+    ports:
+      - "9187:9187"
+    volumes:
+      - ./ops/prometheus/postgres-exporter-queries.yaml:/etc/postgres-exporter/queries.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   # Local mail catcher: Keycloak's "update account" email (admin user creation)
   # needs an SMTP server or the create rolls back. UI on http://localhost:8025.
   mailpit:
