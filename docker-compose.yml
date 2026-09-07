@@ -11,6 +11,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://ecommerce:ecommerce@postgres:5432/ecommerce
       VALKEY_URL: redis://valkey:6379/0
       S3_ENDPOINT_URL: http://localstack:4566
+      S3_PRESIGN_PUBLIC_BASE_URL: http://localhost:4566
       S3_BUCKET: ecommerce-uploads
       S3_PUBLIC_BASE_URL: http://localhost:4566/ecommerce-uploads
       IMAGE_QUEUE_URL: http://localstack:4566/000000000000/image-uploads
@@ -121,6 +122,8 @@ services:
 
   # One-shot: create the uploads bucket + image-uploads queue/DLQ + the
   # S3 ObjectCreated→SQS notification (uploads/ prefix), then exit.
+  # CORS_ALLOW_ORIGINS: the SPA origin, so the browser can POST presigned
+  # uploads to the bucket cross-origin (bucket CORS applied by the bootstrap).
   s3-setup:
     build: .
     depends_on:
@@ -134,6 +137,7 @@ services:
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
       DATABASE_URL: postgresql+asyncpg://ecommerce:ecommerce@postgres:5432/ecommerce
+      CORS_ALLOW_ORIGINS: '["http://localhost:3000"]'
     command: ["python", "-m", "scripts.s3_bootstrap"]
 
   # The `service`-role outbox relay: polls unpublished outbox rows → SNS.

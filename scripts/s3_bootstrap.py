@@ -157,6 +157,36 @@ async def _ensure_lifecycle(s3, bucket: str, retention_days: int) -> None:
     log.info("ensured %s/ lifecycle expiry after %dd", UPLOAD_PREFIX, retention_days)
 
 
+async def _ensure_cors(s3, bucket: str, origins: list[str]) -> None:
+    """Allow the browser to POST presigned uploads from the SPA origin.
+
+    Direct-from-browser presigned uploads are cross-origin: without bucket CORS
+    the browser refuses to read (or even send) the multipart POST, so the upload
+    leg dies even with a reachable presign URL. Scoped to the configured SPA
+    origins (``CORS_ALLOW_ORIGINS``) — never ``*`` — mirroring what Terraform
+    must configure on the real bucket in the cloud. Empty origins skip the rule
+    (fail visibly in logs rather than open the bucket to every origin).
+    """
+    if not origins:
+        log.warning("CORS_ALLOW_ORIGINS is empty — skipping bucket CORS (browser presigned POSTs would fail)")
+        return
+    await s3.put_bucket_cors(
+        Bucket=bucket,
+        CORSConfiguration={
+            "CORSRules": [
+                {
+                    "AllowedOrigins": origins,
+                    "AllowedMethods": ["POST", "PUT"],
+                    "AllowedHeaders": ["*"],
+                    "ExposeHeaders": ["ETag"],
+                    "MaxAgeSeconds": 3000,
+                }
+            ]
+        },
+    )
+    log.info("ensured bucket CORS on %s for %s", bucket, origins)
+
+
 async def bootstrap() -> None:
     settings = get_settings()
     if not settings.s3_bucket:
@@ -164,6 +194,7 @@ async def bootstrap() -> None:
     async with s3_client(settings) as s3, sqs_client(settings) as sqs:
         await _ensure_bucket(s3, settings.s3_bucket)
         await _ensure_public_read(s3, settings.s3_bucket)
+        await _ensure_cors(s3, settings.s3_bucket, settings.cors_allow_origins)
         await _ensure_lifecycle(s3, settings.s3_bucket, settings.image_upload_retention_days)
         queue_arn = await _ensure_queue(sqs, settings.s3_bucket, settings.image_visibility_timeout_seconds)
         await _ensure_notification(s3, settings.s3_bucket, queue_arn)

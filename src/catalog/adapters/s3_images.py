@@ -11,6 +11,7 @@ from __future__ import annotations
 import inspect
 import uuid
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from botocore.exceptions import ClientError
 
@@ -49,11 +50,19 @@ async def _maybe_await(value: Any) -> Any:
 
 
 class ImageStore(ImageStorePort):
-    """aioboto3 S3 adapter. ``client`` is an entered aioboto3 S3 client."""
+    """aioboto3 S3 adapter. ``client`` is an entered aioboto3 S3 client.
 
-    def __init__(self, client: Any, bucket: str) -> None:
+    ``presign_public_base_url`` re-hosts the presigned-POST URL for clients that
+    live outside the S3 endpoint's own network (a host browser can't resolve the
+    app container's ``localstack`` hostname): the base's origin (scheme+host+port)
+    replaces the generated one. Signature-safe — a presigned-POST policy binds
+    the fields and the object key, not the host they are POSTed to.
+    """
+
+    def __init__(self, client: Any, bucket: str, *, presign_public_base_url: str | None = None) -> None:
         self._client = client
         self._bucket = bucket
+        self._presign_public_base_url = presign_public_base_url
 
     async def presign_upload(
         self, product_id: uuid.UUID, *, content_type: str, max_bytes: int, ttl_seconds: int
@@ -66,6 +75,13 @@ class ImageStore(ImageStorePort):
         re-sniffs the bytes and rejects a mismatch. S3 rejects an upload that
         violates the ``content-length-range`` or ``Content-Type`` condition, so
         the endpoint is never an open uploader.
+
+        The URL is re-hosted onto ``presign_public_base_url`` when set (host-
+        reachable origin for browsers outside the docker network); ``fields`` and
+        the policy signature are untouched — the browser must POST to the same
+        origin the ticket names, and S3 accepts the POST regardless of which
+        reachable hostname delivered it, as long as it resolves to the **same**
+        S3 deployment (same credentials/region scope) that signed the policy.
         """
         token = new_upload_token()
         key = upload_key(product_id, token)
@@ -81,7 +97,13 @@ class ImageStore(ImageStorePort):
                 ExpiresIn=ttl_seconds,
             )
         )
-        return {"url": post["url"], "fields": post["fields"], "key": key, "token": token}
+        url = post["url"]
+        if self._presign_public_base_url is not None:
+            # Re-host: the base's origin (scheme+host+port) replaces the generated
+            # one; path (path-style S3: "/<bucket>"), query and policy stay verbatim.
+            generated, base = urlsplit(url), urlsplit(self._presign_public_base_url)
+            url = urlunsplit((base.scheme, base.netloc, generated.path, generated.query, generated.fragment))
+        return {"url": url, "fields": post["fields"], "key": key, "token": token}
 
     async def download(self, key: str, *, max_bytes: int, expected_etag: str | None = None) -> DownloadedObject:
         """Fetch an object's bytes (bounded), its claimed ``Content-Type`` and ETag.

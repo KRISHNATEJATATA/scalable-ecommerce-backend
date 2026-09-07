@@ -7,6 +7,8 @@ errors into the port's terminal/no-op exceptions.
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from botocore.exceptions import ClientError
 
@@ -85,6 +87,31 @@ class FakeS3:
         if self._error:
             raise ClientError({"Error": {"Code": self._error}}, "HeadObject")
         return {"ContentLength": self._content_length, "ETag": '"abc123"'}
+
+    async def generate_presigned_post(self, **params):
+        self.calls.append(params)
+        # Path-style URL like botocore builds against an explicit endpoint.
+        fields = {"key": params["Key"], "Content-Type": params["Fields"]["Content-Type"], "policy": "p"}
+        return {"url": "http://localstack:4566/bucket", "fields": fields}
+
+
+async def test_presign_returns_the_generated_url_verbatim_without_a_public_base():
+    store = ImageStore(FakeS3(), "bucket")
+    post = await store.presign_upload(uuid.uuid4(), content_type="image/jpeg", max_bytes=100, ttl_seconds=60)
+    assert post["url"] == "http://localstack:4566/bucket", "no re-host configured → URL untouched"
+    assert post["fields"]["Content-Type"] == "image/jpeg"
+
+
+async def test_presign_rehosts_the_url_onto_the_public_base():
+    """Regression for the docker-hostname defect: the app runs inside compose, so
+    ``generate_presigned_post`` mints URLs at the docker-internal endpoint
+    (``localstack:4566``) that a host browser cannot resolve. The adapter must
+    re-host the base's origin — path and fields (policy/signature) untouched, so
+    S3 still accepts the POST."""
+    store = ImageStore(FakeS3(), "bucket", presign_public_base_url="http://localhost:4566/")
+    post = await store.presign_upload(uuid.uuid4(), content_type="image/jpeg", max_bytes=100, ttl_seconds=60)
+    assert post["url"] == "http://localhost:4566/bucket"
+    assert post["fields"]["Content-Type"] == "image/jpeg", "fields carry the signature — never rewritten"
 
 
 async def test_download_pins_ifmatch_and_normalises_the_etag():

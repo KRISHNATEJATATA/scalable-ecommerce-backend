@@ -119,3 +119,28 @@ def test_settings_public_image_base_falls_back_to_endpoint_and_bucket():
     assert settings().image_public_base_url is None
     # An endpoint without a bucket must not build "<endpoint>/None/<key>".
     assert settings(s3_endpoint_url="http://localhost:4566").image_public_base_url is None
+
+
+def test_settings_presign_public_base_url_validation():
+    """The re-host origin is spliced into presigned URLs verbatim — a value
+    without scheme/netloc would mint unPOSTable URLs, and a path/query-bearing
+    value would be silently mangled by the splice (extra components dropped);
+    both are rejected at startup."""
+
+    def settings(**overrides) -> AppSettings:
+        return AppSettings(_env_file=None, database_url=_DSN, **overrides)
+
+    assert settings(s3_presign_public_base_url=None).s3_presign_public_base_url is None
+    assert (
+        settings(s3_presign_public_base_url="http://localhost:4566").s3_presign_public_base_url
+        == "http://localhost:4566"
+    )
+    for bad in (
+        "localhost:4566",
+        "ftp://x",
+        "http://",
+        "https://uploads.example.com/s3",  # path prefix would be silently dropped
+        "http://host?x=1",
+    ):
+        with pytest.raises(ValueError):
+            settings(s3_presign_public_base_url=bad)

@@ -117,7 +117,8 @@ def get_image_store(request: Request) -> ImageStorePort | None:
     s3 = getattr(request.app.state, "s3", None)
     if s3 is None:
         return None
-    return ImageStore(s3, request.app.state.settings.s3_bucket)
+    settings = request.app.state.settings
+    return ImageStore(s3, settings.s3_bucket, presign_public_base_url=settings.s3_presign_public_base_url)
 
 
 def get_product_cache(request: Request) -> ProductCachePort | None:

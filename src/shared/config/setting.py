@@ -12,6 +12,7 @@ latter would break test collection and any env without config.
 
 from functools import lru_cache
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, PostgresDsn, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -140,6 +141,12 @@ class AppSettings(BaseSettings):
     # Public CDN base (CloudFront in prod; LocalStack path locally) for serving
     # product images UNSIGNED. None → fall back to f"{s3_endpoint_url}/{s3_bucket}".
     s3_public_base_url: str | None = None
+    # Host the browser should POST presigned uploads to, when the client that
+    # uploads is not the same network as the app (docker: host browser can't
+    # resolve the internal ``localstack`` hostname). The presign policy does not
+    # bind the host, so rewriting it keeps the signature valid. None → serve the
+    # endpoint the S3 client was built with.
+    s3_presign_public_base_url: str | None = None
 
     # --- Secure image uploads + worker ---
     image_max_upload_bytes: int = Field(default=5 * 1024 * 1024, gt=0)  # presign policy ceiling (5 MiB)
@@ -284,6 +291,32 @@ class AppSettings(BaseSettings):
         if self.s3_endpoint_url and self.s3_bucket:
             return f"{self.s3_endpoint_url}/{self.s3_bucket}"
         return None
+
+    @model_validator(mode="after")
+    def _validate_presign_public_base_url(self) -> "AppSettings":
+        """Fail-fast on a presign re-host origin that would mint malformed URLs.
+
+        The adapter swaps the generated URL's origin (scheme+host+port) for this
+        one verbatim and keeps the generated path: a value without scheme/netloc
+        would produce an unPOSTable URL, and a path/query-bearing value would be
+        **silently mangled** (the extra components are dropped by the splice) —
+        the failure would only surface in the merchant's browser. Validate the
+        origin-only shape at startup instead.
+        """
+        if self.s3_presign_public_base_url is not None:
+            parts = urlsplit(self.s3_presign_public_base_url)
+            if (
+                parts.scheme not in ("http", "https")
+                or not parts.netloc
+                or parts.path not in ("", "/")
+                or parts.query
+                or parts.fragment
+            ):
+                raise ValueError(
+                    "s3_presign_public_base_url must be an absolute http(s) origin "
+                    f"without path/query/fragment (got {self.s3_presign_public_base_url!r})"
+                )
+        return self
 
     @model_validator(mode="after")
     def _require_public_image_base_in_cloud(self) -> "AppSettings":
