@@ -19,16 +19,28 @@ KEY = "uploads/p/t.bin"
 class FakeBody:
     """Mimics aiobotocore's ``StreamingBody``: ``__aenter__`` yields the *wrapped*
     aiohttp response, whose ``read()`` accepts no byte limit. Reading through the
-    context manager's value would therefore silently drop the bound."""
+    context manager's value would therefore silently drop the bound. Like the real
+    aiohttp-backed reader, ``read(amt)`` returns *at most* ``amt`` bytes — whatever
+    is currently buffered — never blocking to fill the caller's request."""
 
-    def __init__(self, data: bytes) -> None:
+    def __init__(self, data: bytes, *, fragment_size: int | None = None) -> None:
         self._data = data
-        self.requested: int | None = None
+        self._pos = 0
+        # aiohttp buffering model: each read sees at most ``fragment_size`` bytes.
+        # None = the whole body is buffered at once.
+        self._fragment_size = fragment_size
+        self.requested: list[int | None] = []
         self.exited = False
 
     async def read(self, amt: int | None = None) -> bytes:
-        self.requested = amt
-        return self._data if amt is None else self._data[:amt]
+        self.requested.append(amt)
+        if amt is None:  # unbounded drain
+            chunk, self._pos = self._data[self._pos :], len(self._data)
+            return chunk
+        buffered = self._fragment_size if self._fragment_size is not None else len(self._data)
+        chunk = self._data[self._pos : self._pos + min(amt, buffered)]
+        self._pos += len(chunk)
+        return chunk
 
     async def __aenter__(self):
         return _UnboundedWrapped()
@@ -43,12 +55,19 @@ class _UnboundedWrapped:
 
 
 class FakeS3:
-    def __init__(self, *, data: bytes = b"bytes", content_length: int | None = None, error: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        data: bytes = b"bytes",
+        content_length: int | None = None,
+        error: str | None = None,
+        fragment_size: int | None = None,
+    ) -> None:
         self._data = data
         self._content_length = len(data) if content_length is None else content_length
         self._error = error
         self.calls: list[dict] = []
-        self.body = FakeBody(data)
+        self.body = FakeBody(data, fragment_size=fragment_size)
 
     async def get_object(self, **params):
         self.calls.append(params)
@@ -82,18 +101,37 @@ async def test_download_without_an_expected_etag_sends_no_condition():
     assert "IfMatch" not in s3.calls[0]
 
 
-async def test_download_read_is_bounded():
+async def test_download_reads_are_bounded():
     s3 = FakeS3(data=b"x" * 50)
     await ImageStore(s3, "bucket").download(KEY, max_bytes=100)
-    assert s3.body.requested == 101, "must ask for one byte past the cap, never unbounded"
+    assert s3.body.requested[0] == 101, "must ask one byte past the cap to detect a lying ContentLength"
+    assert all(a is not None and a <= 101 for a in s3.body.requested), "never read unbounded or past the cap"
     assert s3.body.exited, "the response context must still be released"
+
+
+async def test_fragmented_body_is_read_to_eof_not_truncated():
+    """Regression for the short-read bug: aiobotocore's ``read(amt)`` returns *at
+    most* amt — whatever aiohttp has buffered — so a body arriving across multiple
+    TCP fragments truncated every large upload into a PIL decode failure. The
+    adapter must drain to EOF and reassemble the object whole."""
+    data = bytes(range(256)) * 343  # 87_808 bytes, far more than one fragment
+    s3 = FakeS3(data=data, fragment_size=4096)
+    obj = await ImageStore(s3, "bucket").download(KEY, max_bytes=1_000_000)
+    assert obj.data == data, "a short read must never truncate a multi-fragment body"
+    assert len(s3.body.requested) > 2, "the fragmenting fake must actually force multiple reads"
+
+
+async def test_object_exactly_at_the_cap_is_accepted():
+    s3 = FakeS3(data=b"x" * 100)
+    obj = await ImageStore(s3, "bucket").download(KEY, max_bytes=100)
+    assert obj.data == b"x" * 100, "cap-sized objects must not trip the oversized guard"
 
 
 async def test_declared_oversize_is_rejected_before_reading():
     s3 = FakeS3(data=b"x" * 10, content_length=10_000)
     with pytest.raises(ObjectTooLargeError):
         await ImageStore(s3, "bucket").download(KEY, max_bytes=100)
-    assert s3.body.requested is None, "an oversize object must never be read"
+    assert s3.body.requested == [], "an oversize object must never be read"
     assert s3.body.exited, "rejecting must not leak the pooled connection"
 
 
@@ -101,6 +139,7 @@ async def test_understated_content_length_is_still_caught():
     s3 = FakeS3(data=b"x" * 500, content_length=10)  # object lies about its size
     with pytest.raises(ObjectTooLargeError):
         await ImageStore(s3, "bucket").download(KEY, max_bytes=100)
+    assert s3.body.requested[0] == 101, "the lie is caught by reading one byte past the cap"
     assert s3.body.exited, "rejecting must not leak the pooled connection"
 
 

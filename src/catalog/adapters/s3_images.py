@@ -28,6 +28,10 @@ from src.catalog.ports.storage import (
 # new image is a new key — the CDN never needs to invalidate.
 CACHE_CONTROL = "public, max-age=31536000, immutable"
 
+# Drain size for downloads: big enough that a max-size image is a handful of reads,
+# small enough that one short-read round-trip never holds the whole cap in memory.
+_DOWNLOAD_CHUNK = 64 * 1024
+
 
 def _clean_etag(etag: str) -> str:
     """S3 quotes ETags in headers; the S3→SQS event record does not. Normalise."""
@@ -91,8 +95,9 @@ class ImageStore(ImageStorePort):
         bytes are handled by their own ``ObjectCreated`` event.
 
         **Bounded.** ``ContentLength`` is checked before reading, and the read
-        itself asks for one byte past the cap, so an oversized (or lying) object
-        can never be pulled into worker memory in full.
+        drains to EOF in bounded chunks (asking one byte past the cap at the end),
+        so an oversized (or lying) object can never be pulled into worker memory
+        in full.
 
         A missing object is raised as the port's :class:`ObjectNotFoundError`, not a
         botocore error: it is terminal (the raw upload was lifecycle-expired or
@@ -124,14 +129,29 @@ class ImageStore(ImageStorePort):
             declared = resp.get("ContentLength")
             if declared is not None and declared > max_bytes:
                 raise ObjectTooLargeError(f"{key} is {declared} bytes (cap {max_bytes})")
-            # One byte past the cap: enough to *detect* an object whose real size
-            # exceeds a truthful-looking ContentLength, never enough to blow up.
-            # Read via the StreamingBody itself, never the context manager's value:
-            # aiobotocore's ``__aenter__`` returns the *wrapped* aiohttp response,
-            # whose ``read()`` takes no byte limit — the bound would silently vanish.
-            data = await resp["Body"].read(max_bytes + 1)
-            if len(data) > max_bytes:
-                raise ObjectTooLargeError(f"{key} exceeds {max_bytes} bytes")
+            # **Read to EOF in bounded chunks.** aiobotocore's ``StreamingBody.read(amt)``
+            # delegates to aiohttp's ``StreamReader.read``, whose contract is "at most
+            # amt bytes" — it returns whatever is currently buffered, not exactly amt
+            # (botocore's sync reader blocks until amt or EOF; the async one does not).
+            # One big ``read(max_bytes + 1)`` therefore truncates any body arriving
+            # across more than one TCP fragment, and PIL then fails to decode the
+            # partial image. Each read stays at most one byte past the remaining cap:
+            # enough to *detect* an object bigger than a truthful-looking
+            # ContentLength, never enough to blow up. Read via the StreamingBody
+            # itself, never the context manager's value: aiobotocore's ``__aenter__``
+            # returns the *wrapped* aiohttp response, whose ``read()`` takes no byte
+            # limit — the bound would silently vanish.
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = await resp["Body"].read(min(_DOWNLOAD_CHUNK, max_bytes - total + 1))
+                if not chunk:
+                    break  # empty read = EOF (aiohttp contract)
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ObjectTooLargeError(f"{key} exceeds {max_bytes} bytes")
+                chunks.append(chunk)
+            data = b"".join(chunks)
         return DownloadedObject(data, resp.get("ContentType"), _clean_etag(resp.get("ETag", "")))
 
     async def put_bytes(self, key: str, data: bytes, *, content_type: str) -> None:
