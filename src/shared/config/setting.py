@@ -246,6 +246,26 @@ class AppSettings(BaseSettings):
     # duplicate order, degrading to re-reading the stored order (or 409).
     checkout_idempotency_ttl_seconds: int = Field(default=86400, gt=0)  # ~24h
 
+    # --- Resilience: bounded retries + circuit breakers (payment gateway, Keycloak Admin API) ---
+    # Retries back off exponentially with full jitter and are **bounded**
+    # (``resilience_max_attempts`` total tries) — the breaker is the real defense.
+    # Retrying a charge is safe (the gateway de-duplicates on the idempotency key);
+    # the admin calls retried here are idempotent grants/revocations/updates.
+    # ``resilience_retry_base_delay_seconds`` doubles per attempt; full jitter
+    # spreads concurrent callers so a dependency recovery isn't a thundering herd.
+    resilience_max_attempts: int = Field(default=3, ge=1, le=6)
+    resilience_retry_base_delay_seconds: float = Field(default=0.2, gt=0)
+    resilience_retry_max_delay_seconds: float = Field(default=2.0, gt=0)
+    # Breaker opens after this many **consecutive** transient faults and half-opens
+    # after ``resilience_breaker_reset_seconds`` to let one probe call through.
+    resilience_breaker_failure_threshold: int = Field(default=5, ge=1)
+    resilience_breaker_reset_seconds: float = Field(default=30.0, gt=0)
+    # SIGTERM drain bound for in-process work (seconds): the lifespan stops the
+    # outbox-lag poller, waits for in-flight requests to finish, then closes the
+    # pools last. Must stay **below** ECS's stopTimeout (~30s image stop) so
+    # SIGKILL never interrupts a pool mid-close.
+    shutdown_drain_timeout_seconds: float = Field(default=10.0, gt=0)
+
     # --- Worker metrics export ---
     # Workers don't serve `/metrics` (that's the API process), so their counters
     # are invisible unless exported. Long-running workers get a scrape port;

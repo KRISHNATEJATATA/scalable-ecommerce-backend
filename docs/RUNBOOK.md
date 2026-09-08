@@ -401,6 +401,56 @@ watch the `cart-events` queue depth + oldest-message age (worker liveness). Losi
 the worker freezes snapshots (stale prices, deleted products lingering in carts)
 but never loses a cart — cart state itself lives in Valkey, not in the queue.
 
+### 11. Circuit breakers (payment gateway / Keycloak Admin API)
+
+Outbound payment-gateway and Keycloak-Admin calls are wrapped in a per-dependency
+**circuit breaker** (`src/shared/resilience.py`). Transient faults (connection
+errors, timeouts, provider 5xx/429) are retried with bounded exponential backoff +
+**full jitter** (`RESILIENCE_MAX_ATTEMPTS` total tries); caller-fixable outcomes
+(404/409, business declines) are definitive answers — never retried, never counted.
+After `RESILIENCE_BREAKER_FAILURE_THRESHOLD` consecutive failed logical calls the
+breaker **opens**: every call fails fast with a 503 Problem instead of waiting on a
+dead dependency. After `RESILIENCE_BREAKER_RESET_SECONDS` it **half-opens** and
+admits exactly one probe — success closes it, failure re-opens it for another
+window. Recovery is automatic; no restart is involved.
+
+**Observable.** The state is the `circuit_state{dependency="payment_gateway"|"keycloak_admin"}`
+gauge (**0** closed, **1** half_open, **2** open) plus
+`circuit_transitions_total{dependency, from, to}`; every transition also logs a
+`circuit <name>: closed -> open (...)` line. Alarm on `circuit_state == 2` for
+longer than 2× the reset window; a high `circuit_transitions_total` rate means a
+flapping dependency (breaker correctly opening/closing over and over).
+
+| Breaker open means | User-visible behavior | Action |
+|---|---|---|
+| `payment_gateway` | checkout charges fail fast 503 (the saga compensates and releases stock); webhook processing of already-final payments still works; the reconciler postpones lookups — nothing is abandoned while down (a failed lookup never retires a charge) | check the provider's status page / gateway-side error metrics; self-heals on recovery — never restart to "clear" it |
+| `keycloak_admin` | role grant/revoke, enable/disable, user creation and directory reads fail fast 503; **login and token validation are unaffected** (the JWKS path has its own refresh-throttle guard, deliberately no breaker — a breaker there would turn a Keycloak blip into fleet-wide 401-adjacent 503s) | check Keycloak health (compose: `keycloak` service; prod: Keycloak pod/instance); self-heals |
+
+## Graceful shutdown (SIGTERM drain)
+
+- **API task** (gunicorn → UvicornWorker): the `Dockerfile` `CMD` is **exec-form**,
+  so gunicorn is PID 1 and receives ECS SIGTERM directly. Workers stop accepting,
+  finish in-flight requests (bounded by `--graceful-timeout 15`), then the app
+  lifespan drains in-process work (outbox-lag poller, S3/bus clients) and closes
+  the **DB + Valkey pools last**, all bounded by `SHUTDOWN_DRAIN_TIMEOUT_SECONDS`
+  (10s) — strictly inside the ECS `stopTimeout` (30s default), so SIGKILL never
+  interrupts a pool mid-close. A drain that trips its bound logs
+  `graceful shutdown exceeded ...` at ERROR: investigate, something held a pool.
+- **SQS workers** (relay, image/cache/cart consumers, reaper, reconciler): their
+  SIGTERM handler sets a stop event checked *between* polls; the in-flight
+  message batch completes (well inside the queue visibility timeout), then the
+  process exits and its pools close. The reconciler's idle sleep also wakes on
+  stop, so a deploy never waits out a 60s poll interval.
+
+### 12. Readiness probes
+
+`/v1/health` is liveness: process up, **no dependency calls** (always 200). `/v1/ready`
+pings Postgres, Valkey and (when a bus client is configured) SQS, concurrently and
+deadline-bounded (`READINESS_PROBE_TIMEOUT_SECONDS`); any failure answers **503 with
+the RFC 9457 Problem body** naming the unreachable dependencies in `details`. Wire the
+ALB target group to `/v1/ready` and the ECS/ALB liveness to `/v1/health` — a dependency
+outage then drains traffic from the fleet without killing the tasks themselves.
+
 ## Post-incident
 - Re-enable automated backups on the promoted instance.
 - Rotate any exposed secrets (JWT keys, DB creds) via Secrets Manager.

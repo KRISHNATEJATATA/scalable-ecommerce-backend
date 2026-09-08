@@ -71,12 +71,23 @@ async def test_duplicate_email_on_create_maps_to_conflict(monkeypatch) -> None:
         await admin.create_user("taken@example.com")
 
 
-async def test_genuine_faults_are_reraised_untranslated(monkeypatch) -> None:
+async def test_outage_is_retried_then_maps_to_dependency_unavailable(monkeypatch) -> None:
+    """A provider outage (5xx) is transient: retried, breaker-counted, and after the
+    bounded attempts surfaces as 503 DependencyUnavailable — no raw 500 boundary."""
     outage = KeycloakGetError(error_message="boom", response_code=500)
     admin = _admin_with(monkeypatch, outage)
+    with pytest.raises(DependencyUnavailableError) as caught:
+        await admin.grant_realm_role("sub-1", "merchant")
+    assert not isinstance(caught.value, KeycloakError)  # translated, not re-raised raw
+
+
+async def test_auth_faults_are_reraised_untranslated(monkeypatch) -> None:
+    """401/403 are definitive answers (Keycloak is up): no retry, raw re-raise."""
+    auth = KeycloakGetError(error_message="expired token", response_code=401)
+    admin = _admin_with(monkeypatch, auth)
     with pytest.raises(KeycloakGetError) as caught:
         await admin.grant_realm_role("sub-1", "merchant")
-    assert caught.value is outage
+    assert caught.value is auth
 
 
 class _RecordingKeycloak:

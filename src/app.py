@@ -7,6 +7,8 @@ served in dev only and hidden in prod.
 """
 
 import asyncio
+import contextlib
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -22,6 +24,7 @@ from src.orders.api import routes as orders_routes
 from src.payments.api import routes as payments_routes
 from src.shared.api import health, metrics
 from src.shared.auth.jwks import build_jwks_client
+from src.shared.bus.client import sqs_client
 from src.shared.bus.metrics import poll_outbox_lag
 from src.shared.clients import postgres_client, valkey_client
 from src.shared.clients.s3_client import s3_client
@@ -31,10 +34,20 @@ from src.shared.errors.exception_handlers import register_exception_handlers
 from src.shared.errors.openapi import use_problem_details_openapi
 from src.shared.middleware.security import RequestIDMiddleware, SecurityHeadersMiddleware
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """Own the shared connection pools + auth clients for the app's lifetime."""
+    """Own the shared connection pools + auth clients for the app's lifetime.
+
+    Shutdown is a **bounded drain**: uvicorn/gunicorn stop accepting
+    and finish in-flight requests before this runs; the bound below covers the
+    remaining in-process work (background task, bus/S3 clients, then pools
+    last) and must stay under gunicorn's ``--graceful-timeout``, which must
+    stay under the ECS stopTimeout — so SIGKILL never interrupts a pool
+    mid-close. Exceeding the bound logs loudly and abandons the remainder.
+    """
     settings: AppSettings = app.state.settings
     app.state.db_engine = postgres_client.create_engine(settings)
     app.state.db_sessionmaker = postgres_client.create_sessionmaker(app.state.db_engine)
@@ -52,6 +65,12 @@ async def _lifespan(app: FastAPI):
     s3_cm = s3_client(settings) if settings.s3_bucket else None
     if s3_cm is not None:
         app.state.s3 = await s3_cm.__aenter__()
+    # SQS client for the /v1/ready bus probe. None when no bus is configured
+    # (bare test app, or local dev without LocalStack): the probe then doesn't
+    # run and the bus key is omitted from the readiness body.
+    bus_configured = settings.bus_endpoint_url or settings.environment in ("staging", "prod")
+    bus_cm = sqs_client(settings) if bus_configured else None
+    app.state.bus_sqs = await bus_cm.__aenter__() if bus_cm is not None else None
     # Outbox-lag gauge refresh: sampled from the DB on a loop so /metrics keeps
     # reporting the alarm signal even while the relay is down (a dead relay
     # increments nothing — the DB is the source of truth). One query per tick;
@@ -60,16 +79,29 @@ async def _lifespan(app: FastAPI):
     try:
         yield
     finally:
-        lag_task.cancel()
         try:
-            await lag_task
-        except asyncio.CancelledError:
-            pass
-        await app.state.db_engine.dispose()
-        await app.state.db_probe_engine.dispose()
-        await app.state.valkey.aclose()
-        if s3_cm is not None:
-            await s3_cm.__aexit__(None, None, None)
+            async with asyncio.timeout(settings.shutdown_drain_timeout_seconds):
+                lag_task.cancel()
+                # await it, but never let its cancellation swallow the drain
+                # deadline: shielded wait bounded independently, and the task
+                # is re-cancelled in the abandon path below regardless.
+                with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(lag_task), settings.shutdown_drain_timeout_seconds / 2)
+                if bus_cm is not None:
+                    await bus_cm.__aexit__(None, None, None)
+                if s3_cm is not None:
+                    await s3_cm.__aexit__(None, None, None)
+                # Pools close last: nothing else in the process uses them after this.
+                await app.state.db_engine.dispose()
+                await app.state.db_probe_engine.dispose()
+                await app.state.valkey.aclose()
+        except TimeoutError:
+            lag_task.cancel()  # leaked if the deadline hit while awaiting it
+            logger.error(
+                "graceful shutdown exceeded %.1fs; abandoning the remainder of cleanup "
+                "(SIGKILL-equivalent — report if this fires in normal operation)",
+                settings.shutdown_drain_timeout_seconds,
+            )
 
 
 def create_app(settings: AppSettings | None = None) -> FastAPI:

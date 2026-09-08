@@ -35,41 +35,47 @@ async def test_health_is_200():
     assert resp.headers["X-Content-Type-Options"] == "nosniff"
 
 
-async def test_ready_is_503_without_pools():
+async def test_ready_is_503_problem_without_pools():
     async with _client() as client:
         resp = await client.get("/v1/ready")
     assert resp.status_code == 503
+    assert resp.headers["content-type"].startswith("application/problem+json")  # the documented contract
     body = resp.json()
-    assert body["status"] == "not ready"
-    assert body["checks"] == {"postgres": False, "valkey": False}
+    assert body["title"] == "Service Unavailable"
+    assert {"dependency": "postgres", "reachable": False} in body["details"]
+    assert {"dependency": "valkey", "reachable": False} in body["details"]
 
 
-async def test_valkey_outage_is_degraded_not_unready():
-    """Valkey must never gate readiness — the app falls through to the DB without it."""
+async def test_valkey_outage_gates_readiness():
+    """Valkey is functional state now (carts, idempotency fast path, dedup): it gates.
+    A live-but-failing client (not just an absent one) must 503 the probe."""
 
-    class _FakeEngine:
-        async def connect(self):
-            raise AssertionError("patched out")
+    class _DeadValkey:
+        async def ping(self):
+            raise OSError("valkey down")
 
-    app = create_app(SETTINGS)
-    app.state.db_engine = _FakeEngine()
-    app.state.valkey = None  # unreachable cache
-    import src.shared.clients.postgres_client as pg
-
-    original = pg.ping
-    pg.ping = lambda engine: _ok()
-
-    async def _ok():
+    async def _ok(_engine=None):
         return True
 
+    app = create_app(SETTINGS)
+    app.state.db_engine = object()
+    app.state.valkey = _DeadValkey()  # a real outage: client exists, ping fails
+    import src.shared.api.health as health
+    import src.shared.clients.postgres_client as pg
+
+    original_pg, original_vk = pg.ping, health.valkey_client.ping
+    pg.ping = _ok
+    health.valkey_client.ping = lambda client: client.ping()  # surface the real raise
     try:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.get("/v1/ready")
     finally:
-        pg.ping = original
+        pg.ping, health.valkey_client.ping = original_pg, original_vk
 
-    assert resp.status_code == 200  # ALB keeps the task in service
-    assert resp.json() == {"status": "degraded", "checks": {"postgres": True, "valkey": False}}
+    assert resp.status_code == 503  # ALB deregisters the task
+    body = resp.json()
+    assert body["title"] == "Service Unavailable"
+    assert {"dependency": "valkey", "reachable": False} in body["details"]
 
 
 async def test_ready_probes_are_deadline_bounded():
@@ -101,7 +107,9 @@ async def test_ready_probes_are_deadline_bounded():
 
     assert time.monotonic() - started < 5  # bounded, not hung on either dependency
     assert resp.status_code == 503
-    assert resp.json()["checks"] == {"postgres": False, "valkey": False}
+    assert resp.headers["content-type"].startswith("application/problem+json")
+    failed = {d["dependency"] for d in resp.json()["details"]}
+    assert failed == {"postgres", "valkey"}
 
 
 async def test_metrics_exposed():

@@ -560,10 +560,13 @@ paths:
       tags: [health]
       operationId: getReady
       summary: Readiness probe
-      description: Pings Postgres and Valkey; 200 when both are reachable, 503 otherwise.
+      description: >
+        Pings Postgres, Valkey and (when a bus client is configured) SQS.
+        200 with `{status, checks}` when every checked dependency is reachable;
+        503 as an RFC 9457 Problem naming the unreachable ones in `details`.
       responses:
         "200":
-          description: All critical dependencies are reachable.
+          description: All checked dependencies are reachable.
           content:
             application/json:
               schema:

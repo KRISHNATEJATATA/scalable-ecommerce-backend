@@ -193,9 +193,38 @@ Alembic uses the **sync** `psycopg2` driver; the app uses async `asyncpg`.
 
 ## Health checks
 
-- `GET /v1/health` — liveness (always 200 while the process is up).
-- `GET /v1/ready` — readiness (200 only when critical deps are reachable; 503
-  otherwise). Wire the ALB target-group health check to `/v1/ready`.
+- `GET /v1/health` — liveness (always 200 while the process is up; **no
+  dependency calls**). Wire the ECS/ALB liveness check here.
+- `GET /v1/ready` — readiness: pings Postgres, Valkey and (when a bus client is
+  configured) SQS, concurrently and deadline-bounded
+  (`READINESS_PROBE_TIMEOUT_SECONDS`). 200 with `{status, checks}` only when
+  every checked dependency is reachable; 503 otherwise, as an RFC 9457 Problem
+  naming the failures in `details`. Wire the ALB target-group health check to
+  `/v1/ready`.
+
+## Graceful shutdown (SIGTERM)
+
+The container `CMD` is **exec-form** (JSON array), so gunicorn is PID 1 and
+receives ECS SIGTERM directly — a shell-form `CMD` wraps it in `sh -c`, which
+does not forward signals. The shutdown chain is bounded, each stage strictly
+inside the next:
+
+1. **ECS `stopTimeout`** (30s default; the Terraform task definition must keep
+   it above everything below).
+2. **gunicorn `--graceful-timeout 15`** — workers stop accepting and finish
+   in-flight requests; anything still running is SIGKILLed at the bound.
+3. **`SHUTDOWN_DRAIN_TIMEOUT_SECONDS` (10s)** — the app lifespan's own bound:
+   the outbox-lag poller stops, bus/S3 clients close, then the **DB + Valkey
+   pools close last**. Tripping this bound logs
+   `graceful shutdown exceeded ...` at ERROR — if that fires in normal
+   operation, something was holding a pool connection and needs investigating.
+4. **SQS workers** (separate processes) set a stop event on SIGTERM checked
+   between polls: the current message batch completes within its visibility
+   timeout, the loop exits, pools close. The reconciler's idle sleep wakes on
+   stop instead of waiting out the poll interval.
+
+Worker count: `WEB_CONCURRENCY` (default 2 in the image; gunicorn reads it
+natively since the CMD is exec-form and cannot expand shell defaults).
 
 ## Local setup (parity)
 

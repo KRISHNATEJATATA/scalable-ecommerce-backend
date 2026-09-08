@@ -38,11 +38,12 @@ EXPOSE 8000
 
 # Async workers multiplex I/O-bound requests → worker count ≈ CPU cores, NOT (2*CPU)+1.
 # CPU-bound work (Pillow) goes to the threadpool, not more processes.
-# --timeout stays below the ALB idle timeout.
-CMD gunicorn main:app \
-    -k uvicorn.workers.UvicornWorker \
-    -w ${WEB_CONCURRENCY:-2} \
-    -b 0.0.0.0:8000 \
-    --timeout 30 \
-    --access-logfile - \
-    --error-logfile -
+# Exec-form (JSON array) is deliberate: gunicorn is PID 1 and receives ECS/Docker
+# SIGTERM directly — a shell-form CMD wraps it in `sh -c`, which does not forward
+# signals (ticket 15). Worker count comes from WEB_CONCURRENCY, which gunicorn
+# reads natively. --timeout stays below the ALB idle timeout; --graceful-timeout
+# bounds the SIGTERM drain (15s) below the ECS stopTimeout (30s default), and the
+# app's SHUTDOWN_DRAIN_TIMEOUT_SECONDS (10s) sits inside that — SIGKILL therefore
+# never interrupts a pool mid-close. See docs/DEPLOYMENT.md.
+ENV WEB_CONCURRENCY=2
+CMD ["gunicorn", "main:app", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000", "--timeout", "30", "--graceful-timeout", "15", "--access-logfile", "-", "--error-logfile", "-"]

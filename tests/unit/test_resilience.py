@@ -1,4 +1,10 @@
-"""JWKS resolution guards: unknown-``kid`` refresh amplification + worker retry loop."""
+"""JWKS resolution guards, worker retry loop, and the resilience primitives.
+
+Covers: the unknown-``kid`` refresh-amplification guard, the bounded-retry +
+circuit-breaker shell on the payment gateway and Keycloak admin (transient-only,
+fail-fast while open, observable via ``circuit_state``), and the shared
+``poll_forever`` loop's survival of transient errors.
+"""
 
 from __future__ import annotations
 
@@ -10,11 +16,34 @@ import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from jwt.exceptions import PyJWKClientError
+from keycloak.exceptions import KeycloakConnectionError, KeycloakGetError, KeycloakPostError
 
+from src.identity.adapters.keycloak.admin_client import KeycloakIdentityAdmin
+from src.payments.adapters.resilient_gateway import ResilientPaymentGateway
+from src.payments.adapters.stub_gateway import StubPaymentGateway
+from src.payments.ports.gateway import GatewayOutcome
 from src.shared.auth.jwks import resolve_signing_key
 from src.shared.bus.polling import poll_forever
+from src.shared.config.setting import AppSettings
+from src.shared.errors.exceptions import DependencyUnavailableError, KeycloakConflictError, KeycloakEntityNotFoundError
+from src.shared.resilience import CircuitBreaker, CircuitOpenError, retry_transient
 
 log = logging.getLogger(__name__)
+
+_SETTINGS = dict(
+    environment="local",
+    keycloak_issuer="https://keycloak.test/realms/ecommerce",
+    keycloak_admin_client_id="ecommerce-admin",
+    keycloak_admin_client_secret="secret",
+    resilience_max_attempts=2,
+    resilience_retry_base_delay_seconds=0.01,
+    resilience_retry_max_delay_seconds=0.02,
+    resilience_breaker_failure_threshold=2,
+    resilience_breaker_reset_seconds=0.05,
+)
+
+
+# --- JWKS unknown-kid guards (unchanged contracts) -----------------------------
 
 
 class _CountingJWKClient:
@@ -173,37 +202,46 @@ async def test_unknown_kid_against_usable_jwks_stays_401():
 
 
 async def test_keycloak_lookup_failure_is_not_treated_as_missing_user():
-    """Only 404 means "gone" — a 403/5xx must propagate, not silently skip the mirror."""
-    from keycloak.exceptions import KeycloakGetError
-
-    from src.identity.adapters.keycloak.admin_client import KeycloakIdentityAdmin
+    """Only 404 means "gone" — any other fault must surface (now as the 503 type,
+    after bounded retries and breaker accounting), never as a silent skip."""
 
     class _FailingKc:
-        def __init__(self, code: int) -> None:
+        def __init__(self, code: int | None) -> None:
             self._code = code
 
         async def a_get_user(self, _sub):
             if self._code == 404:
                 raise KeycloakGetError(error_message="not found", response_code=404)
+            if self._code is None:
+                raise KeycloakConnectionError("connection refused")
             raise KeycloakGetError(error_message="boom", response_code=self._code)
 
-    admin = KeycloakIdentityAdmin.__new__(KeycloakIdentityAdmin)
+    admin = KeycloakIdentityAdmin(AppSettings(**_SETTINGS))
 
     async def _client_for(code):
         kc = _FailingKc(code)
-        admin._client = lambda: _wrap(kc)
-        return kc
 
-    async def _wrap(kc):
+        async def _wrap():
+            return kc
+
+        admin._client = _wrap  # type: ignore[method-assign]
         return kc
 
     await _client_for(404)
     assert await admin.get_user_email("sub") is None  # genuinely gone
 
-    for code in (401, 403, 500, 503):
+    for code in (401, 403):  # definitive-but-failing answers: still raw, still not "missing"
         await _client_for(code)
         with pytest.raises(KeycloakGetError):
             await admin.get_user_email("sub")
+
+    for code in (None, 500, 503):  # connection faults and 5xx: bounded retries → 503 type
+        await _client_for(code)
+        with pytest.raises(DependencyUnavailableError):
+            await admin.get_user_email("sub")
+
+
+# --- poll_forever (worker loop) -------------------------------------------------
 
 
 async def test_poll_forever_survives_transient_errors():
@@ -234,3 +272,328 @@ async def test_poll_forever_stops_promptly_while_backing_off():
     await asyncio.sleep(0.05)
     stop.set()
     await asyncio.wait_for(task, timeout=2)
+
+
+# --- CircuitBreaker -----------------------------------------------------------
+
+
+def test_breaker_opens_after_threshold_and_fails_fast():
+    breaker = CircuitBreaker("test", failure_threshold=2, reset_timeout_seconds=60)
+    assert breaker.allow()
+    breaker.record_failure()
+    assert breaker.allow()  # still closed
+    breaker.record_failure()
+    assert breaker.state == "open"
+    assert not breaker.allow()  # fail fast — no probe during the window
+
+
+async def test_breaker_half_opens_after_reset_and_closes_on_success():
+    breaker = CircuitBreaker("test", failure_threshold=1, reset_timeout_seconds=0.01)
+    breaker.record_failure()
+    assert breaker.state == "open"
+    await asyncio.sleep(0.02)
+    assert breaker.allow()  # window elapsed → half-open admits one probe
+    assert breaker.state == "half_open"
+    assert not breaker.allow()  # a second concurrent caller fails fast
+    breaker.record_success()
+    assert breaker.state == "closed"
+    assert breaker.allow()
+
+
+async def test_breaker_reopens_when_probe_fails():
+    breaker = CircuitBreaker("test", failure_threshold=1, reset_timeout_seconds=0.01)
+    breaker.record_failure()
+    await asyncio.sleep(0.02)
+    assert breaker.allow()
+    breaker.record_failure()  # the probe failed
+    assert breaker.state == "open"
+    assert not breaker.allow()  # fresh window, fail fast again
+
+
+def test_breaker_ignores_straggler_success_while_open():
+    breaker = CircuitBreaker("test", failure_threshold=1, reset_timeout_seconds=60)
+    breaker.record_failure()
+    assert breaker.state == "open"
+    breaker.record_success()  # a late probe result after re-open must not un-arm
+    assert breaker.state == "open"
+    assert not breaker.allow()
+
+
+async def test_breaker_cancelled_probe_does_not_wedge_half_open():
+    """A cancelled call (saga step timeout, force-exit) records no outcome — it must
+    release the half-open probe slot, or the breaker would 503 forever until restart."""
+    breaker = CircuitBreaker("test", failure_threshold=1, reset_timeout_seconds=0.01)
+    breaker.record_failure()
+    await asyncio.sleep(0.02)
+    assert breaker.allow()  # probe admitted
+    breaker.record_abandoned()  # ...then the call was cancelled mid-flight
+    assert breaker.allow()  # slot released — a fresh probe can be admitted
+
+    # And the full wrapper path: a cancelled gateway call must not wedge either.
+    from src.payments.adapters.resilient_gateway import ResilientPaymentGateway
+
+    class _HangingGateway:
+        async def charge(self, **kwargs):  # noqa: ANN002, ANN202
+            await asyncio.sleep(30)
+
+        async def lookup(self, idempotency_key: str):  # noqa: ANN202
+            await asyncio.sleep(30)
+
+    gateway = ResilientPaymentGateway(
+        _HangingGateway(), max_attempts=1, failure_threshold=1, reset_timeout_seconds=0.01
+    )
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(gateway.charge(amount=1, idempotency_key="k", payment_method_token="t"), timeout=0.05)
+    await asyncio.sleep(0.02)  # reset window elapses while the probe was abandoned
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(gateway.charge(amount=1, idempotency_key="k2", payment_method_token="t"), timeout=0.05)
+
+
+def test_breaker_success_resets_the_failure_streak():
+    breaker = CircuitBreaker("test", failure_threshold=3)
+    breaker.record_failure()
+    breaker.record_failure()
+    breaker.record_success()  # proves the dependency recovered
+    breaker.record_failure()
+    breaker.record_failure()
+    assert breaker.state == "closed"  # streak was reset — 2 < 3
+
+
+def test_circuit_open_error_is_a_dependency_unavailable_error():
+    # The fail-fast error must ride the existing 503 Problem handler.
+    assert issubclass(CircuitOpenError, DependencyUnavailableError)
+
+
+# --- retry_transient ----------------------------------------------------------
+
+
+async def test_retry_transient_retries_then_succeeds():
+    calls = 0
+
+    async def flaky() -> int:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise ConnectionError("transient")
+        return 42
+
+    result = await retry_transient(flaky, attempts=3, base_delay_seconds=0.01, max_delay_seconds=0.02)
+    assert result == 42 and calls == 3
+
+
+async def test_retry_transient_gives_up_after_bounded_attempts():
+    calls = 0
+
+    async def always_down() -> None:
+        nonlocal calls
+        calls += 1
+        raise ConnectionError("down")
+
+    with pytest.raises(ConnectionError):
+        await retry_transient(always_down, attempts=3, base_delay_seconds=0.01)
+    assert calls == 3  # bounded — documented max, not infinite
+
+
+async def test_retry_transient_never_retries_definitive_answers():
+    calls = 0
+
+    async def not_found() -> None:
+        nonlocal calls
+        calls += 1
+        raise KeycloakGetError(error_message="nope", response_code=404)
+
+    with pytest.raises(KeycloakGetError):
+        await retry_transient(not_found, attempts=3, base_delay_seconds=0.01)
+    assert calls == 1  # 4xx is an answer, not an outage
+
+
+async def test_retry_transient_never_retries_circuit_open():
+    """The fail-fast error must not burn retry attempts against an open breaker."""
+    calls = 0
+
+    async def gated() -> None:
+        nonlocal calls
+        calls += 1
+        raise CircuitOpenError("open")
+
+    with pytest.raises(CircuitOpenError):
+        await retry_transient(gated, attempts=3, base_delay_seconds=0.01)
+    assert calls == 1
+
+
+async def test_retry_transient_treats_5xx_as_transient():
+    attempts: list[int] = []
+
+    async def flaky_5xx() -> int:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise KeycloakGetError(error_message="boom", response_code=503)
+        return 7
+
+    assert await retry_transient(flaky_5xx, attempts=2, base_delay_seconds=0.01) == 7
+
+
+# --- ResilientPaymentGateway --------------------------------------------------
+
+
+class _DownGateway:
+    """Gateway that always raises a transient fault (and counts calls)."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def charge(self, **kwargs):  # noqa: ANN002, ANN202
+        self.calls += 1
+        raise ConnectionError("gateway down")
+
+    async def lookup(self, idempotency_key: str):  # noqa: ANN202
+        self.calls += 1
+        raise ConnectionError("gateway down")
+
+
+async def test_gateway_transient_fault_opens_breaker_and_fails_fast():
+    down = _DownGateway()
+    gateway = ResilientPaymentGateway(down, max_attempts=2, base_delay_seconds=0.01, failure_threshold=2)
+    with pytest.raises(DependencyUnavailableError):
+        await gateway.charge(amount=10, idempotency_key="k1", payment_method_token="tok")
+    assert down.calls == 2  # one logical call = bounded tries
+    with pytest.raises(DependencyUnavailableError):
+        await gateway.charge(amount=10, idempotency_key="k2", payment_method_token="tok")
+    assert down.calls == 4  # second logical call still tried (streak 2 → open)
+    # Third logical call: breaker open → fails fast without touching the gateway.
+    with pytest.raises(DependencyUnavailableError):
+        await gateway.charge(amount=10, idempotency_key="k3", payment_method_token="tok")
+    assert down.calls == 4
+
+
+async def test_gateway_open_breaker_does_not_call_the_inner_gateway():
+    down = _DownGateway()
+    gateway = ResilientPaymentGateway(down, max_attempts=1, failure_threshold=1)
+    with pytest.raises(DependencyUnavailableError):
+        await gateway.lookup("k1")
+    assert down.calls == 1
+    with pytest.raises(DependencyUnavailableError):
+        await gateway.lookup("k2")
+    assert down.calls == 1  # breaker open — the gateway was not contacted again
+
+
+async def test_gateway_decline_is_not_a_fault():
+    """A business decline is a definitive answer: breaker stays closed."""
+    stub = StubPaymentGateway(fail_token_substring="decline")
+    gateway = ResilientPaymentGateway(stub, max_attempts=1, failure_threshold=1)
+    for i in range(5):  # far past the threshold
+        result = await gateway.charge(amount=10, idempotency_key=f"k{i}", payment_method_token="decline-me")
+        assert result.outcome == GatewayOutcome.FAILED
+    assert gateway._breaker.state == "closed"
+
+
+async def test_gateway_retry_exhaustion_raises_unavailable():
+    down = _DownGateway()
+    gateway = ResilientPaymentGateway(down, max_attempts=3, base_delay_seconds=0.01)
+    with pytest.raises(DependencyUnavailableError):
+        await gateway.lookup("k1")
+    assert down.calls == 3
+
+
+# --- Keycloak admin resilience ------------------------------------------------
+
+
+class _FlakyKeycloak:
+    """Stands in for ``KeycloakAdmin``: raises the injected error until ``up``."""
+
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+        self.up = False
+        self.calls = 0
+
+    async def a_get_realm_role(self, role_name: str):  # noqa: ANN202
+        self.calls += 1
+        if not self.up:
+            raise self._error
+        return {"name": role_name}
+
+    async def a_assign_realm_roles(self, user_id: str, roles: list):  # noqa: ANN002, ANN202
+        self.calls += 1
+
+    async def a_create_user(self, payload: dict):  # noqa: ANN002, ANN202
+        self.calls += 1
+        raise self._error
+
+
+def _admin_with(monkeypatch, error: Exception) -> tuple[KeycloakIdentityAdmin, _FlakyKeycloak]:
+    admin = KeycloakIdentityAdmin(AppSettings(**_SETTINGS))
+    kc = _FlakyKeycloak(error)
+
+    async def fake_client():
+        return kc
+
+    monkeypatch.setattr(admin, "_client", fake_client)
+    return admin, kc
+
+
+async def test_keycloak_transient_retries_then_succeeds(monkeypatch):
+    admin, kc = _admin_with(monkeypatch, KeycloakConnectionError("connection refused"))
+    kc.up = True  # the injected error would fire; the flaky wrapper below replaces it
+    original = kc.a_get_realm_role
+    state = {"n": 0}
+
+    async def flaky(role_name):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise KeycloakConnectionError("refused")  # first attempt transient-fails
+        return await original(role_name)
+
+    kc.a_get_realm_role = flaky  # type: ignore[method-assign]
+    await admin.grant_realm_role("sub", "merchant")  # retried once, then fine
+    assert state["n"] == 2
+
+
+async def test_keycloak_sustained_outage_maps_to_dependency_unavailable(monkeypatch):
+    admin, kc = _admin_with(monkeypatch, KeycloakConnectionError("refused"))
+    with pytest.raises(DependencyUnavailableError):
+        await admin.grant_realm_role("sub", "merchant")
+    assert kc.calls == _SETTINGS["resilience_max_attempts"]  # bounded, then 503
+
+
+async def test_keycloak_5xx_is_transient_404_is_not(monkeypatch):
+    admin, kc = _admin_with(monkeypatch, KeycloakGetError(error_message="boom", response_code=500))
+    with pytest.raises(DependencyUnavailableError):
+        await admin.grant_realm_role("sub", "merchant")
+    assert kc.calls == _SETTINGS["resilience_max_attempts"]
+
+    admin2, kc2 = _admin_with(monkeypatch, KeycloakGetError(error_message="gone", response_code=404))
+    with pytest.raises(KeycloakEntityNotFoundError):  # untranslated — a definitive answer
+        await admin2.grant_realm_role("sub", "merchant")
+    assert kc2.calls == 1  # not retried
+
+
+async def test_keycloak_breaker_opens_and_fails_fast(monkeypatch):
+    admin, kc = _admin_with(monkeypatch, KeycloakConnectionError("refused"))
+    for _ in range(_SETTINGS["resilience_breaker_failure_threshold"]):
+        with pytest.raises(DependencyUnavailableError):
+            await admin.grant_realm_role("sub", "merchant")
+    expected = _SETTINGS["resilience_max_attempts"] * _SETTINGS["resilience_breaker_failure_threshold"]
+    assert kc.calls == expected
+    with pytest.raises(DependencyUnavailableError):  # breaker open → no network call
+        await admin.grant_realm_role("sub", "merchant")
+    assert kc.calls == expected
+
+
+async def test_keycloak_409_conflict_not_retried_not_breaker_counted(monkeypatch):
+    admin, kc = _admin_with(monkeypatch, KeycloakPostError(error_message="exists", response_code=409))
+    with pytest.raises(KeycloakConflictError):
+        await admin.create_user("taken@example.com")
+    assert kc.calls == 1  # a definitive answer: one call, no retry
+    assert admin._breaker.state == "closed"
+
+
+async def test_keycloak_breaker_metrics_exposed(monkeypatch):
+    """The breaker gauge must be present with the dependency label after use."""
+    from prometheus_client import generate_latest
+
+    admin, _kc = _admin_with(monkeypatch, KeycloakConnectionError("refused"))
+    with pytest.raises(DependencyUnavailableError):
+        await admin.grant_realm_role("sub", "merchant")
+    body = generate_latest().decode()
+    assert "circuit_state" in body
+    assert 'dependency="keycloak_admin"' in body

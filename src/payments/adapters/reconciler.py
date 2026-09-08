@@ -22,14 +22,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import signal
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from src.payments.adapters.db.repository import PaymentsRepository
+from src.payments.adapters.resilient_gateway import ResilientPaymentGateway
 from src.payments.adapters.stub_gateway import StubPaymentGateway
 from src.payments.application.service import PaymentsService
+from src.payments.ports.gateway import PaymentGatewayPort
 from src.shared.config.setting import AppSettings, get_settings
 
 log = logging.getLogger(__name__)
@@ -41,7 +44,7 @@ class PaymentReconciler:
     def __init__(
         self,
         sessionmaker: async_sessionmaker,
-        gateway: StubPaymentGateway,
+        gateway: PaymentGatewayPort,
         *,
         batch_size: int,
         grace_seconds: int,
@@ -71,7 +74,9 @@ class PaymentReconciler:
         """Loop until ``stop`` is set; sleep ``poll_interval`` only when idle.
 
         A full batch means there may be more waiting, so the next pass runs
-        immediately — the same drain-then-sleep shape as the outbox relay."""
+        immediately — the same drain-then-sleep shape as the outbox relay. The
+        idle sleep wakes the moment ``stop`` is set, so SIGTERM never waits out
+        a full interval (bounded shutdown: finish the current sweep, exit)."""
         while stop is None or not stop.is_set():
             try:
                 resolved = await self.sweep_once()
@@ -79,21 +84,32 @@ class PaymentReconciler:
                 log.exception("reconciliation pass failed; retrying after interval")
                 resolved = 0
             if resolved < self._batch:
-                await asyncio.sleep(poll_interval)
+                if stop is None:
+                    await asyncio.sleep(poll_interval)
+                    continue
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=poll_interval)
 
 
 async def run_reconciler(
     settings: AppSettings,
     sessionmaker: async_sessionmaker,
     *,
-    gateway: StubPaymentGateway | None = None,
+    gateway: PaymentGatewayPort | None = None,
     stop: asyncio.Event | None = None,
     once: bool = False,
 ) -> int:
     """Build a reconciler from settings and run it (one sweep with ``once=True``)."""
     reconciler = PaymentReconciler(
         sessionmaker,
-        gateway or StubPaymentGateway(settings.payment_stub_fail_token_substring),
+        ResilientPaymentGateway(
+            gateway or StubPaymentGateway(settings.payment_stub_fail_token_substring),
+            max_attempts=settings.resilience_max_attempts,
+            base_delay_seconds=settings.resilience_retry_base_delay_seconds,
+            max_delay_seconds=settings.resilience_retry_max_delay_seconds,
+            failure_threshold=settings.resilience_breaker_failure_threshold,
+            reset_timeout_seconds=settings.resilience_breaker_reset_seconds,
+        ),
         batch_size=settings.payment_reconciliation_batch_size,
         grace_seconds=settings.payment_reconciliation_grace_seconds,
         max_age_seconds=settings.payment_reconciliation_max_age_seconds,
