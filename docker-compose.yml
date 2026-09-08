@@ -140,6 +140,51 @@ services:
       CORS_ALLOW_ORIGINS: '["http://localhost:3000"]'
     command: ["python", "-m", "scripts.s3_bootstrap"]
 
+  # One-shot (opt-in): seed the demo state — 4 Keycloak users, 11 products
+  # (5 + 6 across two merchants), 11 images through the real pipeline, stock
+  # per product. Explicitly invoked via `make seed` / `make seed-reset`;
+  # profile-gated so a normal `compose up` never runs it (the repo is shared
+  # by other UI projects). Not the FastAPI lifespan: that runs in prod ECS.
+  # Refuses to run without SEED_DEMO_DATA=1 (the explicit opt-in is also
+  # enforced inside the script, so `python -m scripts.catalog_seed` on a host
+  # without the flag is still a hard refusal).
+  catalog-seed:
+    build: .
+    profiles: ["seed"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+      s3-setup:
+        condition: service_completed_successfully
+      bus-setup:
+        condition: service_completed_successfully
+      relay:
+        condition: service_started
+      image-worker:
+        condition: service_started
+    environment:
+      ENVIRONMENT: local
+      DATABASE_URL: postgresql+asyncpg://ecommerce:ecommerce@postgres:5432/ecommerce
+      S3_ENDPOINT_URL: http://localstack:4566
+      S3_BUCKET: ecommerce-uploads
+      BUS_ENDPOINT_URL: http://localstack:4566
+      BUS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      KEYCLOAK_ISSUER: http://localhost:8080/realms/ecommerce
+      KEYCLOAK_SERVER_URL: http://keycloak:8080/
+      KEYCLOAK_ADMIN_CLIENT_ID: ecommerce-admin
+      KEYCLOAK_ADMIN_CLIENT_SECRET: change-me-local-only
+      SEED_DEMO_DATA: "1"
+    command: ["python", "-m", "scripts.catalog_seed"]
+
   # The `service`-role outbox relay: polls unpublished outbox rows → SNS.
   relay:
     build: .
@@ -235,6 +280,9 @@ services:
       bus-setup:
         condition: service_completed_successfully
     environment:
+      # AppSettings fail-fast requires DATABASE_URL even though this worker never
+      # touches Postgres (pure Valkey) — without it the process dies at boot.
+      DATABASE_URL: postgresql+asyncpg://ecommerce:ecommerce@postgres:5432/ecommerce
       VALKEY_URL: redis://valkey:6379/0
       CART_QUEUE_URL: http://localstack:4566/000000000000/cart-events
       BUS_ENDPOINT_URL: http://localstack:4566

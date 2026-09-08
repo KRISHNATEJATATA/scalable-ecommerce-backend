@@ -308,8 +308,8 @@ class KeycloakIdentityAdmin:
         directory page and this lookup) returns ``False`` — the account simply doesn't
         exist anymore, so it is shown roleless instead of failing the whole page. Any
         other ``KeycloakError`` is a dependency fault: retried/fail-fast by
-        :meth:`_guarded`, then mapped to :class:`DependencyUnavailableError` (503)
-        by :func:`map_admin_errors`.
+        :meth:`_guarded`, then mapped to :class:`DependencyUnavailableError` (503) by
+        :func:`map_admin_errors`.
         """
 
         async def op() -> bool:
@@ -323,3 +323,83 @@ class KeycloakIdentityAdmin:
             return any(r.get("name") == role for r in roles)
 
         return await self._guarded(op)
+
+    # --- demo seeding surface (dev-only; the sole caller is scripts/catalog_seed.py) ---
+    #
+    # These exist so the seeder uses the SAME Admin-API adapter (service account
+    # ``ecommerce-admin``, breaker + retry + error mapping) as the app instead of
+    # hand-rolling a second Keycloak client. They are deliberately NOT part of any
+    # API route: the app itself never handles credentials (spec invariant) — only
+    # the dev-only seeder, guarded by SEED_DEMO_DATA, ever passes a password here.
+
+    @map_admin_errors
+    async def find_sub_by_username(self, username: str) -> str | None:
+        """Exact-username lookup → the account's ``sub`` (``None`` when absent).
+
+        The seeder's ensure-user anchor: usernames are the demo contract (stable
+        across runs), while ``sub`` is minted by Keycloak and changes on recreate.
+        """
+
+        async def op() -> str | None:
+            kc = await self._client()
+            users = await kc.a_get_users(query={"username": username, "exact": True, "max": 1})
+            return users[0]["id"] if users else None
+
+        return await self._guarded(op)
+
+    @map_admin_errors
+    async def create_user_with_password(
+        self, username: str, email: str, password: str, *, first_name: str, last_name: str
+    ) -> str:
+        """Create an enabled, email-verified account with its password set; return the ``sub``.
+
+        Unlike :meth:`create_user` (the app's invite flow), NO required actions are
+        set and NO email is sent: the demo account is immediately authenticatable
+        via password grant, with no Mailpit/SMTP dependency. ``first_name``/
+        ``last_name`` are not cosmetic: the realm's user profile declares them
+        required, and a profile that fails validation makes Keycloak resolve
+        ``VERIFY_PROFILE`` at login — every direct grant would answer
+        "Account is not fully set up". If the password set fails, the just-created
+        account is deleted (shielded) so a retry starts clean instead of colliding
+        with a credentialless orphan. Never retried — a create is not idempotent
+        (same reasoning as :meth:`create_user`).
+        """
+
+        async def op() -> str:
+            kc = await self._client()
+            try:
+                user_sub = await kc.a_create_user(
+                    {
+                        "username": username,
+                        "email": email,
+                        "firstName": first_name,
+                        "lastName": last_name,
+                        "enabled": True,
+                        "emailVerified": True,
+                    }
+                )
+            except KeycloakError as exc:
+                raise _translate(exc) from exc
+            try:
+                await kc.a_set_user_password(user_id=user_sub, password=password, temporary=False)
+            except BaseException:
+                await asyncio.shield(kc.a_delete_user(user_sub))
+                raise
+            return user_sub
+
+        return await self._guarded(op, retry=False)
+
+    @map_admin_errors
+    async def delete_user(self, user_sub: str) -> None:
+        """Delete a Keycloak account outright (``--reset``); a 404 is already-gone → success."""
+
+        async def op() -> None:
+            kc = await self._client()
+            try:
+                await kc.a_delete_user(user_sub)
+            except KeycloakError as exc:
+                if getattr(exc, "response_code", None) == 404:
+                    return
+                raise
+
+        await self._guarded(op)

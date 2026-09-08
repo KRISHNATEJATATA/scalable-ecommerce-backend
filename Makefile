@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help install run lint typecheck test migrate compose-up compose-down hooks gen-alembic-env relay bus-setup s3-setup image-worker cache-worker cart-consumer reaper
+.PHONY: help install run lint typecheck test migrate compose-up compose-down seed seed-reset hooks gen-alembic-env relay bus-setup s3-setup image-worker cache-worker cart-consumer reaper
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS=":.*?## "}; {printf "%-14s %s\n", $$1, $$2}'
@@ -58,6 +58,12 @@ gen-alembic-env: ## Regenerate each module's env.py from scripts/alembic_env.py.
 
 compose-up: ## Start local backing services (Postgres, Valkey, LocalStack S3/SNS/SQS, ElasticMQ) + app + workers
 	docker compose up -d
+
+seed: ## Seed the demo state into the running stack (idempotent: 4 users, 11 products, images, stock)
+	docker compose run --rm catalog-seed
+
+seed-reset: ## Wipe + re-seed the known demo state (demo users get fresh subs; products re-anchor)
+	docker compose run --rm catalog-seed python -m scripts.catalog_seed --reset
 
 compose-down: ## Stop local backing services
 	docker compose down

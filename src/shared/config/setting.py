@@ -74,6 +74,13 @@ class AppSettings(BaseSettings):
     # SQS queue the catalog-cache invalidation consumer drains. LocalStack locally.
     catalog_cache_queue_url: str | None = None
 
+    # --- Demo seeding (dev-only) ---
+    # Explicit opt-in that unlocks `make seed` (scripts/catalog_seed.py). The
+    # seeder refuses to run without it, so hardcoded demo credentials and the
+    # fictional catalog are structurally incapable of reaching a real deployment.
+    # Deliberately NOT a field any server code reads — the seeder is the only consumer.
+    seed_demo_data: bool = True
+
     # --- Auth: OIDC via Keycloak (app is a pure resource server, Phase 5) ---
     # The app only VALIDATES Keycloak-issued RS256 tokens (JWKS). Keycloak owns
     # login/refresh/passwords. Algorithm is hardcoded to RS256 (alg:none guard).
