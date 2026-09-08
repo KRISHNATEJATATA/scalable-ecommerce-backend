@@ -1,6 +1,6 @@
 """Keyset/cursor pagination machinery shared across module repositories.
 
-See ``docs/adr/0003-keyset-cursor-pagination.md``. Holds the opaque cursor
+Holds the opaque cursor
 codec, the ORM keyset helper, the whitelist gate, the ``Page[T]`` envelope, and
 the ``PageParams`` query DTO — tightly coupled, so one module.
 

@@ -28,3 +28,6 @@ class Product:
     image_status: ImageStatus
     created_at: datetime
     updated_at: datetime
+    # The aggregate's optimistic-lock counter (column ``version_id``) — the
+    # ETag basis, exposed on the response as ``version``.
+    version: int

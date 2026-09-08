@@ -10,7 +10,7 @@ shape (matching the hand-authored contract, which already declared
 carts, the checkout idempotency fast path and event dedup live in Valkey, and
 outbox shipping needs the bus. (This supersedes the earlier degraded-not-gating
 stance: with cart state in Valkey, a Valkey outage is a functional outage for
-shoppers, not a graceful degradation — ticket 15.)
+shoppers, not a graceful degradation.)
 
 All checks run **concurrently** and **deadline-bounded**: a blackholed
 dependency accepts the TCP connection and never answers, so an unbounded ping

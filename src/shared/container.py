@@ -4,9 +4,6 @@ One provider chain per DB-backed module: ``get_session`` → ``get_<m>_repositor
 → ``get_<m>_service``. Repository/service providers are annotated to the **port**
 (the abstraction), so routes depend on the contract, not the concrete adapter —
 and tests inject fakes via ``app.dependency_overrides`` with no internal patching.
-
-Reads only this phase; write services (create/checkout/reserve/JIT) and their
-storage/payment/bus ports land with their feature tickets.
 """
 
 from __future__ import annotations
@@ -204,7 +201,7 @@ class OrderStockHolds(StockHoldsPort):
     """Orders' :class:`StockHoldsPort` built over the inventory service.
 
     Lives here so orders never names inventory. SKU mapping ``str(product.id)``
-    is the composition seam from ADR 0011 — the saga is its production caller.
+    is the composition seam — the saga is its production caller.
     """
 
     def __init__(self, inventory: InventoryService) -> None:

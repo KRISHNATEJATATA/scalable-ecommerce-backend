@@ -113,6 +113,7 @@ def _product_row_orm():
         image_status="none",
         created_at=_NOW,
         updated_at=_NOW,
+        version_id=1,
     )
 
 
@@ -176,6 +177,7 @@ def test_catalog_mapper_orm_and_productrow_map_equal():
         image_status=orm.image_status,
         created_at=orm.created_at,
         updated_at=orm.updated_at,
+        version_id=orm.version_id,
     )
     assert product_to_domain(orm) == product_to_domain(raw)
     assert isinstance(product_to_domain(raw), Product)

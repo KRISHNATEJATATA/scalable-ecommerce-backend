@@ -1,4 +1,4 @@
-"""Ticket 14 boundary tests: traceback redaction, sanitized 5xx, docs CSP.
+"""boundary tests: traceback redaction, sanitized 5xx, docs CSP.
 
 Uses ``httpx.AsyncClient`` over the ASGI app directly (no network, no lifespan),
 matching ``test_phase1_app.py``.
@@ -23,7 +23,7 @@ def _records() -> tuple[logging.Logger, logging.Handler, list[logging.LogRecord]
     records: list[logging.LogRecord] = []
     handler = logging.Handler()
     handler.emit = records.append  # type: ignore[method-assign]
-    logger = logging.getLogger("test.ticket14")
+    logger = logging.getLogger("test.ticket")
     logger.addHandler(handler)
     logger.setLevel(logging.DEBUG)
     return logger, handler, records

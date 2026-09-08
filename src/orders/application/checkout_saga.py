@@ -264,7 +264,7 @@ class CheckoutSaga:
             try:
                 async with asyncio.timeout(self._step_timeout):
                     for line in lines:
-                        # SKU mapping str(product.id): the composition seam from ADR 0011.
+                        # SKU mapping str(product.id).
                         await self._holds.reserve(str(line.product_id), line.quantity, order_id)
             except TimeoutError as exc:
                 # The reserve may have landed without its answer returning —

@@ -20,7 +20,7 @@ incremented in the recovery-poller process — same pattern as
     bug, never a second order);
   - ``conflict`` — any other controlled 409: empty cart, declined payment,
     cancelled replay, step timeout, reservation line conflicts — **and** the
-    post-payment failures ADR 0013 converts to "it will be settled
+    post-payment failures converts to "it will be settled
     automatically" (the order stays pending; unwinding is forbidden once money
     moved);
   - ``error`` — anything unhandled (the 500-shaped residue).

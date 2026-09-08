@@ -41,7 +41,9 @@ _SORT_COLUMNS: dict[str, tuple[str, str]] = {
 }
 _FILTERS: frozenset[str] = frozenset({"category", "merchant_id"})
 
-_SELECT_COLS = "id, merchant_id, name, description, category, price, image_key, image_status, created_at, updated_at"
+_SELECT_COLS = (
+    "id, merchant_id, name, description, category, price, image_key, image_status, created_at, updated_at, version_id"
+)
 
 # Fields the image-flip UPDATEs return so the ``ProductUpdated`` payload is built
 # from post-update state inside the same transaction (no read-then-publish race).
@@ -67,6 +69,7 @@ class ProductRow:
     image_status: str
     created_at: datetime
     updated_at: datetime
+    version_id: int
 
 
 class CatalogRepository:
@@ -81,7 +84,7 @@ class CatalogRepository:
         """One keyset page of live products, optionally equality-filtered and/or substring-searched.
 
         ``search`` is a case-insensitive substring match over ``name`` and
-        ``description`` (ADR 0017). The term is matched **literally**: LIKE
+        ``description``. The term is matched **literally**: LIKE
         wildcards are escaped, so ``%``/``_``/``\\`` in the term match
         themselves. It is a pure ``WHERE`` filter — result order stays the
         keyset ``(sort, id)`` order, and pagination/dup-skip guarantees are

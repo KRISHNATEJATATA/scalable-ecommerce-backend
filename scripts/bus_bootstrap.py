@@ -34,7 +34,7 @@ CONSUMERS: dict[str, list[str]] = {
     # orchestrator calls the services directly and the recovery poller reads
     # the payment row), so no SQS consumer drains this queue yet — the
     # subscriptions exist so the topology (queues + DLQs + fan-out) is created
-    # and future choreography consumers have a queue to attach to. See ADR 0013.
+    # and future choreography consumers have a queue to attach to.
     "saga-events": ["StockReserved", "StockReleased", "PaymentSucceeded", "PaymentFailed"],
 }
 MAX_RECEIVE_COUNT = 5

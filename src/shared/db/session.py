@@ -3,7 +3,7 @@
 ``get_session`` opens one session per request from the app's sessionmaker
 (owned by the lifespan in ``src/app.py``), rolls back on any error, and closes
 on exit. No auto-commit: reads don't need it and auto-commit-on-exit is a
-footgun for later writes — feature tickets that write commit explicitly.
+footgun for later writes.
 """
 
 from __future__ import annotations
@@ -23,5 +23,3 @@ async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
         except Exception:
             await session.rollback()
             raise
-    # no auto-commit — reads don't need it and auto-commit-on-exit is a
-    # footgun for later writes; feature tickets commit explicitly.

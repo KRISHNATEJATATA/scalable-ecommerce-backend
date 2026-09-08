@@ -43,7 +43,7 @@ from src.shared.config.logging import current_trace_id
 from src.shared.config.setting import AppSettings
 from src.shared.db.outbox import OutboxMessage
 from src.shared.db.pagination import PageParams, PageResponse
-from src.shared.errors.exceptions import AuthorizationError, InvalidUploadError
+from src.shared.errors.exceptions import AuthorizationError, InvalidUploadError, PreconditionFailedError
 
 log = logging.getLogger(__name__)
 
@@ -407,13 +407,27 @@ class CatalogService:
         return self._to_response(to_domain(row))
 
     async def update_product(
-        self, *, product_id: uuid.UUID, merchant_id: uuid.UUID, is_admin: bool, patch: ProductUpdate
+        self,
+        *,
+        product_id: uuid.UUID,
+        merchant_id: uuid.UUID,
+        is_admin: bool,
+        patch: ProductUpdate,
+        if_match: int | None = None,
     ) -> ProductResponse | None:
-        """Update an owned product and emit ``ProductUpdated``; ``None`` if absent."""
+        """Update an owned product and emit ``ProductUpdated``; ``None`` if absent.
+
+        ``if_match`` is the caller's parsed ``If-Match`` version (``None`` = no
+        precondition): a mismatch with the freshly loaded row answers 412
+        *before* anything is written — the client-side stale-read check that
+        complements the optimistic lock's in-request 409 backstop.
+        """
         product = await self._repo.get_product(product_id)
         if product is None:
             return None
         self._assert_owner(product.merchant_id, merchant_id, is_admin)
+        if if_match is not None and product.version_id != if_match:
+            raise PreconditionFailedError()
 
         changes = patch.model_dump(exclude_unset=True)
         outbox = product_updated_outbox(
@@ -427,12 +441,20 @@ class CatalogService:
         row = await self._repo.update_product(product, changes, outbox=outbox)
         return self._to_response(to_domain(row))
 
-    async def delete_product(self, *, product_id: uuid.UUID, merchant_id: uuid.UUID, is_admin: bool) -> bool:
-        """Soft-delete an owned product and emit ``ProductDeleted``; ``False`` if absent."""
+    async def delete_product(
+        self, *, product_id: uuid.UUID, merchant_id: uuid.UUID, is_admin: bool, if_match: int | None = None
+    ) -> bool:
+        """Soft-delete an owned product and emit ``ProductDeleted``; ``False`` if absent.
+
+        ``if_match`` guards the delete like ``update_product``'s — a stale
+        ``If-Match`` version answers 412 without deleting anything.
+        """
         product = await self._repo.get_product(product_id)
         if product is None:
             return False
         self._assert_owner(product.merchant_id, merchant_id, is_admin)
+        if if_match is not None and product.version_id != if_match:
+            raise PreconditionFailedError()
 
         event = ProductDeletedV2.new(
             trace_id=current_trace_id(),

@@ -34,6 +34,7 @@ from src.shared.errors.exceptions import (
     KeycloakEntityNotFoundError,
     OrderStateConflictError,
     PaymentIdempotencyConflictError,
+    PreconditionFailedError,
     ReservationConflictError,
     ReservationContendedError,
     StockBelowReservedError,
@@ -133,8 +134,14 @@ async def _unknown_payment_ref_handler(_: Request, exc: UnknownPaymentRefError) 
 
 async def _concurrent_update_handler(_: Request, exc: ConcurrentUpdateError) -> JSONResponse:
     # 409: the optimistic lock (`version_id`) rejected a lost-update, which is the
-    # guard working — a retryable client outcome, not the 500 boundary.
+    # guard working - a retryable client outcome, not the 500 boundary.
     return _problem_response(409, title="Conflict", detail=exc.detail)
+
+
+async def _precondition_failed_handler(_: Request, exc: PreconditionFailedError) -> JSONResponse:
+    # 412: the client's If-Match version no longer matches the row — the
+    # cross-request sibling of the 409 above (same remedy: re-read, re-apply).
+    return _problem_response(412, title="Precondition Failed", detail=exc.detail)
 
 
 async def _stale_data_handler(_: Request, exc: StaleDataError) -> JSONResponse:
@@ -242,6 +249,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(OrderStateConflictError, _order_state_conflict_handler)
     app.add_exception_handler(UnknownPaymentRefError, _unknown_payment_ref_handler)
     app.add_exception_handler(ConcurrentUpdateError, _concurrent_update_handler)
+    app.add_exception_handler(PreconditionFailedError, _precondition_failed_handler)
     app.add_exception_handler(StaleDataError, _stale_data_handler)
     app.add_exception_handler(DependencyUnavailableError, _dependency_unavailable_handler)
     app.add_exception_handler(KeycloakEntityNotFoundError, _keycloak_not_found_handler)

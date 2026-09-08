@@ -6,14 +6,20 @@ passes the gate); per-row ownership is enforced in the service, not here. The
 caller's local ``users.id`` (``CurrentUserDep``) is bound as ``merchant_id`` — a
 merchant can never spoof ownership by sending someone else's id. Reads require a
 valid token but no particular role (any shopper may browse).
+
+Conditional writes: product responses carry ``ETag: "<version>"``
+and writes may opt in to ``If-Match`` — a mismatch answers 412 before any
+state changes. Opt-in, never required: script consumers are not forced to
+track the header (the optimistic-lock 409 remains the server-side backstop).
 """
 
 from __future__ import annotations
 
+import re
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 
 from src.catalog.api.schemas import (
     ImagePresignRequest,
@@ -44,6 +50,46 @@ _NOT_FOUND = HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="produc
 # ``shared/api/query.py``) rather than a silently unfiltered page.
 _LIST_QUERY_PARAMS = frozenset({"limit", "sort", "cursor", "category", "merchant_id", "search"})
 
+# ``If-Match`` grammar this API accepts: ``*`` (any) or one quoted integer
+# (``"<version>"`` — W/ weak prefixes and list values are not produced by any
+# of this API's ETags, so they are rejected as malformed rather than guessed).
+_IF_MATCH_RE = re.compile(r"^\"(\d+)\"$")
+
+
+def etag_of(version: int) -> str:
+    """The entity tag for a product version: the quoted integer (RFC 9110 form)."""
+    return f'"{version}"'
+
+
+def parse_if_match(header: str | None) -> int | None:
+    """Parse ``If-Match`` into a version to compare, or ``None`` when no precondition.
+
+    Compares the quoted integer numerically (so a zero-padded echo of a real
+    version still matches — the API never issues leading zeros, and a padded
+    tag can only ever name a version that exists). Repeated ``If-Match``
+    header lines are not supported: Starlette serves only the first.
+
+    ``None`` (absent), ``*`` (any version), or a matching ``"<n>"`` all pass;
+    a malformed header is a 400 (the client is broken, not stale); anything
+    else is the exact version the client read.
+    """
+    if header is None:
+        return None
+    if header.strip() == "*":
+        return None
+    match = _IF_MATCH_RE.match(header.strip())
+    if match is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='If-Match must be a quoted integer (ETag) or "*"',
+        )
+    return int(match.group(1))
+
+
+def set_etag(response: Response, product: ProductResponse) -> None:
+    """Stamp the response's ``ETag`` from the product's aggregate version."""
+    response.headers["ETag"] = etag_of(product.version)
+
 
 @router.get("", response_model=PageResponse[ProductResponse])
 async def list_products(
@@ -73,11 +119,14 @@ async def list_products(
 
 
 @router.get("/{product_id}", response_model=ProductResponse)
-async def get_product(product_id: uuid.UUID, service: CatalogServiceDep, _principal: PrincipalDep) -> ProductResponse:
-    """Fetch one live product, or 404."""
+async def get_product(
+    product_id: uuid.UUID, service: CatalogServiceDep, _principal: PrincipalDep, response: Response
+) -> ProductResponse:
+    """Fetch one live product, or 404. The response carries ``ETag: "<version>"``."""
     product = await service.get_product(product_id)
     if product is None:
         raise _NOT_FOUND
+    set_etag(response, product)
     return product
 
 
@@ -96,13 +145,24 @@ async def update_product(
     service: CatalogServiceDep,
     caller: CurrentUserDep,
     principal: MerchantPrincipalDep,
+    response: Response,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> ProductResponse:
-    """Update an owned product (emits ``ProductUpdated``); cross-merchant → 403, missing → 404."""
+    """Update an owned product (emits ``ProductUpdated``); cross-merchant → 403, missing → 404.
+
+    An ``If-Match: "<version>"`` header makes the write conditional: a stale
+    version answers 412 (re-read and re-apply) before any state changes.
+    """
     product = await service.update_product(
-        product_id=product_id, merchant_id=caller.id, is_admin=principal.is_admin, patch=body
+        product_id=product_id,
+        merchant_id=caller.id,
+        is_admin=principal.is_admin,
+        patch=body,
+        if_match=parse_if_match(if_match),
     )
     if product is None:
         raise _NOT_FOUND
+    set_etag(response, product)
     return product
 
 
@@ -112,9 +172,16 @@ async def delete_product(
     service: CatalogServiceDep,
     caller: CurrentUserDep,
     principal: MerchantPrincipalDep,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> None:
-    """Soft-delete an owned product (emits ``ProductDeleted``); cross-merchant → 403, missing → 404."""
-    deleted = await service.delete_product(product_id=product_id, merchant_id=caller.id, is_admin=principal.is_admin)
+    """Soft-delete an owned product (emits ``ProductDeleted``); cross-merchant → 403, missing → 404.
+
+    Honours ``If-Match`` like the update: a stale version answers 412 and
+    nothing is deleted.
+    """
+    deleted = await service.delete_product(
+        product_id=product_id, merchant_id=caller.id, is_admin=principal.is_admin, if_match=parse_if_match(if_match)
+    )
     if not deleted:
         raise _NOT_FOUND
 

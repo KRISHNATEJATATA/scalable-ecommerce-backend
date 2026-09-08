@@ -307,9 +307,7 @@ async def test_search_composes_with_filters_and_pagination(app_ctx, rsa_key):
     a = _make_token(rsa_key, roles=["merchant"])
     b = _make_token(rsa_key, roles=["merchant"])
     async with _client(app_ctx) as client:
-        first = (
-            await client.post("/v1/products", headers=_auth(a), json={**_PRODUCT, "name": "alpha one"})
-        ).json()
+        first = (await client.post("/v1/products", headers=_auth(a), json={**_PRODUCT, "name": "alpha one"})).json()
         mid_a = first["merchant_id"]
         for name in ("alpha two", "beta three"):
             await client.post("/v1/products", headers=_auth(a), json={**_PRODUCT, "name": name})
@@ -604,6 +602,106 @@ async def test_presign_missing_product_404(app_ctx, rsa_key, image_store):
     async with _client(app_ctx) as client:
         resp = await client.post(f"/v1/products/{uuid.uuid4()}/image:presign", headers=_auth(token), json=_PRESIGN)
     assert resp.status_code == 404
+
+
+# --- conditional writes: ETag / If-Match ------------------------
+
+
+async def test_get_and_patch_carry_etag_of_version(app_ctx, rsa_key):
+    token = _make_token(rsa_key, roles=["merchant"])
+    async with _client(app_ctx) as client:
+        created = (await client.post("/v1/products", headers=_auth(token), json=_PRODUCT)).json()
+        got = await client.get(f"/v1/products/{created['id']}", headers=_auth(token))
+        assert got.headers["etag"] == '"1"'
+        assert got.json()["version"] == 1
+
+        updated = await client.patch(f"/v1/products/{created['id']}", headers=_auth(token), json={"price": "12.00"})
+        assert updated.headers["etag"] == '"2"'
+        assert updated.json()["version"] == 2
+
+
+async def test_if_match_matching_version_writes_and_bumps_etag(app_ctx, rsa_key):
+    token = _make_token(rsa_key, roles=["merchant"])
+    async with _client(app_ctx) as client:
+        created = (await client.post("/v1/products", headers=_auth(token), json=_PRODUCT)).json()
+        ok = await client.patch(
+            f"/v1/products/{created['id']}", headers={**_auth(token), "If-Match": '"1"'}, json={"price": "12.00"}
+        )
+    assert ok.status_code == 200, ok.text
+    assert Decimal(ok.json()["price"]) == Decimal("12.00")
+    assert ok.headers["etag"] == '"2"'
+
+
+async def test_if_match_star_always_passes(app_ctx, rsa_key):
+    token = _make_token(rsa_key, roles=["merchant"])
+    async with _client(app_ctx) as client:
+        created = (await client.post("/v1/products", headers=_auth(token), json=_PRODUCT)).json()
+        ok = await client.patch(
+            f"/v1/products/{created['id']}", headers={**_auth(token), "If-Match": "*"}, json={"price": "12.00"}
+        )
+    assert ok.status_code == 200, ok.text
+
+
+async def test_if_match_stale_version_is_412_and_writes_nothing(app_ctx, rsa_key, sessionmaker):
+    """A stale If-Match answers 412 before any state change — no patch applied,
+    no ProductUpdated event emitted, version untouched."""
+    token = _make_token(rsa_key, roles=["merchant"])
+    async with _client(app_ctx) as client:
+        created = (await client.post("/v1/products", headers=_auth(token), json=_PRODUCT)).json()
+        stale = await client.patch(
+            f"/v1/products/{created['id']}", headers={**_auth(token), "If-Match": '"99"'}, json={"price": "12.00"}
+        )
+        assert stale.status_code == 412, stale.text
+        assert stale.headers["content-type"].startswith("application/problem+json")
+        # The detail names the remedy, not the version (versions are not secrets,
+        # but the message must not change shape — the frontend keys on it).
+        assert "re-read" in stale.json()["detail"]
+
+        gone = await client.get(f"/v1/products/{created['id']}", headers=_auth(token))
+        assert Decimal(gone.json()["price"]) == Decimal("9.99") and gone.json()["version"] == 1
+    assert [e["event_type"] for e in await _outbox(sessionmaker)] == ["ProductCreated"]
+
+
+async def test_if_match_stale_delete_is_412_and_deletes_nothing(app_ctx, rsa_key):
+    token = _make_token(rsa_key, roles=["merchant"])
+    async with _client(app_ctx) as client:
+        created = (await client.post("/v1/products", headers=_auth(token), json=_PRODUCT)).json()
+        stale = await client.delete(f"/v1/products/{created['id']}", headers={**_auth(token), "If-Match": '"42"'})
+        assert stale.status_code == 412, stale.text
+        still_there = await client.get(f"/v1/products/{created['id']}", headers=_auth(token))
+        assert still_there.status_code == 200
+
+        ok = await client.delete(f"/v1/products/{created['id']}", headers={**_auth(token), "If-Match": '"1"'})
+        assert ok.status_code == 204
+
+
+async def test_if_match_malformed_is_400(app_ctx, rsa_key):
+    token = _make_token(rsa_key, roles=["merchant"])
+    async with _client(app_ctx) as client:
+        created = (await client.post("/v1/products", headers=_auth(token), json=_PRODUCT)).json()
+        for bad in ('"abc"', "1", '"1", "2"', 'W/"1"'):
+            resp = await client.patch(
+                f"/v1/products/{created['id']}", headers={**_auth(token), "If-Match": bad}, json={"price": "12.00"}
+            )
+            assert resp.status_code == 400, (bad, resp.text)
+
+
+async def test_if_match_412_beats_a_later_lost_update_409(app_ctx, rsa_key):
+    """The two stale-write defenses compose: If-Match 412 catches the stale read
+    up front; the optimistic-lock 409 remains the backstop for the race the
+    header cannot see (read and write inside one request's window)."""
+    token = _make_token(rsa_key, roles=["merchant"])
+    async with _client(app_ctx) as client:
+        created = (await client.post("/v1/products", headers=_auth(token), json=_PRODUCT)).json()
+        await client.patch(f"/v1/products/{created['id']}", headers=_auth(token), json={"price": "10.00"})
+        # Without If-Match: the old-style write against version 2 succeeds (last-write-wins).
+        plain = await client.patch(f"/v1/products/{created['id']}", headers=_auth(token), json={"price": "11.00"})
+        assert plain.status_code == 200
+        # With a stale If-Match: 412, not 409 — the precondition is checked before the write.
+        stale = await client.patch(
+            f"/v1/products/{created['id']}", headers={**_auth(token), "If-Match": '"1"'}, json={"price": "12.00"}
+        )
+    assert stale.status_code == 412
 
 
 # --- image worker state (token-guarded, stale-event safe) -----------------

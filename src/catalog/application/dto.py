@@ -114,6 +114,11 @@ class ProductResponse(BaseModel):
     # the cached payload. ``null`` = unknown (no stock row), never zero; ``0`` =
     # known out of stock. Always present on the wire (explicit ``null``).
     available: int | None = None
+    # The aggregate's optimistic-lock counter (the ``version_id`` column): the
+    # ETag basis and the value clients echo back via ``If-Match``. Part of the
+    # cached payload (unlike ``available``) so a cache hit still serves the
+    # correct ETag — the catalog-cache consumer invalidates it on every write.
+    version: int
 
 
 class ProductCreate(BaseModel):

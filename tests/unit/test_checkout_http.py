@@ -1,4 +1,4 @@
-"""Checkout + order-history HTTP contract (ticket 13 frontend agreement).
+"""Checkout + order-history HTTP contract.
 
 Full round-trip via ``httpx.AsyncClient`` over the ASGI app: real
 Testcontainers-Postgres (identity + catalog + inventory + orders + payments

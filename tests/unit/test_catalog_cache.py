@@ -92,6 +92,7 @@ class _Row:
     image_status: str
     created_at: datetime
     updated_at: datetime
+    version_id: int
 
 
 class CountingRepo:
@@ -121,6 +122,7 @@ def _row(product_id: uuid.UUID) -> _Row:
         image_status=ImageStatus.NONE.value,
         created_at=now,
         updated_at=now,
+        version_id=1,
     )
 
 

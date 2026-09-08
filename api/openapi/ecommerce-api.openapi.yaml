@@ -122,12 +122,19 @@ paths:
       tags: [catalog]
       operationId: getProduct
       summary: Get one product
-      description: Returns one live (non-deleted) product by id, or 404.
+      description: >-
+        Returns one live (non-deleted) product by id, or 404. The response
+        carries `ETag: "<version>"` — send it back as `If-Match` to make a
+        subsequent write conditional.
       security:
         - bearerAuth: []
       responses:
         "200":
           description: The product.
+          headers:
+            ETag:
+              schema: { type: string }
+              description: The product's quoted `version` (e.g. `"7"`).
           content:
             application/json:
               schema:
@@ -143,9 +150,20 @@ paths:
       description: >-
         Partial update of an owned product. A merchant mutating another
         merchant's product → 403 (admin bypasses ownership). Emits
-        `ProductUpdated` via the outbox.
+        `ProductUpdated` via the outbox. Honours an optional `If-Match`
+        precondition: a stale version answers `412` before any
+        state changes — re-read and re-apply.
       security:
         - bearerAuth: []
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          schema: { type: string }
+          description: >-
+            The quoted `version` from a previous read of this product (or `*`
+            for "must exist"). Optional — without it the write proceeds and
+            the server-side optimistic lock still answers 409 on a lost race.
       requestBody:
         required: true
         content:
@@ -155,10 +173,21 @@ paths:
       responses:
         "200":
           description: The updated product.
+          headers:
+            ETag:
+              schema: { type: string }
+              description: The post-write quoted `version`.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Product"
+        "400":
+          description: >-
+            Malformed `If-Match` — not a quoted integer version and not `*`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -167,8 +196,18 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           description: >-
-            Lost update — another writer advanced this product's version between
-            the read and the write (optimistic lock). Re-read and re-apply.
+            Lost update — another writer advanced this product's version
+            between the read and the write (optimistic lock). Re-read and
+            re-apply.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "412":
+          description: >-
+            The `If-Match` version does not match the product's current
+            `version` — the caller's copy is stale. Nothing was written;
+            re-read and re-apply.
           content:
             application/problem+json:
               schema:
@@ -188,12 +227,27 @@ paths:
       summary: Soft-delete a product (owner merchant only)
       description: >-
         Soft-deletes an owned product (cross-merchant → 403, admin bypasses).
-        Emits `ProductDeleted` via the outbox.
+        Emits `ProductDeleted` via the outbox. Honours an optional `If-Match`
+        precondition like the update — a stale version answers `412` and
+        nothing is deleted.
       security:
         - bearerAuth: []
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          schema: { type: string }
+          description: The quoted `version` from a previous read (or `*`). Optional.
       responses:
         "204":
           description: Product soft-deleted.
+        "400":
+          description: >-
+            Malformed `If-Match` — not a quoted integer version and not `*`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -204,6 +258,14 @@ paths:
           description: >-
             Lost update — a concurrent edit advanced this product's version
             (optimistic lock). Re-read and retry the delete.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "412":
+          description: >-
+            The `If-Match` version does not match the product's current
+            `version` — nothing was deleted; re-read and retry.
           content:
             application/problem+json:
               schema:
@@ -980,7 +1042,14 @@ components:
         updated_at:
           type: string
           format: date-time
-      required: [id, merchant_id, name, description, category, price, image_key, image_status, image_url, image_thumbnail_urls, available, created_at, updated_at]
+        version:
+          type: integer
+          minimum: 0
+          description: >-
+            The product's optimistic-lock counter — the value the `ETag`
+            response header carries (quoted). Echo it back as `If-Match` on
+            PATCH/DELETE to reject stale writes with 412 (ADR 0018).
+      required: [id, merchant_id, name, description, category, price, image_key, image_status, image_url, image_thumbnail_urls, available, version, created_at, updated_at]
     ProductCreate:
       description: Merchant create payload. `merchant_id` is bound from the caller, never from input. `image_key`/`image_status` are worker-owned and not accepted here.
       type: object

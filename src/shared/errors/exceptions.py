@@ -1,7 +1,7 @@
 """Purpose-named domain exceptions raised below the HTTP boundary.
 
 Repositories never import FastAPI; they raise these plain exceptions and a
-later RFC 9457 handler (ticket 14) maps them to ``400`` Problem Details. Until
+later RFC 9457 handler maps them to ``400`` Problem Details. Until
 then, callers/tests assert the exception type directly.
 """
 
@@ -220,10 +220,11 @@ class ConcurrentUpdateError(Exception):
     simply re-read and re-apply its patch. Adapters translate the SQLAlchemy error
     into this one so the ORM exception never leaks past the repository.
 
-    **Scope:** this guards the read→write window *inside one request*. There is no
-    ``ETag``/``If-Match`` yet (``ProductResponse`` exposes no version), so two
-    *sequential* requests remain last-write-wins by design — conditional updates
-    are ticket 25, not a gap in this guard.
+    **Scope:** this guards the read→write window *inside one request* — the
+    server-side backstop. Across *sequential* requests, clients detect the
+    stale read themselves via ``ETag``/``If-Match`` (412,
+    :class:`PreconditionFailedError`), which exposes the same ``version_id``
+    counter the ORM lock guards.
     """
 
     def __init__(self, resource: str = "resource") -> None:
@@ -231,6 +232,21 @@ class ConcurrentUpdateError(Exception):
         super().__init__(detail)
         self.resource = resource
         self.detail = detail
+
+
+class PreconditionFailedError(Exception):
+    """A client ``If-Match`` precondition failed against the loaded aggregate — 412.
+
+    The client based its write on a version that no longer matches the row:
+    the client-side sibling of :class:`ConcurrentUpdateError` (that one catches
+    the race *inside* the request via the ORM optimistic lock; this one catches
+    a stale read *across* requests). The remedy is the same — re-read and
+    re-apply.
+    """
+
+    def __init__(self) -> None:
+        self.detail = "the product changed since it was read (If-Match mismatch); re-read it and re-apply"
+        super().__init__(self.detail)
 
 
 class StockMutationError(Exception):

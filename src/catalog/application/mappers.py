@@ -26,4 +26,5 @@ def to_domain(row: Any) -> Product:
         image_status=ImageStatus(row.image_status),
         created_at=row.created_at,
         updated_at=row.updated_at,
+        version=row.version_id,
     )
