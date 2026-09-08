@@ -26,6 +26,10 @@ tags:
     description: Pre-checkout basket — per-caller Valkey state, no pagination
   - name: inventory
     description: Stock levels per SKU — the merchant/admin stock declaration
+  - name: checkout
+    description: The checkout saga — one cart driven to one terminal order
+  - name: orders
+    description: The caller's own order history, detail, and cancellation
 paths:
   /v1/products:
     get:
@@ -35,7 +39,8 @@ paths:
       description: >-
         Keyset-paginated listing of live (non-deleted) products. `sort` is a
         whitelisted field (`created_at`/`price`/`name`) with an optional leading
-        `-` for descending; `category`/`merchant_id` filter the result.
+        `-` for descending; `category`/`merchant_id` filter the result and
+        `search` substring-matches it.
       security:
         - bearerAuth: []
       parameters:
@@ -54,6 +59,14 @@ paths:
         - name: merchant_id
           in: query
           schema: { type: string, format: uuid }
+        - name: search
+          in: query
+          schema: { type: string, maxLength: 200 }
+          description: >-
+            Case-insensitive substring match over `name` and `description`;
+            the characters `%`, `_` and `\` match literally. Composes (AND)
+            with the other filters; result order stays the keyset `sort`
+            order — no relevance ranking (ADR 0017).
       responses:
         "200":
           description: One keyset page of products.
@@ -241,6 +254,181 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+  /v1/checkout:
+    post:
+      tags: [checkout]
+      operationId: checkout
+      summary: Run the cart through the checkout saga
+      description: >-
+        Drives the caller's cart to a terminal order (reserve stock → charge
+        → commit → `paid`). Requires an `Idempotency-Key` header: same key +
+        same body replays the stored `201`; same key + different body →
+        `409`; stock failure → `409` with the order already cancelled and
+        compensation run (show "out of stock", not a retry loop); replaying
+        an already-cancelled checkout re-raises its `409` — a retry needs a
+        new key. Generate a new key whenever the cart changes — the key pins
+        the first request it was sent with.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 200 }
+          description: Per-attempt client key that makes a retry safe to resend.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CheckoutRequest"
+      responses:
+        "201":
+          description: The checkout settled — the order (usually `paid`; `pending` only from crash recovery).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "400":
+          description: >-
+            The `payment_token` is a PAN-shaped value (card data) — rejected
+            at the payments boundary, never forwarded to the gateway.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: >-
+            Conflict — classify on the Problem `detail` (the `title` names the
+            exception, e.g. "Idempotency Conflict"). **Terminal** — surface it,
+            a retry cannot succeed: "insufficient stock for ..." (out of
+            stock), "this Idempotency-Key was already used with a different
+            request body" (same key, different body), "this checkout was
+            already cancelled; start a new one with a new Idempotency-Key",
+            "payment was declined; the order was cancelled", "checkout payment
+            timed out; the order was cancelled", "the order was cancelled
+            while checking out; start a new checkout", "cart is empty; nothing
+            to check out", "checkout reservation timed out". **Settling —
+            retry with the SAME key**: "payment outcome unknown; retry with
+            the same Idempotency-Key to settle", "checkout commit timed out;
+            it will be settled automatically", "checkout could not complete
+            after payment; it will be settled automatically", "the order was
+            cancelled while the payment was completing; it will be
+            reconciled". Reservation conflicts/contention from the reserve
+            step also surface as 409 (titles "Reservation Conflict" /
+            "Reservation Contention").
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422":
+          description: Missing/empty/oversized `Idempotency-Key`, or an invalid body.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /v1/orders:
+    get:
+      tags: [orders]
+      operationId: listOrders
+      summary: List the caller's orders (keyset-paginated)
+      description: >-
+        Keyset-paginated history of the caller's own orders, newest first by
+        default, optionally filtered by `status`. `sort` is a whitelisted
+        field with an optional leading `-` for descending.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: sort
+          in: query
+          schema: { type: string, default: "-created_at" }
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { type: string, enum: [pending, paid, shipped, cancelled] }
+      responses:
+        "200":
+          description: One keyset page of the caller's orders.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderPage"
+        "400":
+          description: Unknown sort field, unknown status, or an undecodable cursor.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/orders/{order_id}:
+    parameters:
+      - $ref: "#/components/parameters/OrderId"
+    get:
+      tags: [orders]
+      operationId: getOrder
+      summary: Get one of the caller's orders
+      description: Returns one order with its frozen line items; another user's id → 403.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: The order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/orders/{order_id}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/OrderId"
+    post:
+      tags: [orders]
+      operationId: cancelOrder
+      summary: Cancel the caller's own pending order
+      description: >-
+        Cancels a `pending` order and releases its stock holds. An
+        already-`cancelled` order is idempotently returned. `paid`/`shipped`
+        → `409` (refunds are the future reverse saga, not this endpoint); a
+        settled-while-cancelling race → `409` telling the caller to re-read.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: The order in `cancelled` state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: >-
+            The order is not cancellable — `paid`/`shipped` ("only pending
+            orders can be cancelled (order is ...)"), it settled while the
+            cancel ran ("the order settled while cancelling; re-read it"), or
+            its payment is still settling ("payment for this order is in
+            progress; try again once it settles").
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
   /v1/cart:
     get:
       tags: [cart]
@@ -411,6 +599,47 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CreateUserResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    get:
+      tags: [identity]
+      operationId: listAdminUsers
+      summary: List the Keycloak directory (admin only)
+      description: >-
+        Cursor-paginated directory of Keycloak accounts as
+        `{items, next_cursor}` pages of `{sub, email, merchant_role,
+        disabled}`. `search` matches any part of username/email (substring,
+        implemented as Keycloak's `*term*` infix — a `*` inside the term is
+        still a Keycloak wildcard, ADR 0015). No `sort` param — Keycloak's
+        users endpoint has none (documented deviation).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: search
+          in: query
+          schema: { type: string, maxLength: 200 }
+          description: Case-insensitive substring match over username/email.
+      responses:
+        "200":
+          description: One page of the admin directory.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminUserPage"
+        "400":
+          description: Undecodable cursor or an unknown query param (no `sort` here).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -634,6 +863,14 @@ components:
         minLength: 1
         maxLength: 64
         pattern: "^[A-Za-z0-9._:-]+$"
+    OrderId:
+      name: order_id
+      in: path
+      required: true
+      description: The order's UUID.
+      schema:
+        type: string
+        format: uuid
   responses:
     Unauthorized:
       description: Missing, invalid, expired, or malformed bearer token.
@@ -918,6 +1155,107 @@ components:
             Manual optimistic-lock version, bumped on every stock write that
             changes `on_hand` or `reserved` (a same-value re-PUT is a no-op).
       required: [sku, on_hand, reserved, version]
+    CheckoutRequest:
+      description: >-
+        Checkout body — the cart is server-side, so only the gateway token
+        travels: a hosted-checkout token/ref, never card data (a PAN-shaped
+        value is rejected with 400 at the payments boundary).
+      type: object
+      additionalProperties: false
+      properties:
+        payment_token:
+          type: string
+          minLength: 1
+          maxLength: 512
+      required: [payment_token]
+    OrderItem:
+      description: One order line — catalog facts (name, price) frozen at checkout time; later catalog edits never rewrite order history.
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        product_id:
+          type: string
+          format: uuid
+        product_name:
+          type: string
+        unit_price:
+          type: string
+          description: Decimal (money) serialized as a string.
+        quantity:
+          type: integer
+          minimum: 1
+      required: [id, product_id, product_name, unit_price, quantity]
+    Order:
+      description: >-
+        An order and its lines — the record of one checkout. `pending` arises
+        only from crash recovery (the stub gateway settles synchronously);
+        terminal states are `paid`/`shipped`/`cancelled`.
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [pending, paid, shipped, cancelled]
+        total:
+          type: string
+          description: Decimal (money) serialized as a string.
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/OrderItem"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required: [id, user_id, status, total, items, created_at, updated_at]
+    OrderPage:
+      description: One keyset page of the caller's orders.
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Order"
+        next_cursor:
+          type: [string, "null"]
+          description: Opaque cursor for the next page; `null` on the last page.
+      required: [items, next_cursor]
+    AdminUser:
+      description: One Keycloak directory entry, resolved live from the Admin API — not the local mirror; `sub` is the Keycloak id.
+      type: object
+      properties:
+        sub:
+          type: string
+          description: The Keycloak user id (the OIDC `sub`).
+        email:
+          type: [string, "null"]
+          description: May be `null` — an account without an address.
+        merchant_role:
+          type: boolean
+        disabled:
+          type: boolean
+      required: [sub, email, merchant_role, disabled]
+    AdminUserPage:
+      description: One keyset page of the admin directory.
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminUser"
+        next_cursor:
+          type: [string, "null"]
+          description: Opaque cursor for the next page; `null` on the last page.
+      required: [items, next_cursor]
     Problem:
       description: RFC 9457 Problem Details (the one flat error shape).
       type: object
