@@ -262,6 +262,78 @@ async def test_structurally_valid_but_uncastable_cursor_is_400(app_ctx, rsa_key)
     assert resp.status_code == 400, resp.text
 
 
+# --- search ----------------------------------------------------
+
+
+async def test_search_matches_name_and_description_case_insensitively(app_ctx, rsa_key):
+    token = _make_token(rsa_key, roles=["merchant"])
+    async with _client(app_ctx) as client:
+        await client.post(
+            "/v1/products",
+            headers=_auth(token),
+            json={**_PRODUCT, "name": "Silk Scarf", "description": "hand-rolled edges"},
+        )
+        await client.post(
+            "/v1/products",
+            headers=_auth(token),
+            json={**_PRODUCT, "name": "Wool Coat", "description": "waterfall SILK lining"},
+        )
+        await client.post(
+            "/v1/products",
+            headers=_auth(token),
+            json={**_PRODUCT, "name": "Leather Bag", "description": "pebbled hide"},
+        )
+        resp = await client.get("/v1/products?search=silk", headers=_auth(token))
+    assert resp.status_code == 200, resp.text
+    assert {p["name"] for p in resp.json()["items"]} == {"Silk Scarf", "Wool Coat"}
+
+
+async def test_search_wildcards_match_literally(app_ctx, rsa_key):
+    """``%``/``_`` in the term are escaped, so they match themselves — ``_``
+    never degrades into the one-char wildcard (else ``a_b`` would match ``axb``)."""
+    token = _make_token(rsa_key, roles=["merchant"])
+    async with _client(app_ctx) as client:
+        await client.post("/v1/products", headers=_auth(token), json={**_PRODUCT, "name": "100%_wool"})
+        await client.post("/v1/products", headers=_auth(token), json={**_PRODUCT, "name": "100x wool"})
+        await client.post("/v1/products", headers=_auth(token), json={**_PRODUCT, "name": "a_b"})
+        await client.post("/v1/products", headers=_auth(token), json={**_PRODUCT, "name": "axb"})
+        percent = await client.get("/v1/products?search=100%25", headers=_auth(token))
+        underscore = await client.get("/v1/products?search=a%5Fb", headers=_auth(token))
+    assert {p["name"] for p in percent.json()["items"]} == {"100%_wool"}
+    assert {p["name"] for p in underscore.json()["items"]} == {"a_b"}
+
+
+async def test_search_composes_with_filters_and_pagination(app_ctx, rsa_key):
+    a = _make_token(rsa_key, roles=["merchant"])
+    b = _make_token(rsa_key, roles=["merchant"])
+    async with _client(app_ctx) as client:
+        first = (
+            await client.post("/v1/products", headers=_auth(a), json={**_PRODUCT, "name": "alpha one"})
+        ).json()
+        mid_a = first["merchant_id"]
+        for name in ("alpha two", "beta three"):
+            await client.post("/v1/products", headers=_auth(a), json={**_PRODUCT, "name": name})
+        await client.post("/v1/products", headers=_auth(b), json={**_PRODUCT, "name": "alpha nine"})
+
+        scoped = (await client.get(f"/v1/products?search=alpha&merchant_id={mid_a}", headers=_auth(a))).json()
+        assert {p["name"] for p in scoped["items"]} == {"alpha one", "alpha two"}
+
+        # Walk the searched set one row per page: exactly the three alpha rows,
+        # no dups, no skips, cursor terminates.
+        walked: list[str] = []
+        cursor: str | None = None
+        for _ in range(4):
+            url = "/v1/products?search=alpha&limit=1" + (f"&cursor={cursor}" if cursor else "")
+            page = (await client.get(url, headers=_auth(a))).json()
+            walked.extend(p["name"] for p in page["items"])
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        miss = (await client.get("/v1/products?search=nonexistent", headers=_auth(a))).json()
+    assert set(walked) == {"alpha one", "alpha two", "alpha nine"} and len(walked) == 3
+    assert miss["items"] == [] and miss["next_cursor"] is None
+
+
 # --- update ---------------------------------------------------------------
 
 

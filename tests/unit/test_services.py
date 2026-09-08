@@ -58,7 +58,7 @@ class _FakeCatalogRepo:
     async def get_product(self, product_id):
         return self._product
 
-    async def list_products(self, params, filters=None):
+    async def list_products(self, params, filters=None, *, search=None):
         return self._page
 
 

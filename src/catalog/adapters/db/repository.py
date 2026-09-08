@@ -75,7 +75,18 @@ class CatalogRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def list_products(self, params: PageParams, filters: dict[str, object] | None = None) -> Page[ProductRow]:
+    async def list_products(
+        self, params: PageParams, filters: dict[str, object] | None = None, *, search: str | None = None
+    ) -> Page[ProductRow]:
+        """One keyset page of live products, optionally equality-filtered and/or substring-searched.
+
+        ``search`` is a case-insensitive substring match over ``name`` and
+        ``description`` (ADR 0017). The term is matched **literally**: LIKE
+        wildcards are escaped, so ``%``/``_``/``\\`` in the term match
+        themselves. It is a pure ``WHERE`` filter — result order stays the
+        keyset ``(sort, id)`` order, and pagination/dup-skip guarantees are
+        the listing's own.
+        """
         filters = filters or {}
         check_filters(filters, _FILTERS)
         if params.sort_field not in _SORT_COLUMNS:
@@ -89,6 +100,13 @@ class CatalogRepository:
         for key, value in filters.items():
             where.append(f"{key} = :{key}")  # key is whitelist-validated above
             binds[key] = value
+        if search:
+            # Literal substring: escape the LIKE wildcards (Postgres' default
+            # escape char is the backslash) before wrapping the term. A NULL
+            # description can never match; OR keeps the row when the name does.
+            escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            where.append("(name ILIKE :search OR description ILIKE :search)")
+            binds["search"] = f"%{escaped}%"
         if params.cursor:
             cursor_sort, cursor_id = decode_cursor(params.cursor, cast_type)
             where.append(f"({column}, id) {op} (CAST(:cursor_sort AS {cast_type}), CAST(:cursor_id AS uuid))")

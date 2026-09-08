@@ -42,7 +42,7 @@ _NOT_FOUND = HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="produc
 
 # Every query param the listing understands; anything else is a 400 (see
 # ``shared/api/query.py``) rather than a silently unfiltered page.
-_LIST_QUERY_PARAMS = frozenset({"limit", "sort", "cursor", "category", "merchant_id"})
+_LIST_QUERY_PARAMS = frozenset({"limit", "sort", "cursor", "category", "merchant_id", "search"})
 
 
 @router.get("", response_model=PageResponse[ProductResponse])
@@ -55,6 +55,10 @@ async def list_products(
     cursor: str | None = None,
     category: str | None = None,
     merchant_id: uuid.UUID | None = None,
+    search: Annotated[
+        str | None,
+        Query(max_length=200, description="Case-insensitive substring match over product name and description."),
+    ] = None,
 ) -> PageResponse[ProductResponse]:
     """Keyset-paginated, filterable listing of live products."""
     reject_unknown_query_params(request, _LIST_QUERY_PARAMS)
@@ -63,7 +67,9 @@ async def list_products(
         filters["category"] = category
     if merchant_id is not None:
         filters["merchant_id"] = merchant_id
-    return await service.list_products(PageParams(limit=limit, sort=sort, cursor=cursor), filters or None)
+    return await service.list_products(
+        PageParams(limit=limit, sort=sort, cursor=cursor), filters or None, search=search
+    )
 
 
 @router.get("/{product_id}", response_model=ProductResponse)

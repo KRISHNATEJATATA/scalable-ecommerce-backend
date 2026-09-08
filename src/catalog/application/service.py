@@ -345,10 +345,15 @@ class CatalogService:
         return await self._read_through(product_id)  # lock lapsed without a value → promote
 
     async def list_products(
-        self, params: PageParams, filters: dict[str, object] | None = None
+        self, params: PageParams, filters: dict[str, object] | None = None, *, search: str | None = None
     ) -> PageResponse[ProductResponse]:
-        """Return a keyset page of products, optionally filtered."""
-        page = await self._repo.list_products(params, filters)
+        """Return a keyset page of products, optionally filtered, optionally substring-searched.
+
+        ``search`` is a case-insensitive substring match over name and
+        description — a ``WHERE`` filter, so result order stays the
+        keyset ``sort`` order.
+        """
+        page = await self._repo.list_products(params, filters, search=search)
         items = [self._to_response(to_domain(row)) for row in page.items]
         await self._attach_availability(items)
         return PageResponse(items=items, next_cursor=page.next_cursor)

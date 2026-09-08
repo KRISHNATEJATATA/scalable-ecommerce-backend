@@ -102,7 +102,9 @@ class ProductRecord(Protocol):
 
 
 class CatalogRepositoryPort(Protocol):
-    async def list_products(self, params: PageParams, filters: dict[str, object] | None = None) -> Page[Any]: ...
+    async def list_products(
+        self, params: PageParams, filters: dict[str, object] | None = None, *, search: str | None = None
+    ) -> Page[Any]: ...
 
     async def get_product(self, product_id: uuid.UUID) -> ProductRecord | None: ...
 
