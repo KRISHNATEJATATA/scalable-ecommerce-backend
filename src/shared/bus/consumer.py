@@ -195,11 +195,22 @@ class SqsConsumer:
         return True
 
     async def poll_once(self) -> int:
-        """Receive one batch; process + delete each. Returns messages acked.
+        """Receive one batch; process + delete each concurrently. Returns messages acked.
 
-        A handler error or an in-flight duplicate leaves the message on the queue
-        (no delete) so SQS redelivers it and, past ``maxReceiveCount``, routes a
-        genuine poison message to the DLQ.
+        Messages are processed **concurrently** (one coroutine per message): SQS
+        starts every message's visibility clock at receive time, so a serial
+        for-loop makes batch duration ≈ ``sum(handlers)`` and tail messages
+        reappear mid-batch, burning redrive attempts toward the DLQ despite
+        handler success. Concurrently the batch takes ≈ ``max(handler)`` — the
+        correctness of in-flight duplicates is already guaranteed by the
+        per-event Valkey lease (``_process`` claims ``SET NX EX`` first).
+
+        Per-message boundaries (one message can never disturb its siblings):
+        - handler error or contract-invalid event → log.exception, no delete
+          (left for redrive → DLQ);
+        - in-flight duplicate (``_process`` → False) → no delete, no error;
+        - ``delete_message`` failure → log.exception, no delete counted — the
+          message is redelivered and deduped/acked on its next delivery.
         """
         resp = await self._sqs.receive_message(
             QueueUrl=self._queue_url,
@@ -209,17 +220,33 @@ class SqsConsumer:
         )
         messages = resp.get("Messages", [])
         handled = 0
-        for message in messages:
-            try:
-                acked = await self._process(message)
-            except Exception:  # boundary: poison message stays for SQS redrive → DLQ
-                log.exception("event handler failed; leaving message for redrive")
-                continue
-            if not acked:  # in-flight elsewhere → leave for redrive, no error
-                continue
-            await self._sqs.delete_message(QueueUrl=self._queue_url, ReceiptHandle=message["ReceiptHandle"])
-            handled += 1
+        for ok in await asyncio.gather(*(self._process_and_ack(message) for message in messages)):
+            if ok:  # deleted = acked; anything else is left for SQS redrive
+                handled += 1
         return handled
+
+    async def _process_and_ack(self, message: dict[str, Any]) -> bool:
+        """Process one message and delete (ack) it on success.
+
+        Owns its own try/except so one poison message or a failing delete never
+        escapes into :meth:`poll_once` and cancels its batch siblings. Returns
+        ``True`` only when the message was actually deleted (counted as handled).
+        """
+        try:
+            acked = await self._process(message)
+        except Exception:  # boundary: poison message stays for SQS redrive → DLQ
+            log.exception("event handler failed; leaving message for redrive")
+            return False
+        if not acked:  # in-flight elsewhere → leave for redrive, no error
+            return False
+        try:
+            await self._sqs.delete_message(QueueUrl=self._queue_url, ReceiptHandle=message["ReceiptHandle"])
+        except Exception:
+            # Don't count it as handled: the message is redelivered after the
+            # visibility timeout and the ``done`` marker dedupes/acks that delivery.
+            log.exception("failed to delete message after successful handling; leaving for redrive")
+            return False
+        return True
 
     async def run(self, stop) -> None:
         """Long-poll loop until ``stop`` (an ``asyncio.Event``) is set.

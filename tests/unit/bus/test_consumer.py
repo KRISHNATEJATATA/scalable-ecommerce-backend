@@ -9,6 +9,7 @@ LocalStack (see ``docs/RUNBOOK.md`` / ``scripts/bus_bootstrap.py``), not here.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import UTC, datetime
@@ -253,3 +254,97 @@ async def test_fanout_subscribers_each_process_the_same_event() -> None:
     assert calls == {"a": [event_id], "b": [event_id]}  # each subscriber ran exactly once
     assert valkey.store[f"event:consumer-a:{event_id}"] == "done"
     assert valkey.store[f"event:consumer-b:{event_id}"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_batch_is_processed_concurrently_within_visibility_window() -> None:
+    """The batch runs concurrently, not serially: 10 x 50ms handlers must take
+    ≈ max(handler), not sum(handlers) — SQS starts every message's visibility
+    clock at receive time, so a serial batch outruns the window and burns
+    redrive attempts toward the DLQ despite handler success"""
+    messages = [_message(str(uuid.uuid4()), handle=f"m{i}") for i in range(10)]
+    started: list[float] = []
+
+    async def handler(event: dict) -> None:
+        started.append(asyncio.get_running_loop().time())
+        await asyncio.sleep(0.05)
+
+    sqs = FakeSqs(messages)
+    consumer = _consumer(sqs, FakeValkey(), handler)
+
+    loop = asyncio.get_running_loop()
+    begin = loop.time()
+    handled = await consumer.poll_once()
+    elapsed = loop.time() - begin
+
+    assert handled == 10  # all acked
+    assert sorted(sqs.deleted) == sorted(m["ReceiptHandle"] for m in messages)
+    # Overlap proof: every handler must have started before the first one finished.
+    assert len(started) == 10 and max(started) - min(started) < 0.05
+    # Pre-fix serial batch ≈ 0.5-0.6s; concurrent ≈ 0.05s. Generous ceiling keeps
+    # this stable on slow CI while still failing a serial regression.
+    assert elapsed < 0.3
+
+
+@pytest.mark.asyncio
+async def test_poison_message_does_not_disturb_its_batch_siblings() -> None:
+    """One poison handler error stays inside its own per-message boundary: the
+    other messages are still processed and deleted, and poll_once does not raise."""
+    poison_id = str(uuid.uuid4())
+    calls: list[str] = []
+
+    async def handler(event: dict) -> None:
+        if event["event_id"] == poison_id:
+            raise RuntimeError("poison")
+        calls.append(event["event_id"])
+
+    good1, good2 = str(uuid.uuid4()), str(uuid.uuid4())
+    sqs = FakeSqs(
+        [
+            _message(good1, handle="g1"),
+            _message(poison_id, handle="bad"),
+            _message(good2, handle="g2"),
+        ]
+    )
+    handled = await _consumer(sqs, FakeValkey(), handler).poll_once()
+
+    assert calls == [good1, good2]  # siblings unaffected by the poison
+    assert sqs.deleted == ["g1", "g2"]  # good messages acked, poison left for redrive
+    assert handled == 2
+
+
+class FlakyDeleteSqs(FakeSqs):
+    """FakeSqs whose delete_message fails for one specific receipt handle."""
+
+    def __init__(self, messages: list[dict], failing_handle: str) -> None:
+        super().__init__(messages)
+        self._failing_handle = failing_handle
+
+    async def delete_message(self, *, QueueUrl, ReceiptHandle):  # noqa: N803
+        if ReceiptHandle == self._failing_handle:
+            raise RuntimeError("sqs delete blew up")
+        self.deleted.append(ReceiptHandle)
+
+
+@pytest.mark.asyncio
+async def test_delete_failure_does_not_stop_the_rest_of_the_batch() -> None:
+    """A transient delete_message error must not escape poll_once (which would
+    abandon the rest of the batch mid-loop with their visibility clocks running):
+    siblings are still processed + deleted, the failed message stays for
+    redelivery (where the done marker dedupes/acks), and handled counts only
+    actual deletes."""
+    failing, sibling = str(uuid.uuid4()), str(uuid.uuid4())
+    calls: list[str] = []
+
+    async def handler(event: dict) -> None:
+        calls.append(event["event_id"])
+
+    sqs = FlakyDeleteSqs(
+        [_message(failing, handle="del-fail"), _message(sibling, handle="del-ok")],
+        failing_handle="del-fail",
+    )
+    handled = await _consumer(sqs, FakeValkey(), handler).poll_once()
+
+    assert calls == [failing, sibling]  # both handlers ran
+    assert sqs.deleted == ["del-ok"]  # only the successful delete recorded
+    assert handled == 1  # failed delete is NOT counted as handled
