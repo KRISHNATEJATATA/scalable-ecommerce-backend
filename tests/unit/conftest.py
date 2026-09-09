@@ -66,6 +66,22 @@ async def async_engine(_migrated):
     await engine.dispose()
 
 
+@pytest.fixture(scope="session")
+def _valkey_server():
+    """One real Valkey for the whole session (compose runs ``valkey/valkey:8``).
+
+    Shared by every test that exercises Valkey-backed code through the real
+    engine (cache adapter + cache-aside orchestration, bus dedupe). Tests flush
+    before use, so sharing one container is safe — spinning one per module was
+    the slow part.
+    """
+    from testcontainers.core.container import DockerContainer
+
+    container = DockerContainer("valkey/valkey:8").with_exposed_ports(6379)
+    with container:
+        yield container.get_container_host_ip(), int(container.get_exposed_port(6379))
+
+
 @pytest.fixture
 async def session(async_engine):
     maker = async_sessionmaker(async_engine, expire_on_commit=False)

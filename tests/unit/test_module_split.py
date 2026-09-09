@@ -1,20 +1,16 @@
 """Module-split smoke tests: schema-per-module models, constraints, and per-module Alembic chains.
 
-Requires a real Postgres reachable via ``DATABASE_URL`` (Testcontainers-managed
-in CI; see ``tests/unit/conftest.py`` if one is added later). Skips cleanly
-when no Postgres is reachable, so this file doesn't fail collection in
-environments without a DB.
+Runs against the shared session-scoped Testcontainers-Postgres from
+``tests/unit/conftest.py`` — real Postgres, never SQLite, and **no
+environment-dependent skip**: if Docker is unavailable, the suite fails loudly
+instead of silently skipping the database checks (the old stand-in fixture
+skipped whenever a localhost Postgres was unreachable, letting constraint
+regressions land green on machines without a DB).
 
-the skip-if-unreachable fixture is a stand-in until ticket 17
-(crown-jewel-risk-tests) wires a shared Testcontainers-Postgres fixture for
-the whole suite (see .scratch/distributed-ecommerce-backend/issues/17-crown-
-jewel-risk-tests.md) — that ticket is the one that makes this DB coverage
-mandatory in CI instead of best-effort.
+The shared ``_migrated`` fixture has already run every module's Alembic chain to
+head; ``sessionmaker_factory`` (via ``async_engine``) truncates all tables before
+each test, so these inserts start from a clean schema.
 """
-
-import subprocess
-import sys
-from pathlib import Path
 
 import pytest
 import sqlalchemy
@@ -28,36 +24,22 @@ from src.inventory.adapters.db.models import SCHEMA as INVENTORY_SCHEMA
 from src.inventory.adapters.db.models import Inventory
 from src.shared.config.setting import get_settings
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
-MODULES = ["identity", "catalog", "inventory", "orders", "payments"]
-
 
 def _sync_url() -> str:
     return str(get_settings().database_url).replace("+asyncpg", "+psycopg2")
 
 
-@pytest.fixture(scope="module")
-def engine():
-    try:
-        eng = sqlalchemy.create_engine(_sync_url())
-        with eng.connect() as conn:
-            conn.execute(text("SELECT 1"))
-    except Exception as exc:  # pragma: no cover - environment-dependent
-        pytest.skip(f"Postgres not reachable: {exc}")
-    return eng
+@pytest.fixture
+async def engine(_migrated, sessionmaker_factory):
+    """A sync engine on the same Testcontainers database the async fixtures use.
 
-
-@pytest.fixture(scope="module", autouse=True)
-def migrated(engine):
-    """Run every module's own Alembic chain to head before the tests in this file."""
-    for module in MODULES:
-        subprocess.run(
-            [sys.executable, "-m", "alembic", "-c", f"src/{module}/alembic.ini", "upgrade", "head"],
-            cwd=REPO_ROOT,
-            check=True,
-        )
-    yield
+    Depends on ``sessionmaker_factory`` so the per-test truncate has run first;
+    migrations are owned by the shared session-scoped ``_migrated`` fixture (this
+    file used to run the chains itself against a possibly-absent localhost DB).
+    """
+    eng = sqlalchemy.create_engine(_sync_url())
+    yield eng
+    eng.dispose()
 
 
 def test_inventory_check_constraints_reject_bad_rows(engine):

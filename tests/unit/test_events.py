@@ -12,8 +12,10 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -21,8 +23,6 @@ from pydantic import ValidationError
 from src.events import (
     EVENT_MODELS,
     OrderPlaced,
-    PaymentSucceeded,
-    ProductCreated,
     ProductCreatedV2,
     StockReserved,
     UnknownEventError,
@@ -32,8 +32,6 @@ from src.events import (
 from src.events.models import (
     OrderPlacedData,
     OrderPlacedLine,
-    PaymentSucceededData,
-    ProductWriteData,
     ProductWriteDataV2,
     StockChangeData,
     UserCreatedData,
@@ -127,40 +125,6 @@ def test_consumer_rejects_any_missing_envelope_field(field: str) -> None:
         validate_event(json.dumps(raw))
 
 
-@pytest.mark.parametrize(
-    "event",
-    [
-        _sample(),
-        StockReserved.new(trace_id="t", data=StockChangeData(sku="SKU-1", order_id=uuid.uuid4(), quantity=2)),
-        ProductCreated.new(
-            trace_id="t",
-            data=ProductWriteData(product_id=uuid.uuid4(), merchant_id=uuid.uuid4(), name="x", price=Decimal("9.99")),
-        ),
-        ProductCreatedV2.new(
-            trace_id="t",
-            data=ProductWriteDataV2(
-                product_id=uuid.uuid4(), merchant_id=uuid.uuid4(), name="x", price=Decimal("9.99"), product_version=1
-            ),
-        ),
-        OrderPlaced.new(
-            trace_id="t",
-            data=OrderPlacedData(
-                order_id=uuid.uuid4(),
-                user_id=uuid.uuid4(),
-                total=Decimal("9.99"),
-                items=[OrderPlacedLine(product_id=uuid.uuid4(), quantity=1, unit_price=Decimal("9.99"))],
-            ),
-        ),
-        PaymentSucceeded.new(
-            trace_id="t",
-            data=PaymentSucceededData(payment_id=uuid.uuid4(), order_id=uuid.uuid4(), amount=Decimal("9.99")),
-        ),
-    ],
-)
-def test_producer_output_validates(event) -> None:
-    validate_event(event.model_dump_json())
-
-
 def test_consumer_rejects_coercible_wrong_types_and_returns_normalized_data() -> None:
     """Strict JSON mode: ``"2"`` is a contract violation, not an int to coerce."""
     event = StockReserved.new(trace_id="t", data=StockChangeData(sku="SKU-1", order_id=uuid.uuid4(), quantity=2))
@@ -194,6 +158,145 @@ def test_unknown_type_or_version_raises() -> None:
         validate_event(json.dumps({**good, "type": "NopeEvent"}))
     with pytest.raises(UnknownEventError):
         validate_event(json.dumps({**good, "schema_version": 999}))
+
+
+# --- every registered contract is enumerated, producer AND consumer side ------
+#
+# The registry is keyed by ``(type, schema_version)`` and grows every time a new
+# event type or version lands. A hand-written test list grows only when someone
+# remembers — a v3 payload added to ``EVENT_MODELS`` without a contract test
+# would ship with no proof that producer output validates or that a violating
+# payload is rejected. So the enumeration is *driven by the registry*: the map
+# below must cover every ``(type, version)`` in ``REGISTRY``, and the test fails
+# with instructions when a new entry is added without a sample.
+#
+#: ``(type, schema_version) -> callable(**data) -> payload dict``. The factory
+#: receives fresh UUIDs (product/merchant/user ids) so samples never collide.
+_EVENT_SAMPLES: dict[tuple[str, int], Callable[..., dict[str, Any]]] = {
+    ("UserCreated", 1): lambda user_id, merchant_id: {
+        "user_id": user_id,
+        "email": "a@b.com",
+    },
+    ("UserDeleted", 1): lambda user_id, merchant_id: {"user_id": user_id},
+    ("ProductCreated", 1): lambda user_id, merchant_id: {
+        "product_id": user_id,
+        "merchant_id": merchant_id,
+        "name": "widget",
+        "price": "9.99",
+        "category": "tools",
+    },
+    ("ProductUpdated", 1): lambda user_id, merchant_id: {
+        "product_id": user_id,
+        "merchant_id": merchant_id,
+        "name": "widget",
+        "price": "9.99",
+    },
+    ("ProductDeleted", 1): lambda user_id, merchant_id: {"product_id": user_id, "merchant_id": merchant_id},
+    ("ProductCreated", 2): lambda user_id, merchant_id: {
+        "product_id": user_id,
+        "merchant_id": merchant_id,
+        "name": "widget",
+        "price": "9.99",
+        "product_version": 1,
+    },
+    ("ProductUpdated", 2): lambda user_id, merchant_id: {
+        "product_id": user_id,
+        "merchant_id": merchant_id,
+        "name": "widget",
+        "price": "9.99",
+        "product_version": 2,
+    },
+    ("ProductDeleted", 2): lambda user_id, merchant_id: {
+        "product_id": user_id,
+        "merchant_id": merchant_id,
+        "product_version": 1,
+    },
+    ("StockReserved", 1): lambda user_id, merchant_id: {
+        "sku": "SKU-1",
+        "order_id": user_id,
+        "quantity": 2,
+    },
+    ("StockReleased", 1): lambda user_id, merchant_id: {
+        "sku": "SKU-1",
+        "order_id": user_id,
+        "quantity": 2,
+    },
+    ("OrderPlaced", 1): lambda user_id, merchant_id: {
+        "order_id": user_id,
+        "user_id": user_id,
+        "total": "19.99",
+        "items": [{"product_id": merchant_id, "quantity": 1, "unit_price": "9.99"}],
+    },
+    ("PaymentSucceeded", 1): lambda user_id, merchant_id: {
+        "payment_id": user_id,
+        "order_id": merchant_id,
+        "amount": "9.99",
+    },
+    ("PaymentFailed", 1): lambda user_id, merchant_id: {
+        "payment_id": user_id,
+        "order_id": merchant_id,
+        "amount": "9.99",
+        "reason": "card_declined",
+    },
+}
+
+
+def _event_body(event_type: str, schema_version: int) -> dict[str, Any]:
+    """A valid full envelope for one registry entry, via its sample factory."""
+    data = _EVENT_SAMPLES[(event_type, schema_version)](uuid.uuid4(), uuid.uuid4())
+    model = REGISTRY[(event_type, schema_version)]
+    return model.new(trace_id="t-enum", data=data).model_dump(mode="json")
+
+
+def test_every_registry_entry_has_a_sample() -> None:
+    """The enumeration map covers the whole registry — a newly added event type
+    or ``schema_version`` fails here until ``_EVENT_SAMPLES`` grows an entry."""
+    missing = [key for key in REGISTRY if key not in _EVENT_SAMPLES]
+    assert not missing, (
+        f"event contract(s) {missing} registered without a contract-test sample: "
+        "add an entry to _EVENT_SAMPLES in tests/unit/test_events.py"
+    )
+    assert set(_EVENT_SAMPLES) == set(REGISTRY)  # no stale samples either
+
+
+@pytest.mark.parametrize(
+    ("event_type", "schema_version"),
+    sorted(REGISTRY),  # sorted for a stable, readable parametrize list
+)
+def test_producer_output_validates_for_every_registered_event(event_type: str, schema_version: int) -> None:
+    """The exact wire payload a producer emits passes ``validate_event``."""
+    body = _event_body(event_type, schema_version)
+    assert body["type"] == event_type and body["schema_version"] == schema_version
+    normalized = validate_event(json.dumps(body))
+    assert normalized["event_id"] == body["event_id"]
+
+
+@pytest.mark.parametrize(
+    ("event_type", "schema_version"),
+    sorted(REGISTRY),
+)
+def test_consumer_rejects_violations_for_every_registered_event(event_type: str, schema_version: int) -> None:
+    """Consumer side of the contract, per registered version: a wrong-type payload
+    field, an unexpected extra field, and a missing envelope field each fail."""
+    body = _event_body(event_type, schema_version)
+    model = REGISTRY[(event_type, schema_version)]
+    data_fields = model.model_fields["data"].annotation.model_fields
+
+    with pytest.raises(ValidationError):  # a string where the payload wants an int/uuid/number
+        bad_type = json.loads(json.dumps(body))
+        first = next(iter(data_fields))
+        bad_type["data"][first] = ["wrong-type"]
+        validate_event(json.dumps(bad_type))
+
+    with pytest.raises(ValidationError):  # extra="forbid" — privileged/unexpected fields
+        extra = json.loads(json.dumps(body))
+        extra["data"]["role"] = "admin"
+        validate_event(json.dumps(extra))
+
+    with pytest.raises(UnknownEventError):  # missing routing field is unroutable, not merely invalid
+        unroutable = json.loads(json.dumps(body))
+        del unroutable["schema_version"]
+        validate_event(json.dumps(unroutable))
 
 
 # --- product event versioning (v1 frozen, v2 live) -------------------------

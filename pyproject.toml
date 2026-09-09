@@ -47,6 +47,9 @@ dev = [
     "moto",
     "ruff",
     "import-linter",
+    # Bundles libmagic so Windows dev machines run the image-sniff tests instead
+    # of skipping them (CI installs apt libmagic1; Linux gets real libmagic here).
+    "python-magic-bin; sys_platform == 'win32'",
 ]
 
 [tool.setuptools.packages.find]

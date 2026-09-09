@@ -66,8 +66,24 @@ make run                      # uvicorn main:app --reload
 make lint                     # ruff check + ruff format --check + import-linter
 make test                     # pytest tests/unit/ (coverage reported, not gated)
 make typecheck                # basedpyright (advisory only — baseline carries pre-existing errors)
+make loadtest                 # k6 checkout load test vs the running stack (fails when p95 >= 300 ms)
 make hooks                    # install pre-commit (Ruff + Ruff-format + Spectral)
 ```
+
+### Load testing
+
+`make loadtest` runs [k6](https://k6.io) against a running stack
+(`make compose-up && make seed && make run`) and drives the real checkout flow.
+Setup provisions **one ephemeral Keycloak user per VU** (via the dev realm's
+Admin API, deleted on teardown) so each VU races its own cart — sharing the
+demo consumer's cart across VUs would measure the harness, not the service —
+warms their JIT identity rows, and restocks the first seeded product so every
+iteration lands on the happy path. Its pass/fail line is the ticket-16 SLO —
+**checkout p95 < 300 ms** — plus a `checks > 99%` guard, so the test fails
+(exit code non-zero) when the service can't hold the SLO. Tune with `K6_RATE`
+(arrivals/s), `K6_DURATION`, `K6_VUS` (users created & VU cap), `BASE_URL`,
+`KEYCLOAK_URL`. Requires `k6` on PATH (`winget install k6 --source winget` /
+`brew install k6`).
 
 ## Environment variables
 

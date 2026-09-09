@@ -43,6 +43,18 @@ jobs:
           RUFF_OUTPUT_FORMAT: github
         run: make lint
 
+      # `python-magic` needs libmagic; without it the image-processing tests skip
+      # and the no-skip gate below (deliberately empty allowlist) fails the build.
+      # Install it before the tests rather than allowlisting a skip away.
+      - name: Install libmagic
+        run: sudo apt-get update && sudo apt-get install -y libmagic1
+
+      # The suite's Postgres/Valkey/LocalStack tests drive real containers via
+      # Testcontainers; a runner without Docker would skip or fail them. Make the
+      # dependency explicit so the crown-jewel coverage never degrades silently.
+      - name: Verify Docker is available for Testcontainers
+        run: docker info
+
       - name: Prepare test results directory
         run: mkdir -p test-results
 
@@ -54,3 +66,8 @@ jobs:
             --cov=src \
             --cov-report=term-missing \
             --junitxml=test-results/unit.xml
+
+      # a skipped crown-jewel test is a loud failure, never silent
+      # green. The gate's allowlist is empty on purpose; see scripts/ci_no_skips.py.
+      - name: Fail on any skipped test
+        run: python scripts/ci_no_skips.py test-results/unit.xml

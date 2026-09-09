@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help install run lint typecheck test migrate compose-up compose-down seed seed-reset hooks gen-alembic-env relay bus-setup s3-setup image-worker cache-worker cart-consumer reaper
+.PHONY: help install run lint typecheck test loadtest migrate compose-up compose-down seed seed-reset hooks gen-alembic-env relay bus-setup s3-setup image-worker cache-worker cart-consumer reaper
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS=":.*?## "}; {printf "%-14s %s\n", $$1, $$2}'
@@ -24,6 +24,9 @@ typecheck: ## Run basedpyright + ty (advisory only — both carry pre-existing b
 
 test: ## Run the unit test suite (coverage reported, not gated)
 	pytest tests/unit/
+
+loadtest: ## Run the k6 checkout load test against a running stack (fails when checkout p95 >= 300 ms)
+	k6 run loadtest/checkout.js
 
 migrate: ## Run every module's independent Alembic chain to head (portable: one line per module)
 	python -m alembic -c src/identity/alembic.ini upgrade head

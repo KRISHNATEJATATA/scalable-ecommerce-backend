@@ -457,6 +457,19 @@ the RFC 9457 Problem body** naming the unreachable dependencies in `details`. Wi
 ALB target group to `/v1/ready` and the ECS/ALB liveness to `/v1/health` — a dependency
 outage then drains traffic from the fleet without killing the tasks themselves.
 
+### 13. Load testing (checkout SLO check)
+
+`make loadtest` runs the in-repo k6 script (`loadtest/checkout.js`) against the
+running local stack (`make compose-up && make seed && make run`), driving the
+real checkout flow — one ephemeral Keycloak user per VU (provisioned via the
+dev realm's Admin API, deleted on teardown), so each VU races its own cart.
+The run **fails** when checkout p95
+≥ 300 ms or any check drops below 99% — use it to confirm a
+capacity suspicion before/after changes. Tune arrivals with `K6_RATE`
+(default 10/s) and `K6_DURATION` (default 30s). On ECS, prefer running it from
+CI or a jumpbox against a staging service rather than from a laptop: the SLO is
+a service-level claim, not a client-network claim.
+
 ## Post-incident
 - Re-enable automated backups on the promoted instance.
 - Rotate any exposed secrets (JWT keys, DB creds) via Secrets Manager.

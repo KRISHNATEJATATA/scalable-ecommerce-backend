@@ -14,19 +14,12 @@ import asyncio
 import uuid
 
 import pytest
-from testcontainers.core.container import DockerContainer
 from valkey.asyncio import Valkey
 
 from src.catalog.adapters.cache import ValkeyProductCache
 from src.catalog.ports.cache import MISS
 
-
-@pytest.fixture(scope="session")
-def _valkey_server():
-    """One real Valkey for the session (compose runs ``valkey/valkey:8``)."""
-    container = DockerContainer("valkey/valkey:8").with_exposed_ports(6379)
-    with container:
-        yield container.get_container_host_ip(), int(container.get_exposed_port(6379))
+# ``_valkey_server`` (one session-scoped real Valkey) lives in tests/unit/conftest.py.
 
 
 @pytest.fixture

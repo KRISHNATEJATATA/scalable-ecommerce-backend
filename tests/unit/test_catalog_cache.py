@@ -343,4 +343,70 @@ async def test_invalidation_handler_evicts_key() -> None:
 
     # Idempotent: a second delete (already-absent key) is a no-op, not an error.
     await handler({"type": "ProductDeleted", "data": {"product_id": str(pid)}})
-    assert pid not in cache.data
+
+
+# --- the same orchestration over the REAL Valkey adapter ---------
+
+
+async def test_cold_stampede_single_fills_through_the_real_valkey_adapter(_valkey_server):
+    """Service-level stampede defense end to end: N concurrent cold misses through
+    the real Valkey Lua (SET NX lock, owner-checked store) drive exactly one DB
+    fill — the fake-based tests above pin the orchestration, this one proves the
+    real adapter delivers the primitives the orchestration leans on."""
+    import asyncio
+
+    from valkey.asyncio import Valkey
+
+    from src.catalog.adapters.cache import ValkeyProductCache
+
+    host, port = _valkey_server
+    client = Valkey(host=host, port=port)
+    try:
+        await client.flushdb()
+        cache = ValkeyProductCache(client, ttl_seconds=60, ttl_jitter_seconds=0, lock_ttl_seconds=5)
+        pid = uuid.uuid4()
+        repo = CountingRepo(_row(pid), delay=0.02)
+        service = CatalogService(repo, cache=cache)
+
+        results = await asyncio.gather(*(service.get_product(pid) for _ in range(25)))
+
+        assert all(r is not None and r.id == pid for r in results)
+        assert repo.get_calls == 1, "25 concurrent cold reads must fill the cache once, not 25 times"
+        assert await client.get(f"product:{pid}") is not None
+    finally:
+        await client.aclose()
+
+
+async def test_real_invalidation_clears_value_and_in_flight_fill_lock(_valkey_server):
+    """The invalidation handler wired to the real adapter drops both the cached
+    value and any fill lock mid-flight — a concurrent filler's stale store then
+    no-ops, so post-invalidation reads can never be served stale."""
+    import asyncio
+
+    from valkey.asyncio import Valkey
+
+    from src.catalog.adapters.cache import ValkeyProductCache
+    from src.catalog.adapters.cache_worker import make_invalidation_handler as real_handler
+
+    host, port = _valkey_server
+    client = Valkey(host=host, port=port)
+    try:
+        await client.flushdb()
+        cache = ValkeyProductCache(client, ttl_seconds=60, ttl_jitter_seconds=0, lock_ttl_seconds=5)
+        pid = uuid.uuid4()
+        repo = CountingRepo(_row(pid), delay=0.05)
+        service = CatalogService(repo, cache=cache)
+
+        async def read():
+            return await service.get_product(pid)
+
+        async def invalidate_mid_fill():
+            await asyncio.sleep(0.02)  # while the filler holds the lock, before it stores
+            await real_handler(cache)({"type": "ProductUpdated", "data": {"product_id": str(pid)}})
+
+        result, _ = await asyncio.gather(read(), invalidate_mid_fill())
+        assert result is not None  # the caller still gets its answer
+        assert await client.get(f"product:{pid}") is None  # the stale fill never landed
+        assert repo.get_calls == 1
+    finally:
+        await client.aclose()
