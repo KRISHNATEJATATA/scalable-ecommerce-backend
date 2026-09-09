@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Request, status
+from fastapi import APIRouter, Depends, Path, Query, Request, status
 
 from src.identity.api.schemas import AdminUserResponse, CreateUserRequest, CreateUserResponse, UserResponse
 from src.identity.application.service import IdentityAdminService
@@ -24,6 +24,11 @@ from src.shared.container import CurrentUserDep, get_identity_admin_service
 from src.shared.db.pagination import DEFAULT_LIMIT, MAX_LIMIT, PageResponse
 
 router = APIRouter(tags=["identity"])
+
+# Keycloak subs are UUIDs; the tightest URL-safe bound before the value reaches
+# python-keycloak's URL formatting (`..` traversal / `?` query injection).
+_SUB_PATTERN = r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+SubPath = Annotated[str, Path(min_length=1, max_length=64, pattern=_SUB_PATTERN)]
 
 AdminServiceDep = Annotated[IdentityAdminService, Depends(get_identity_admin_service)]
 _require_admin = Depends(require_role("admin"))
@@ -78,7 +83,7 @@ async def list_admin_users(
     response_model=None,
     dependencies=[_require_admin],
 )
-async def grant_merchant(sub: str, service: AdminServiceDep, _admin_user: CurrentUserDep) -> None:
+async def grant_merchant(sub: SubPath, service: AdminServiceDep, _admin_user: CurrentUserDep) -> None:
     """Grant the ``merchant`` realm role to a Keycloak user (admin only)."""
     await service.grant_merchant(sub)
 
@@ -89,7 +94,7 @@ async def grant_merchant(sub: str, service: AdminServiceDep, _admin_user: Curren
     response_model=None,
     dependencies=[_require_admin],
 )
-async def revoke_merchant(sub: str, service: AdminServiceDep, _admin_user: CurrentUserDep) -> None:
+async def revoke_merchant(sub: SubPath, service: AdminServiceDep, _admin_user: CurrentUserDep) -> None:
     """Revoke the ``merchant`` realm role from a Keycloak user (admin only)."""
     await service.revoke_merchant(sub)
 
@@ -100,7 +105,7 @@ async def revoke_merchant(sub: str, service: AdminServiceDep, _admin_user: Curre
     response_model=None,
     dependencies=[_require_admin],
 )
-async def disable_user(sub: str, service: AdminServiceDep, _admin_user: CurrentUserDep) -> None:
+async def disable_user(sub: SubPath, service: AdminServiceDep, _admin_user: CurrentUserDep) -> None:
     """Disable a user in Keycloak and mirror ``is_active=false`` locally (admin only)."""
     await service.disable_user(sub)
 
