@@ -28,14 +28,15 @@ from keycloak.exceptions import KeycloakConnectionError, KeycloakError, Keycloak
 
 from keycloak import KeycloakAdmin, KeycloakOpenIDConnection
 from src.shared.config.setting import AppSettings
-from src.shared.errors.exceptions import KeycloakConflictError, KeycloakEntityNotFoundError
+from src.shared.errors.exceptions import KeycloakConflictError, KeycloakEntityNotFoundError, KeycloakInvalidRequestError
 
 
 def _translate(exc: KeycloakError) -> Exception:
     """Map Keycloak's status-carrying errors onto purpose-named ones.
 
-    404 (unknown user ``sub`` / realm role) and 409 (email/username already
-    taken) are caller-fixable outcomes that must reach the admin as 404/409 —
+    404 (unknown user ``sub`` / realm role), 409 (email/username already
+    taken) and 400 (payload refused outright, e.g. ``error-invalid-email``)
+    are caller-fixable outcomes that must reach the admin as 404/409/400 —
     falling through here meant the 500 boundary answered them. Anything else
     (401 expired token, 403 missing service-account role, 5xx outage) stays as
     raised: a genuine server/dependency fault.
@@ -45,6 +46,8 @@ def _translate(exc: KeycloakError) -> Exception:
         return KeycloakEntityNotFoundError()
     if code == 409:
         return KeycloakConflictError("a Keycloak account with this email already exists")
+    if code == 400:
+        return KeycloakInvalidRequestError(f"Keycloak rejected this account: HTTP {code} — check the email address")
     return exc
 
 

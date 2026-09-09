@@ -32,6 +32,7 @@ from src.shared.errors.exceptions import (
     InvalidUploadError,
     KeycloakConflictError,
     KeycloakEntityNotFoundError,
+    KeycloakInvalidRequestError,
     OrderStateConflictError,
     PaymentIdempotencyConflictError,
     PreconditionFailedError,
@@ -72,12 +73,18 @@ async def _bad_request_handler(_: Request, exc: InvalidQueryParamError | Invalid
 
 async def _detail_bad_request_handler(
     _: Request,
-    exc: InvalidUploadError | InvalidReservationError | InvalidPaymentMethodError | InvalidCartOperationError,
+    exc: InvalidUploadError
+    | InvalidReservationError
+    | InvalidPaymentMethodError
+    | InvalidCartOperationError
+    | KeycloakInvalidRequestError,
 ) -> JSONResponse:
     # Requests rejected by server-side validation before they reach durable state:
     # an upload whose declared type/size fails policy, a reservation whose quantity
     # is non-positive, a payment token shaped like raw card data, a cart mutation
-    # past its boundary limits. 400 with the exception's own detail — never a 500.
+    # past its boundary limits, or a Keycloak Admin-API call refused outright
+    # (HTTP 400, e.g. a malformed email). 400 with the exception's own detail —
+    # never a 500.
     return _problem_response(400, title="Bad Request", detail=exc.detail)
 
 
@@ -240,6 +247,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(InvalidUploadError, _detail_bad_request_handler)
     app.add_exception_handler(InvalidReservationError, _detail_bad_request_handler)
     app.add_exception_handler(InvalidCartOperationError, _detail_bad_request_handler)
+    app.add_exception_handler(KeycloakInvalidRequestError, _detail_bad_request_handler)
     app.add_exception_handler(InsufficientStockError, _insufficient_stock_handler)
     app.add_exception_handler(ReservationConflictError, _reservation_conflict_handler)
     app.add_exception_handler(ReservationContendedError, _reservation_contended_handler)

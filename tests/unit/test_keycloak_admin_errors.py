@@ -13,7 +13,12 @@ from keycloak.exceptions import KeycloakError, KeycloakGetError, KeycloakPostErr
 from src.identity.adapters.keycloak.admin_client import KeycloakIdentityAdmin
 from src.identity.domain.user import DirectoryUser
 from src.shared.config.setting import AppSettings
-from src.shared.errors.exceptions import DependencyUnavailableError, KeycloakConflictError, KeycloakEntityNotFoundError
+from src.shared.errors.exceptions import (
+    DependencyUnavailableError,
+    KeycloakConflictError,
+    KeycloakEntityNotFoundError,
+    KeycloakInvalidRequestError,
+)
 
 _SETTINGS = dict(
     environment="local",
@@ -69,6 +74,15 @@ async def test_duplicate_email_on_create_maps_to_conflict(monkeypatch) -> None:
     admin = _admin_with(monkeypatch, KeycloakPostError(error_message="exists", response_code=409))
     with pytest.raises(KeycloakConflictError):
         await admin.create_user("taken@example.com")
+
+
+async def test_keycloak_400_on_create_maps_to_invalid_request(monkeypatch) -> None:
+    """A Keycloak 400 (e.g. error-invalid-email) is caller-fixable input, not a
+    server fault: it must surface as the purpose-named 4xx, never the raw
+    KeycloakPostError that would fall through to the 500 boundary"""
+    admin = _admin_with(monkeypatch, KeycloakPostError(error_message="error-invalid-email", response_code=400))
+    with pytest.raises(KeycloakInvalidRequestError):
+        await admin.create_user("not-an-email")
 
 
 async def test_outage_is_retried_then_maps_to_dependency_unavailable(monkeypatch) -> None:

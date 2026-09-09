@@ -339,6 +339,34 @@ async def test_admin_creates_user_201(app_ctx, rsa_key):
     assert "new-user@test.io" in app_ctx.state.identity_admin.created
 
 
+async def test_admin_create_rejects_malformed_email_422(app_ctx, rsa_key):
+    """A non-email body must be turned away at the schema (422), never reach
+    Keycloak (whose 400 would otherwise have surfaced as a raw 500)."""
+    token = _make_token(rsa_key, roles=["admin"])
+    async with _client(app_ctx) as client:
+        resp = await client.post(
+            "/v1/admin/users",
+            headers=_auth(token),
+            json={"email": "not-an-email"},
+        )
+    assert resp.status_code == 422, resp.text
+    assert app_ctx.state.identity_admin.created == []
+
+
+async def test_admin_create_rejects_oversized_email_422(app_ctx, rsa_key):
+    """300 chars blows past Keycloak's username/email column bound (255) —
+    reject at the schema (422) instead of an opaque 500."""
+    token = _make_token(rsa_key, roles=["admin"])
+    async with _client(app_ctx) as client:
+        resp = await client.post(
+            "/v1/admin/users",
+            headers=_auth(token),
+            json={"email": "a" * 300 + "@x"},
+        )
+    assert resp.status_code == 422, resp.text
+    assert app_ctx.state.identity_admin.created == []
+
+
 async def test_disable_non_provisioned_user_still_blocks_future_login(app_ctx, rsa_key):
     """Disabling a user who never authenticated must not be a no-op."""
     sub = str(uuid.uuid4())
