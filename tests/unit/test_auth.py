@@ -269,6 +269,31 @@ async def test_admin_grants_merchant_role_204(app_ctx, rsa_key):
     assert (target, "merchant") in app_ctx.state.identity_admin.granted
 
 
+async def test_admin_sub_path_param_must_be_uuid(app_ctx, rsa_key):
+    """regression: traversal / non-UUID ``{sub}`` never reaches the admin port.
+
+    ``..%2F..%2Fevil`` is 404, not 422: the ASGI scope path is percent-decoded
+    before routing, so the injected slash splits the segment and no route matches.
+    Single-segment junk that *does* reach the route (``%2E%2E`` decodes to ``..``)
+    is 422 on the UUID pattern.
+    """
+    token = _make_token(rsa_key, roles=["admin"])
+    admin = app_ctx.state.identity_admin
+    cases = [
+        ("post", "/v1/admin/users/{sub}/roles/merchant", admin.granted),
+        ("delete", "/v1/admin/users/{sub}/roles/merchant", admin.revoked),
+        ("post", "/v1/admin/users/{sub}/disable", admin.enabled),
+    ]
+    async with _client(app_ctx) as client:
+        for method, path, _ in cases:
+            for sub, expected in (("%2E%2E", 422), ("..%2F..%2Fevil", 404), ("not-a-uuid", 422)):
+                resp = await client.request(method, path.format(sub=sub), headers=_auth(token))
+                assert resp.status_code == expected, (method, path, sub, resp.text)
+    assert admin.granted == []
+    assert admin.revoked == []
+    assert admin.enabled == {}
+
+
 async def test_require_role_admin_does_not_satisfy_other_role():
     """admin bypass is for ownership, NOT role membership — a merchant gate rejects admin."""
     from src.shared.auth.dependencies import require_role
