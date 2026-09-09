@@ -28,7 +28,9 @@ groups:
 
       - alert: InventoryReaperDown
         # Long-running shape only; absent() so a never-scraped target also fires.
-        expr: up{job="reservation-reaper"} == 0 or absent(up{job="reservation-reaper"})
+        # the reaper is scraped under the `workers` job (prometheus.yml) —
+        # its `instance` label is the target string `reaper:9100`, anchored regex.
+        expr: up{job="workers", instance=~"reaper:9100"} == 0 or absent(up{job="workers", instance=~"reaper:9100"})
         for: 5m
         labels:
           severity: warning
@@ -39,6 +41,10 @@ groups:
       - alert: InventoryReaperNotRunning
         # Scheduled `--once` shape: no push in 30m means the schedule stopped firing.
         # Keep this rule or InventoryReaperDown, whichever shape you deploy — not both.
+        # ponytail/BUG-008 note: currently DEAD config — no Pushgateway is deployed
+        # (nothing sets METRICS_PUSHGATEWAY_URL), so push_time_seconds never exists.
+        # Kept for the scheduled `--once` shape; its `job` label is the push grouping
+        # key, not a prometheus.yml scrape job, hence no `reservation-reaper` job_name.
         expr: time() - push_time_seconds{job="reservation-reaper"} > 1800
         labels:
           severity: warning
