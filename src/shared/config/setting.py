@@ -116,7 +116,9 @@ class AppSettings(BaseSettings):
     # any client forge their own client IP — which would make IP-keyed rate
     # limiting trivially bypassable. Pin this to the ALB / VPC subnet CIDR in
     # every deployed environment; the default is loopback + private ranges.
-    trusted_proxies: list[str] = Field(default_factory=lambda: ["127.0.0.1", "10.0.0.0/8", "172.16.0.0/12"])
+    trusted_proxies: list[str] = Field(
+        default_factory=lambda: ["127.0.0.1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+    )
 
     # --- Feature flags (plain env booleans; not a flag service) ---
     enable_reviews: bool = False
@@ -256,6 +258,10 @@ class AppSettings(BaseSettings):
     # checkout. The recovery poller settles orders still `pending` past this age.
     checkout_saga_step_timeout_seconds: int = Field(default=60, gt=0)
     checkout_saga_recovery_batch_size: int = Field(default=50, gt=0)
+    # The recovery poller's own sweep cadence — deliberately NOT the reservation
+    # reaper's interval: the two workers share no schedule contract, so retuning
+    # one (reaper) must not silently retune the other (saga recovery).
+    checkout_saga_recovery_poll_interval_seconds: float = Field(default=10.0, gt=0)
     # Valkey fast-path TTL for `Idempotency-Key → (body_hash, status, response)`.
     # Eviction only loses the fast path: the DB UNIQUE backstop still prevents a
     # duplicate order, degrading to re-reading the stored order (or 409).

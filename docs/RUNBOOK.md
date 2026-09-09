@@ -349,6 +349,7 @@ checkout token (anything PAN-shaped is rejected at the boundary).
 | 404s from `/v1/payments/webhook` | gateway pointed at the wrong environment/realm | fix the gateway config — do not widen acceptance |
 | `PaymentFailed` with reason `abandoned_by_reconciler` | checkout died between row-create and gateway charge, or the provider lost it | find the order's checkout logs; the charge never landed gateway-side, so retrying checkout with a NEW idempotency key is safe |
 | Sudden `PaymentFailed` spike | upstream decline event or fail-token misconfiguration in tests | compare against gateway-side decline metrics before assuming a code fault |
+| `checkout_orphaned_paid_payments_total` incremented | payment succeeded for an order a concurrent cancel flipped — money taken, order cancelled; nothing reconciles this pair automatically (the reconciler only scans `pending` charges) | manual reconciliation required (below); the auto-heal scan is a reserved decision, not built |
 
 ```bash
 # Manual one-shot sweep (same image, service role)
@@ -364,6 +365,11 @@ SELECT count(*) FROM payments.payments WHERE status = 'pending' AND created_at <
 SELECT count(*) FROM payments.payments WHERE status = 'failed' AND failure_reason = 'abandoned_by_reconciler' AND updated_at >= now() - interval '1 day';
 -- Outcome split over time (a healthy ledger is mostly `succeeded`):
 SELECT status, count(*) FROM payments.payments GROUP BY status;
+-- THE orphaned-payment alert (checkout_orphaned_paid_payments_total > 0):
+-- money taken, order cancelled — reconcile by hand. Healthy = 0 rows.
+SELECT p.id, p.order_id, p.amount FROM payments.payments p
+  JOIN orders.orders o ON o.id = p.order_id
+  WHERE p.status = 'succeeded' AND o.status = 'cancelled';
 ```
 
 **Monitoring.** The reconciler exports its own counters via `WORKER_METRICS_PORT`

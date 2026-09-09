@@ -337,7 +337,7 @@ def _dir_user(sub, email="u@example.com", enabled=True):
     return DirectoryUser(sub=sub, email=email, enabled=enabled)
 
 
-async def test_admin_list_users_maps_items_roles_and_next_cursor():
+async def test_admin_list_users_maps_items_roles_and_terminal_full_page():
     users = [
         _dir_user("sub-1"),
         _dir_user("sub-2", enabled=False),
@@ -353,8 +353,20 @@ async def test_admin_list_users_maps_items_roles_and_next_cursor():
         ("sub-2", "u@example.com", True, True),
         ("sub-3", None, False, False),
     ]
+    # limit+1 probe: one more than the page is requested; the exactly-full page
+    # is terminal — no phantom next_cursor.
+    assert admin.calls == [(None, 0, 4)]
+    assert page.next_cursor is None
+
+
+async def test_admin_list_users_probe_row_trimmed_and_has_more():
+    admin = _FakeIdentityAdmin([_dir_user(f"sub-{i}") for i in range(1, 4)])
+    svc = IdentityAdminService(_FakeSingleRepo(), admin)
+    page = await svc.list_users(limit=2, cursor=None, search=None)
+    # The probe row is trimmed: exactly `limit` items enriched, cursor present.
+    assert [i.sub for i in page.items] == ["sub-1", "sub-2"]
     assert admin.calls == [(None, 0, 3)]
-    assert page.next_cursor == _encode_offset_cursor(3)
+    assert page.next_cursor == _encode_offset_cursor(2, 2, None)
 
 
 async def test_admin_list_users_second_page_returns_next_slice():
@@ -363,15 +375,50 @@ async def test_admin_list_users_second_page_returns_next_slice():
     first = await svc.list_users(limit=2, cursor=None, search=None)
     second = await svc.list_users(limit=2, cursor=first.next_cursor, search=None)
     assert [i.sub for i in second.items] == ["sub-3", "sub-4"]
-    assert admin.calls == [(None, 0, 2), (None, 2, 2)]
-    assert second.next_cursor == _encode_offset_cursor(4)
+    assert admin.calls == [(None, 0, 3), (None, 2, 3)]
+    # 4 users total: after this 2-item slice the walk is done.
+    assert second.next_cursor is None
+
+
+async def test_admin_list_users_cursor_pins_page_limit():
+    """A resumed page is served at the pinned limit — the request's limit only starts fresh walks."""
+    admin = _FakeIdentityAdmin([_dir_user(f"sub-{i}") for i in range(1, 4)])
+    svc = IdentityAdminService(_FakeSingleRepo(), admin)
+    first = await svc.list_users(limit=2, cursor=None, search=None)
+    assert first.next_cursor == _encode_offset_cursor(2, 2, None)
+    # Replaying the pinned cursor with a different limit stays on the walk.
+    second = await svc.list_users(limit=10, cursor=first.next_cursor, search=None)
+    assert [i.sub for i in second.items] == ["sub-3"]
+    assert admin.calls[-1] == (None, 2, 3)
+    assert second.next_cursor is None
+
+
+async def test_admin_list_users_cursor_rejects_changed_search():
+    """A cursor replayed under a different search is stale — 400, not silent re-partitioning."""
+    admin = _FakeIdentityAdmin([_dir_user("sub-1")])
+    svc = IdentityAdminService(_FakeSingleRepo(), admin)
+    cursor = _encode_offset_cursor(2, 2, "alice")
+    with pytest.raises(InvalidCursorError, match="different search"):
+        await svc.list_users(limit=2, cursor=cursor, search="bob")
+    # Rejected before the port is touched.
+    assert admin.calls == []
+
+
+async def test_admin_list_users_legacy_offset_cursor_decodes_unpinned():
+    """Legacy ``{"offset": n}`` cursors (pre-pinning) decode leniently: request limit/search apply."""
+    admin = _FakeIdentityAdmin([_dir_user(f"sub-{i}") for i in range(1, 5)])
+    svc = IdentityAdminService(_FakeSingleRepo(), admin)
+    page = await svc.list_users(limit=2, cursor=_encode_offset_cursor(2), search=None)
+    assert [i.sub for i in page.items] == ["sub-3", "sub-4"]
+    assert admin.calls == [(None, 2, 3)]
+    assert page.next_cursor is None
 
 
 async def test_admin_list_users_forwards_search_untouched():
     admin = _FakeIdentityAdmin([_dir_user("sub-9")])
     svc = IdentityAdminService(_FakeSingleRepo(), admin)
     page = await svc.list_users(limit=10, cursor=None, search="sub-9")
-    assert admin.calls == [("sub-9", 0, 10)]
+    assert admin.calls == [("sub-9", 0, 11)]
     assert [i.sub for i in page.items] == ["sub-9"]
     assert page.next_cursor is None
 

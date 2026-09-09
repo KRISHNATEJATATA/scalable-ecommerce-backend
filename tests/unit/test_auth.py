@@ -101,13 +101,15 @@ class _FakeAdmin:
         self.enabled: dict[str, bool] = {}
         self.emails: dict[str, str] = {}
         self.created: list[tuple[str, str]] = []
-        # Directory for the admin listing: 20 entries so the default page is a
-        # FULL page (next_cursor set). One merchant; one disabled consumer with
-        # no email (covers email=None + disabled = not enabled).
+        # Directory for the admin listing: 25 entries so the default page is a
+        # FULL page of 20 (next_cursor set) with a real second page — the
+        # limit+1 probe must not confuse an exactly-full page with has-more.
+        # One merchant; one disabled consumer with no email (covers email=None
+        # + disabled = not enabled).
         self.directory: list[DirectoryUser] = [
             DirectoryUser(sub=MERCHANT_SUB, email="merchant@test.io", enabled=True),
             DirectoryUser(sub=DISABLED_SUB, email=None, enabled=False),
-            *[DirectoryUser(sub=f"pad-{i:02d}", email=f"pad-{i:02d}@test.io", enabled=True) for i in range(18)],
+            *[DirectoryUser(sub=f"pad-{i:02d}", email=f"pad-{i:02d}@test.io", enabled=True) for i in range(23)],
         ]
         self.realm_roles: set[tuple[str, str]] = {(MERCHANT_SUB, "merchant")}
         self.listed: list[tuple[str | None, int, int]] = []
@@ -593,16 +595,75 @@ async def test_admin_listing_returns_first_page_and_cursors(app_ctx, rsa_key):
     # merchant_role is resolved live from Keycloak role mappings, not token claims.
     assert by_sub[MERCHANT_SUB]["merchant_role"] is True
     assert by_sub[DISABLED_SUB]["merchant_role"] is False
-    # Port received the default page window (offset 0, limit 20, no search).
+    # Port received the default page window (offset 0, limit 20, no search) —
+    # as a limit+1 has-more probe: max = 21.
     fake = app_ctx.state.identity_admin
-    assert fake.listed == [(None, 0, 20)]
-    # The returned cursor must translate to first=20 at the port on the next page.
+    assert fake.listed == [(None, 0, 21)]
+    # The returned cursor must translate to first=20 (probed at 21) on the next page.
     async with _client(app_ctx) as client:
         second = await client.get("/v1/admin/users", headers=_auth(token), params={"cursor": body["next_cursor"]})
     assert second.status_code == 200, second.text
-    assert fake.listed[-1] == (None, 20, 20)
-    # The directory holds exactly 20 users: page two is empty and terminal.
-    assert second.json() == {"items": [], "next_cursor": None}
+    assert fake.listed[-1] == (None, 20, 21)
+    # 25-directory second page: the remaining 5 users, short → terminal.
+    second_body = second.json()
+    assert len(second_body["items"]) == 5
+    assert second_body["next_cursor"] is None
+
+
+async def test_admin_listing_exactly_full_page_is_terminal(app_ctx, rsa_key):
+    """#5: a page that exactly fills the directory emits NO next_cursor (no phantom empty page)."""
+
+    class _Exact(_FakeAdmin):
+        def __init__(self) -> None:
+            super().__init__()
+            self.directory = self.directory[:20]  # exactly one full default page
+
+    app_ctx.state.identity_admin = _Exact()
+    token = _make_token(rsa_key, roles=["admin"])
+    async with _client(app_ctx) as client:
+        resp = await client.get("/v1/admin/users", headers=_auth(token))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert len(body["items"]) == 20
+    assert body["next_cursor"] is None
+
+
+async def test_admin_listing_cursor_pins_limit(app_ctx, rsa_key):
+    """A resumed page is served at the pinned limit — the request's limit only starts fresh walks."""
+    token = _make_token(rsa_key, roles=["admin"])
+    fake = app_ctx.state.identity_admin
+    async with _client(app_ctx) as client:
+        first = await client.get("/v1/admin/users", headers=_auth(token), params={"limit": "2"})
+    assert first.status_code == 200, first.text
+    cursor = first.json()["next_cursor"]
+    assert cursor is not None
+    async with _client(app_ctx) as client:
+        second = await client.get("/v1/admin/users", headers=_auth(token), params={"cursor": cursor, "limit": "100"})
+    assert second.status_code == 200, second.text
+    # The pinned limit (2) applied, not the request's 100 → 2-item second page.
+    assert len(second.json()["items"]) == 2
+    assert fake.listed[-1] == (None, 2, 3)
+
+
+async def test_admin_listing_cursor_rejects_changed_search_400(app_ctx, rsa_key):
+    """#6: replaying a pinned cursor under a different search is a 400 — no silent re-partitioning."""
+    token = _make_token(rsa_key, roles=["admin"])
+    fake = app_ctx.state.identity_admin
+    async with _client(app_ctx) as client:
+        first = await client.get("/v1/admin/users", headers=_auth(token), params={"search": "pad"})
+    assert first.status_code == 200, first.text
+    cursor = first.json()["next_cursor"]
+    assert cursor is not None
+    async with _client(app_ctx) as client:
+        resp = await client.get(
+            "/v1/admin/users", headers=_auth(token), params={"cursor": cursor, "search": "merchant"}
+        )
+    assert resp.status_code == 400, resp.text
+    body = resp.json()
+    assert body["status"] == 400 and "type" in body and "trace_id" in body
+    assert "different search" in body["detail"]
+    # Rejected before the port: no new listing call beyond the first walk page.
+    assert fake.listed[-1] == ("pad", 0, 21)
 
 
 async def test_admin_listing_forwards_search(app_ctx, rsa_key):
@@ -611,7 +672,7 @@ async def test_admin_listing_forwards_search(app_ctx, rsa_key):
     async with _client(app_ctx) as client:
         resp = await client.get("/v1/admin/users", headers=_auth(token), params={"search": "alice"})
     assert resp.status_code == 200, resp.text
-    assert app_ctx.state.identity_admin.listed == [("alice", 0, 20)]
+    assert app_ctx.state.identity_admin.listed == [("alice", 0, 21)]
 
 
 async def test_admin_listing_rejects_consumer_403(app_ctx, rsa_key):

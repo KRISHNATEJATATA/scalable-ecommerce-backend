@@ -47,7 +47,10 @@ def _translate(exc: KeycloakError) -> Exception:
     if code == 409:
         return KeycloakConflictError("a Keycloak account with this email already exists")
     if code == 400:
-        return KeycloakInvalidRequestError(f"Keycloak rejected this account: HTTP {code} — check the email address")
+        # Generic on purpose: _translate is shared by every Admin-API call (create,
+        # role grants, enable/disable...), so a payload can be refused for fields
+        # other than the email (profile attrs, malformed role reps).
+        return KeycloakInvalidRequestError(f"Keycloak rejected this request: HTTP {code} — check the submitted fields")
     return exc
 
 

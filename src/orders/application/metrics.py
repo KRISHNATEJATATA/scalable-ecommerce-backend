@@ -37,6 +37,13 @@ incremented in the recovery-poller process — same pattern as
   ``compensated`` rate means checkouts are crashing mid-flight upstream; a
   ``deferred`` rate means the payment reconciler owns those orders, not this
   poller.
+* ``checkout_orphaned_paid_payments_total`` — the guarded ``mark_paid`` flip
+  lost to a concurrent cancel **after** the charge succeeded: money taken, the
+  order cancelled, and nothing reconciles that pair automatically (the payment
+  reconciler only scans ``pending`` charges). The log line and the 409 the
+  caller sees are transient, so this counter is the alertable signal: any
+  increment means a human must reconcile the payment against the cancelled
+  order by hand — the auto-heal scan is a reserved decision, not built.
 """
 
 from __future__ import annotations
@@ -59,4 +66,9 @@ checkout_recovery_total = Counter(
     "checkout_recovery_total",
     "Recovery-poller settlements of crashed checkouts by outcome (completed, compensated, deferred).",
     ["outcome"],
+)
+
+checkout_orphaned_paid_payments_total = Counter(
+    "checkout_orphaned_paid_payments_total",
+    "Succeeded payments on a cancelled order (the cancel won the guarded flip) — manual reconciliation required.",
 )

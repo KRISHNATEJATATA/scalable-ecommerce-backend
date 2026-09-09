@@ -28,6 +28,7 @@ import hashlib
 import json
 import logging
 import uuid
+from collections import Counter
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -37,6 +38,7 @@ from src.orders.application.mappers import to_domain
 from src.orders.application.metrics import (
     checkout_attempts_total,
     checkout_compensation_total,
+    checkout_orphaned_paid_payments_total,
     checkout_recovery_total,
 )
 from src.orders.application.outbox import order_placed_outbox
@@ -117,11 +119,12 @@ class CheckoutSaga:
 
         Idempotency is consulted *before* the cart: a completed checkout clears
         the basket, so a retry arrives with an empty cart and must still replay
-        (only the token pins the key). Raises ``OrderStateConflictError`` (409)
-        for an empty cart, a declined payment, a timed-out reservation, or a
-        replay of an already-cancelled checkout,
-        ``CheckoutIdempotencyConflictError`` (409) for same key + different
-        body, and ``InsufficientStockError`` (409) when the shelves refuse.
+        (only the token pins the key). A replay of a stored 201 clears the
+        basket only when it still matches the order's lines (mop-up for a crash
+        between the drive's clear and the replay record); a basket rebuilt
+        after the checkout is never touched. Raises ``OrderStateConflictError``
+        (409) for an empty cart, a declined payment, a timed-out reservation,
+        or a replay of an already-cancelled checkout,
         ``CheckoutIdempotencyConflictError`` (409) for same key + different
         body, and ``InsufficientStockError`` (409) when the shelves refuse.
         Every failure path compensates before raising — no half-state escapes
@@ -145,7 +148,7 @@ class CheckoutSaga:
                     log.info("checkout replay served from idempotency record (user=%s)", user_id)
                     response = OrderResponse.model_validate(record.response)
                     if response.status == OrderStatus.PAID:
-                        await self._clear_basket(user_id)
+                        await self._clear_basket_if_replay_mop_up(user_id, response.items)
                     checkout_attempts_total.labels("replayed").inc()
                     return response, False
 
@@ -211,6 +214,9 @@ class CheckoutSaga:
         """A pre-existing order under ``(user_id, key)``: replay, resume, or refuse it.
 
         * ``paid`` → the stored 201 (the contract's replay), fast-path remembered.
+          The basket is cleared only when it still matches the order's lines —
+          mop-up for a crash between the drive's clear and the replay record; a
+          rebuilt basket is never touched.
         * ``pending`` → a crash between create and finish: drive it home from the
           order's own stored lines (the cart may have been cleared or changed
           since). The row pre-existed, so this is a replay even though this call
@@ -224,7 +230,7 @@ class CheckoutSaga:
         if order.status == OrderStatus.PAID:
             response = _response(order)
             await self._remember(user_id, idempotency_key, body_hash, 201, response)
-            await self._clear_basket(user_id)
+            await self._clear_basket_if_replay_mop_up(user_id, response.items)
             return response, False
         if order.status == OrderStatus.PENDING:
             log.info("resuming crashed checkout for order %s", order.id)
@@ -355,6 +361,10 @@ class CheckoutSaga:
                 if paid.status == OrderStatus.PAID:
                     log.info("checkout order %s settled concurrently; reading final state", order_id)
                 else:
+                    # No auto-heal owns this state — the payment reconciler only
+                    # scans `pending` charges — so count it loudly and leave
+                    # reconciliation to a human (docs/RUNBOOK.md §9).
+                    checkout_orphaned_paid_payments_total.inc()
                     log.error(
                         "checkout order %s was cancelled while the payment was completing; "
                         "reconciliation required (paid payment row attached)",
@@ -508,6 +518,28 @@ class CheckoutSaga:
             await self._basket.clear(user_id)
         except Exception:  # boundary: cleanup, not correctness
             log.warning("basket clear failed after terminal checkout; cart survives", exc_info=True)
+
+    async def _clear_basket_if_replay_mop_up(self, user_id: uuid.UUID, order_items: Any) -> None:
+        """Replay-side basket mop-up: clear ONLY a basket that still matches the order.
+
+        The drive's success path already clears the basket *before* the replay
+        record is stored, so a normal replay sees an empty (or rebuilt) basket
+        and must not touch it. This exists for the crash window between that
+        clear and ``_remember`` — a replay record written with the cart still
+        holding the order's lines. Clearing unconditionally here would silently
+        empty a basket the user built after the original checkout, so compare
+        the current basket against the order's lines (ids + quantities as a
+        multiset; drifted ``unit_price``/``name`` via ProductUpdated refresh
+        must not block the clear) and clear only when they match.
+        """
+        lines = await self._basket.get_lines(user_id)
+        if not lines:
+            return  # nothing to mop up (the common replay case)
+        if Counter((line.product_id, line.quantity) for line in lines) != Counter(
+            (item.product_id, item.quantity) for item in order_items
+        ):
+            return  # a basket rebuilt after checkout is never touched
+        await self._clear_basket(user_id)
 
 
 def _total(lines: list[CheckoutLine]) -> Decimal:

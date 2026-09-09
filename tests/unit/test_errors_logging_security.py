@@ -92,6 +92,88 @@ async def test_redactfilter_leaves_clean_records_alone():
         logger.removeHandler(handler)
 
 
+async def test_redactfilter_covers_extra_authorization_key():
+    """``extra={'authorization': ...}`` lands as a record attribute and renders
+    as a top-level JSON key — outside ``getMessage()`` — so the filter must scan
+    non-standard attributes too."""
+    logger, handler, records = _records()
+    try:
+        logger.info("session started", extra={"authorization": "Bearer abc"})
+        record = records[-1]
+        RedactFilter().filter(record)
+        rendered = record.getMessage()
+        assert "REDACTED" in rendered
+        assert "Bearer abc" not in rendered
+        # the extra attribute itself must not survive for any formatter
+        assert "authorization" not in record.__dict__
+        assert record.args == ()
+        assert record.exc_info is None
+        assert record.exc_text is None or "authorization" not in str(record.exc_text)
+    finally:
+        logger.removeHandler(handler)
+
+
+async def test_redactfilter_covers_extra_password_key():
+    logger, handler, records = _records()
+    try:
+        logger.info("signup attempt", extra={"password": "x"})
+        record = records[-1]
+        RedactFilter().filter(record)
+        rendered = record.getMessage()
+        assert "REDACTED" in rendered
+        assert record.args == ()
+        assert "password" not in record.__dict__
+    finally:
+        logger.removeHandler(handler)
+
+
+async def test_redactfilter_covers_extra_email_value():
+    """No sensitive KEY substring on ``email_value`` — the value must trip the
+    ``_EMAIL_RE`` scan instead (a key rename must not defeat redaction)."""
+    logger, handler, records = _records()
+    try:
+        logger.info("contact point", extra={"email_value": "a@b.com"})
+        record = records[-1]
+        RedactFilter().filter(record)
+        rendered = record.getMessage()
+        assert "REDACTED" in rendered
+        assert "a@b.com" not in rendered
+        assert "email_value" not in record.__dict__
+    finally:
+        logger.removeHandler(handler)
+
+
+async def test_redactfilter_leaves_benign_extra_intact():
+    logger, handler, records = _records()
+    try:
+        logger.info("cart state", extra={"order_count": 5})
+        record = records[-1]
+        RedactFilter().filter(record)
+        assert record.getMessage() == "cart state"
+        assert record.__dict__["order_count"] == 5
+        assert record.args == ()
+    finally:
+        logger.removeHandler(handler)
+
+
+async def test_redactfilter_standard_attrs_are_excluded_from_extra_scan():
+    """Standard LogRecord attributes are infrastructure: e.g. ``threadName``
+    ('MainThread') contains no _REDACT_KEYS substring anyway, but the exclusion
+    set guarantees values like a 'tokens.py' pathname or any stdlib-added key
+    can never trigger redaction via the extra scan."""
+    flt = RedactFilter()
+    record = logging.LogRecord("t", logging.INFO, "payments/tokens.py", 1, "ping", (), None)
+    record.threadName = "MainThread"
+    flt.filter(record)
+    assert record.getMessage() == "ping"  # untouched — no false positive
+    # and the exclusion set matches the stdlib attribute set exactly
+    stdlib = set(logging.LogRecord("x", 0, "x", 1, "x", (), "x").__dict__.keys())
+    from src.shared.config.logging import _STANDARD_RECORD_ATTRS
+
+    assert stdlib <= set(_STANDARD_RECORD_ATTRS)
+    assert {"message", "asctime", "taskName"} <= set(_STANDARD_RECORD_ATTRS)
+
+
 def _client(app, *, raise_app_exceptions: bool = True) -> httpx.AsyncClient:
     # 500-path tests need raise_app_exceptions=False: ServerErrorMiddleware
     # re-raises after sending the sanitized response (real servers log it).

@@ -140,8 +140,11 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         docs_csp_paths=frozenset({path for path in (app.docs_url, app.redoc_url, app.openapi_url) if path is not None}),
     )
     app.add_middleware(RequestIDMiddleware)
-    # RED per endpoint (rate/status/duration under the route template) — innermost
-    # so the counters see the status after every inner layer ran.
+    # RED per endpoint (rate/status/duration under the route template). Starlette
+    # wraps last-added-first, so this is the OUTERMOST user middleware — which is
+    # exactly what the metrics need: the counters must observe the final response
+    # status the client sees, after every inner layer (proxy headers, CORS,
+    # security headers, request id) has run.
     app.add_middleware(metrics.MetricsMiddleware)
 
     register_exception_handlers(app)

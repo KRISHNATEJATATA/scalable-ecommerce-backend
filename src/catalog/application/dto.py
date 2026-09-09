@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from src.catalog.domain.image_keys import PUBLIC_IMAGE_EXT, THUMBNAIL_SIZES
 from src.catalog.domain.image_status import ImageStatus
@@ -43,6 +43,18 @@ def _patch_schema(schema: dict) -> None:
             prop["anyOf"] = variants
         if prop.get("default", ...) is None:
             del prop["default"]
+
+
+def _reject_blank_name(value: str | None) -> str | None:
+    """Reject an empty or whitespace-only ``name`` (422 at the trust boundary).
+
+    ``min_length=1`` alone accepts ``"   "`` — a name made only of whitespace is
+    not a name. Reject only: never strip/normalize, which would silently change
+    the stored value's semantics (``"  ok  "`` is accepted verbatim).
+    """
+    if value is not None and not value.strip():
+        raise ValueError("name must not be blank")
+    return value
 
 
 def public_image_url(image_key: str | None, image_status: ImageStatus, base: str | None) -> str | None:
@@ -138,6 +150,12 @@ class ProductCreate(BaseModel):
     category: str | None = Field(default=None, max_length=255)
     price: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
 
+    @field_validator("name", mode="after")
+    @classmethod
+    def _name_not_blank(cls, value: str) -> str:
+        _reject_blank_name(value)
+        return value
+
 
 class ProductUpdate(BaseModel):
     """Partial merchant update — every field optional; unset fields are untouched.
@@ -158,6 +176,13 @@ class ProductUpdate(BaseModel):
     description: str | None = Field(default=None, max_length=5000)
     category: str | None = Field(default=None, max_length=255)
     price: Decimal | None = Field(default=None, gt=0, max_digits=12, decimal_places=2)
+
+    @field_validator("name", mode="after")
+    @classmethod
+    def _name_not_blank(cls, value: str | None) -> str | None:
+        # Omitted (None) is fine — untouched field; a *sent* blank name is not.
+        _reject_blank_name(value)
+        return value
 
     @model_validator(mode="after")
     def _reject_empty_patch(self) -> ProductUpdate:

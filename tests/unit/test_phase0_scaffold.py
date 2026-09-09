@@ -85,3 +85,22 @@ def test_demo_seeding_kill_switch(monkeypatch):
     monkeypatch.setenv("SEED_DEMO_DATA", "0")
     s = AppSettings(_env_file=None)
     assert s.seed_demo_data is False
+
+
+def test_trusted_proxies_default_covers_loopback_and_all_private_ranges():
+    """The comment promises "loopback + private ranges": that is all of RFC 1918.
+    Without 192.168.0.0/16 a peer on a 192.168.x.x network (compose, home/office
+    LAN) would be untrusted and its X-Forwarded-* headers ignored. Asserted on the
+    declared field default (default_factory invoked), so no env/.env can skew it."""
+    default = AppSettings.model_fields["trusted_proxies"].get_default(call_default_factory=True)
+    assert default == ["127.0.0.1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
+
+def test_saga_recovery_poll_interval_is_its_own_setting_defaulting_to_the_reapers():
+    """The saga-recovery poller used to borrow the reservation reaper's interval;
+    it now has its own knob with the same default (10.0), so unconfigured
+    behavior is unchanged while the two cadences stay independently tunable."""
+    saga_default = AppSettings.model_fields["checkout_saga_recovery_poll_interval_seconds"].get_default()
+    reaper_default = AppSettings.model_fields["reservation_reaper_poll_interval_seconds"].get_default()
+    assert saga_default == 10.0
+    assert saga_default == reaper_default

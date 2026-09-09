@@ -81,8 +81,11 @@ async def test_keycloak_400_on_create_maps_to_invalid_request(monkeypatch) -> No
     server fault: it must surface as the purpose-named 4xx, never the raw
     KeycloakPostError that would fall through to the 500 boundary"""
     admin = _admin_with(monkeypatch, KeycloakPostError(error_message="error-invalid-email", response_code=400))
-    with pytest.raises(KeycloakInvalidRequestError):
+    with pytest.raises(KeycloakInvalidRequestError) as caught:
         await admin.create_user("not-an-email")
+    # Generic detail: _translate is shared by every Admin-API call, not only
+    # account creation — an email-specific wording would misname other 400s.
+    assert caught.value.detail == "Keycloak rejected this request: HTTP 400 — check the submitted fields"
 
 
 async def test_outage_is_retried_then_maps_to_dependency_unavailable(monkeypatch) -> None:

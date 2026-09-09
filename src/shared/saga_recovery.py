@@ -187,7 +187,7 @@ async def run_recovery(
     recovery = SagaRecovery(sessionmaker, valkey, settings)
     if once:
         return await recovery.sweep_once()
-    await recovery.run(settings.reservation_reaper_poll_interval_seconds, stop=stop)
+    await recovery.run(settings.checkout_saga_recovery_poll_interval_seconds, stop=stop)
     return {"completed": 0, "compensated": 0, "deferred": 0}
 
 

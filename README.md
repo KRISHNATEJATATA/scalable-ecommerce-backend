@@ -59,7 +59,7 @@ make compose-up               # Postgres + Valkey + LocalStack (S3/SNS/SQS) + El
                               # + one-shot migrate/bus-setup/s3-setup
                               # + app + relay + image-worker + cache-worker + cart-consumer
                               # + reaper + payment-reconciler + saga-recovery
-make seed                     # opt-in demo state: 4 users, 11 products (5+6 across two
+make seed                     # demo state: 4 users, 11 products (5+6 across two
                               # merchants) with images + stock (9x25, one sold-out, one low).
                               # Idempotent; `make seed-reset` wipes + re-seeds (fresh user subs)
 make run                      # uvicorn main:app --reload
@@ -79,9 +79,9 @@ has a local default. See [`.env.example`](.env.example) for the full list.
 
 `make seed` (the `catalog-seed` compose one-shot, profile-gated under
 `profiles: ["seed"]`) populates demo users, products, images and stock into the
-**running** stack. It is never triggered implicitly by `compose up`. It refuses
-to run unless `SEED_DEMO_DATA=1` is set (the compose service sets it; the
-`.env.example` default is `0`), so hardcoded demo credentials can never reach a
-real deployment. Demo accounts (usernames `demo.consumer`, `demo.merchant`,
-`demo.merchant2`, `demo.admin`) are created via the Keycloak Admin API with
-known passwords — dev/local only.
+**running** stack. It is never triggered implicitly by `compose up`. Seeding is
+**enabled by default**: the seeder refuses to run only when `SEED_DEMO_DATA=0`
+(a kill switch for shared/staging databases — the compose service sets `1`, and
+`.env.example` ships `1`). Demo accounts (usernames `demo.consumer`,
+`demo.merchant`, `demo.merchant2`, `demo.admin`) are created via the Keycloak
+Admin API with known passwords — dev/local only.

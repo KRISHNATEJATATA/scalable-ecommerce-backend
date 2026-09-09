@@ -48,6 +48,63 @@ _REDACT_KEYS = ("password", "token", "authorization", "secret", "cookie", "jwt",
 # "buyer@example.com"), so PII-shaped values get their own pattern.
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 
+# Standard LogRecord attribute names (CPython 3.13: logging.LogRecord.__dict__
+# at makeRecord time, plus the formatter-added 'message'/'asctime'). The extra=
+# scan skips these: msg/args and the traceback carriers are already covered by
+# the message/traceback scan, and the rest is infrastructure whose values must
+# never trigger redaction (a pathname like "payments/tokens.py" would otherwise
+# trip the "token" substring). Frozen literal so it is stable and greppable.
+_STANDARD_RECORD_ATTRS = frozenset(
+    {
+        "args",
+        "asctime",
+        "created",
+        "exc_info",
+        "exc_text",
+        "filename",
+        "funcName",
+        "levelname",
+        "levelno",
+        "lineno",
+        "message",
+        "module",
+        "msecs",
+        "msg",
+        "name",
+        "pathname",
+        "process",
+        "processName",
+        "relativeCreated",
+        "stack_info",
+        "taskName",
+        "thread",
+        "threadName",
+    }
+)
+
+
+def _leaking_extra_keys(record: logging.LogRecord) -> list[str]:
+    """Non-standard record attribute names (the ``extra={...}`` idiom) that leak.
+
+    A key leaks when its lowercase name contains a ``_REDACT_KEYS`` substring; a
+    value leaks when its flat string form matches ``_EMAIL_RE``. Only
+    ``str``/``bytes``/``bytearray`` values are scanned — ``str()`` on arbitrary
+    objects can be huge or carry ``__str__`` side effects — with bytes decoded
+    leniently (``errors="ignore"``). Nested containers are not recursed into
+    (documented :class:`RedactFilter` boundary).
+    """
+    leaking: list[str] = []
+    for key, value in record.__dict__.items():
+        if key in _STANDARD_RECORD_ATTRS:
+            continue
+        if any(sub in key.lower() for sub in _REDACT_KEYS):
+            leaking.append(key)
+        elif isinstance(value, str) and _EMAIL_RE.search(value):
+            leaking.append(key)
+        elif isinstance(value, bytes | bytearray) and _EMAIL_RE.search(value.decode("utf-8", errors="ignore")):
+            leaking.append(key)
+    return leaking
+
 
 class ContextFilter(logging.Filter):
     """Inject the current request id onto every record as ``trace_id``."""
@@ -70,6 +127,19 @@ class RedactFilter(logging.Filter):
     ``exc_text`` (the pre-rendered traceback some handlers cache), ``exc_info``
     itself, and ``stack_info`` are cleared on a hit, so no handler — ecs-logging
     or a plain stdlib formatter — can re-render the payload.
+
+    The ``logging`` ``extra={...}`` idiom lands as top-level record attributes
+    and is rendered as top-level JSON keys by ``ecs_logging.StdlibFormatter``,
+    bypassing the message scan — so non-standard attributes are also scanned:
+    any extra **key** whose lowercase name contains a ``_REDACT_KEYS`` substring,
+    or whose flat **value** (``str``/``bytes`` only; nested structures are not
+    recursed into) matches ``_EMAIL_RE``, triggers the same all-or-nothing
+    treatment as a message hit. Boundary: only top-level extra keys and flat
+    string values are scanned — a secret nested inside a dict/list extra is NOT
+    caught here and must not be logged that way. Standard LogRecord attributes
+    are excluded from the scan (``_STANDARD_RECORD_ATTRS``): they are either
+    covered by the message/traceback scan or infrastructure whose values
+    (``pathname``, ``threadName``, ...) must never trigger redaction.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -80,7 +150,9 @@ class RedactFilter(logging.Filter):
         stack_info = record.stack_info or ""
         hay = f"{msg}\n{rendered_traceback.lower()}\n{stack_info.lower()}"
         hit = any(key in hay for key in _REDACT_KEYS) or _EMAIL_RE.search(hay) is not None
-        if not hit:
+        # extra= attributes never reach getMessage(); scan them separately.
+        leaking_extra = _leaking_extra_keys(record)
+        if not hit and not leaking_extra:
             return True
         record.msg = "[REDACTED: record contained a sensitive key]"
         record.args = ()
@@ -90,6 +162,11 @@ class RedactFilter(logging.Filter):
         record.exc_info = None
         record.exc_text = "[REDACTED: traceback contained a sensitive key]"
         record.stack_info = None
+        # The formatter renders extra= attributes as top-level JSON keys, so
+        # replacing msg alone cannot stop the leak: drop the offending
+        # attributes entirely (all-or-nothing, like the traceback above).
+        for key in leaking_extra:
+            delattr(record, key)
         return True
 
 

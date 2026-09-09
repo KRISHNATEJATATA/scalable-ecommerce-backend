@@ -7,10 +7,12 @@ then, callers/tests assert the exception type directly.
 
 
 class InvalidCursorError(ValueError):
-    """A pagination cursor could not be decoded (malformed/tampered base64url JSON)."""
+    """A pagination cursor could not be used (malformed/tampered base64url JSON, or stale for
+    the filter it is replayed under) → 400."""
 
-    def __init__(self, cursor: str) -> None:
-        super().__init__(f"Invalid pagination cursor: {cursor!r}")
+    def __init__(self, cursor: str, *, detail: str | None = None) -> None:
+        message = detail if detail is not None else f"Invalid pagination cursor: {cursor!r}"
+        super().__init__(message)
         self.cursor = cursor
 
 

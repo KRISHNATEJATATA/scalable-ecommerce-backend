@@ -12,7 +12,10 @@ from typing import cast
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from src.shared.saga_recovery import SagaRecovery
+from src.shared.config.setting import AppSettings
+from src.shared.saga_recovery import SagaRecovery, run_recovery
+
+_DSN = "postgresql+asyncpg://u:p@localhost:5432/db"
 
 
 def _recovery() -> SagaRecovery:
@@ -68,3 +71,22 @@ async def test_failure_log_says_interval_not_backoff():
     rendered = [record.getMessage() for record in records]
     assert any("retrying after interval" in line for line in rendered)
     assert all("backoff" not in line for line in rendered)
+
+
+_SETTINGS = AppSettings(database_url=_DSN, checkout_saga_recovery_poll_interval_seconds=3.25)
+
+
+async def test_run_recovery_uses_the_dedicated_saga_recovery_poll_interval(monkeypatch):
+    """``run_recovery`` must hand the loop its OWN poll interval
+    (``checkout_saga_recovery_poll_interval_seconds``) — it used to borrow the
+    reservation reaper's, so retuning one worker silently retuned the other."""
+    seen: list[float] = []
+
+    async def fake_run(self: SagaRecovery, poll_interval: float, stop: asyncio.Event | None = None) -> None:
+        seen.append(poll_interval)
+
+    monkeypatch.setattr(SagaRecovery, "run", fake_run)
+
+    await run_recovery(_SETTINGS, cast(async_sessionmaker, None), None)
+
+    assert seen == [3.25]

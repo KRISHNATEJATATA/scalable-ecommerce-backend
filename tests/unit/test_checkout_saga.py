@@ -403,6 +403,81 @@ async def test_same_key_is_per_user_not_global(session):
     assert await _orders_count(session) == 2
 
 
+# --- replay basket mop-up ------------------------------------
+
+
+async def test_fast_path_replay_leaves_a_rebuilt_basket_alone(session):
+    """ a replay of a stored 201 must NOT clear a cart the user
+    built after the original checkout — the mop-up clear fires only when the
+    current basket still matches the order's lines."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    saga = _saga(session, basket)
+    order, _ = await saga.checkout(user_id=USER_A, idempotency_key="key-rebuilt", payment_token="tok_visa")
+    assert len(basket.cleared) == 1  # the drive's own clear
+
+    rebuilt = _line(product_no=2)
+    basket.stock(USER_A, rebuilt)
+    replayed, created = await saga.checkout(user_id=USER_A, idempotency_key="key-rebuilt", payment_token="tok_visa")
+
+    assert created is False
+    assert replayed.id == order.id
+    assert basket.lines[USER_A] == [rebuilt]  # the rebuilt basket survived
+    assert len(basket.cleared) == 1  # no clear from the replay
+
+
+async def test_fast_path_replay_clears_a_basket_still_matching_the_order(session):
+    """The one scenario the mop-up serves: a crash between the drive's clear
+    and the replay record left the cart uncleaned — the replay clears it, even
+    when a catalog refresh drifted name/price (ids + quantities decide)."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    saga = _saga(session, basket)
+    order, _ = await saga.checkout(user_id=USER_A, idempotency_key="key-mopup", payment_token="tok_visa")
+
+    drifted = CheckoutLine(
+        product_id=line.product_id,
+        name="Renamed by ProductUpdated",
+        unit_price=Decimal("24.99"),
+        quantity=line.quantity,
+    )
+    basket.stock(USER_A, drifted)
+    replayed, created = await saga.checkout(user_id=USER_A, idempotency_key="key-mopup", payment_token="tok_visa")
+
+    assert created is False
+    assert replayed.id == order.id
+    assert len(basket.cleared) == 2  # drive's clear + the replay's mop-up
+    assert basket.lines.get(USER_A) is None
+
+
+async def test_db_backstop_replay_leaves_a_rebuilt_basket_alone(session):
+    """DB backstop: with the fast path lost, a replay of
+    the stored paid order must not clear a basket that no longer matches."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    order, _ = await _saga(session, basket).checkout(
+        user_id=USER_A, idempotency_key="key-backstop-rebuilt", payment_token="tok_visa"
+    )
+    assert len(basket.cleared) == 1
+
+    rebuilt = _line(product_no=2)
+    basket.stock(USER_A, rebuilt)
+    replayed, created = await _saga(session, basket).checkout(
+        user_id=USER_A, idempotency_key="key-backstop-rebuilt", payment_token="tok_visa"
+    )  # fresh fast path: the DB backstop answers
+
+    assert created is False
+    assert replayed.id == order.id
+    assert basket.lines[USER_A] == [rebuilt]  # the rebuilt basket survived
+    assert len(basket.cleared) == 1  # only the drive's clear, never the backstop's
+
+
 # --- compensation ----------------------------------------------------------
 
 
@@ -589,6 +664,99 @@ async def test_failure_after_payment_never_compensates(session):
     order_id = (await session.execute(text("SELECT id FROM orders.orders"))).scalar_one()
     assert await _order_status(session, order_id) == "pending"  # not cancelled
     assert await _stock(session, str(line.product_id)) == (5, 1)  # hold kept for recovery
+
+
+# --- cancel vs. the guarded mark_paid flip-------------------
+
+
+async def test_cancel_wins_after_payment_counts_an_orphaned_paid_payment(session):
+    """The cancel flips the order ``cancelled`` after the charge succeeded: the
+    saga's ``mark_paid`` flip loses, the caller gets a 409, and the
+    ``succeeded`` payment row is attached to a cancelled order — money taken,
+    no order. Nothing reconciles that pair automatically, so the orphan
+    counter is the alertable signal (the log line is not)."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    inventory = InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)
+    payments = PaymentsService(PaymentsRepository(session), StubPaymentGateway(), webhook_secret="test-secret")
+
+    class _CancelWinsAfterCharge(OrdersRepository):
+        """A user-facing cancel wins the guarded flip between the saga's commit
+        and its ``mark_paid``; the saga's own ``pending → paid`` flip then
+        loses (``None``)."""
+
+        async def transition_status(self, order_id, *, expect, to_status, outbox=None):
+            if to_status == OrderStatus.PAID:
+                # The canceller's flip landed first — perform it as
+                # OrdersService.cancel_order would, then lose our own.
+                await super().transition_status(order_id, expect=[OrderStatus.PENDING], to_status=OrderStatus.CANCELLED)
+                return None
+            return await super().transition_status(order_id, expect=expect, to_status=to_status, outbox=outbox)
+
+    saga = CheckoutSaga(
+        _CancelWinsAfterCharge(session),
+        basket,
+        OrderStockHolds(inventory),
+        OrderCharges(payments),
+        _Idempotency(),
+        step_timeout_seconds=60,
+    )
+
+    before = _counter("checkout_orphaned_paid_payments_total")
+    try:
+        await saga.checkout(user_id=USER_A, idempotency_key="key-cancel-wins", payment_token="tok_visa")
+    except OrderStateConflictError as exc:
+        assert "reconciled" in exc.detail
+    else:
+        raise AssertionError("expected OrderStateConflictError")
+
+    assert _counter("checkout_orphaned_paid_payments_total") == before + 1
+    order_id = (await session.execute(text("SELECT id FROM orders.orders"))).scalar_one()
+    assert await _order_status(session, order_id) == "cancelled"
+    payment_status = (
+        await session.execute(text("SELECT status FROM payments.payments WHERE order_id = :id"), {"id": order_id})
+    ).scalar_one()
+    assert payment_status == "succeeded"  # the orphaned pair: money taken, order cancelled
+
+
+async def test_poller_settling_concurrently_does_not_count_an_orphan(session):
+    """The benign arm of the lost flip: the recovery poller's own
+    ``pending → paid`` won, the drive reads final state and returns it — a
+    settled order, not an orphan, so the counter must stay put."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    inventory = InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)
+    payments = PaymentsService(PaymentsRepository(session), StubPaymentGateway(), webhook_secret="test-secret")
+
+    class _PollerSettlesFirst(OrdersRepository):
+        """The poller's guarded flip won the race: it marks the order ``paid``
+        before this drive's flip, which then loses (``None``)."""
+
+        async def transition_status(self, order_id, *, expect, to_status, outbox=None):
+            if to_status == OrderStatus.PAID:
+                await super().transition_status(order_id, expect=[OrderStatus.PENDING], to_status=OrderStatus.PAID)
+                return None
+            return await super().transition_status(order_id, expect=expect, to_status=to_status, outbox=outbox)
+
+    saga = CheckoutSaga(
+        _PollerSettlesFirst(session),
+        basket,
+        OrderStockHolds(inventory),
+        OrderCharges(payments),
+        _Idempotency(),
+        step_timeout_seconds=60,
+    )
+
+    before = _counter("checkout_orphaned_paid_payments_total")
+    order, created = await saga.checkout(user_id=USER_A, idempotency_key="key-poller-first", payment_token="tok_visa")
+
+    assert created is True
+    assert order.status == OrderStatus.PAID
+    assert _counter("checkout_orphaned_paid_payments_total") == before  # benign settle is not an orphan
 
 
 # --- recovery --------------------------------------------------------------

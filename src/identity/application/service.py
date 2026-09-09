@@ -120,11 +120,39 @@ class IdentityAdminService:
         always role-current (unlike token claims); ``disabled`` mirrors Keycloak
         ``enabled=false``. ``search`` is substring (contains) over username/email —
         the admin adapter wraps the term in Keycloak's ``*term*`` infix wildcard
-        (bare ``search`` is prefix-only). A full page carries ``next_cursor`` for
-        the next offset; a short page is the last one.
+        (bare ``search`` is prefix-only).
+
+        Has-more is a ``limit + 1`` probe: one extra row is requested from
+        Keycloak and trimmed before role enrichment, so a page that exactly
+        fills the limit is terminal — no phantom empty next page. The cursor
+        pins the walk: it carries the issuing ``limit`` and ``search``, and a
+        resumed page is served at the pinned limit (the request's ``limit``
+        only applies when starting a fresh walk, ``cursor=None``); replaying a
+        cursor under a different ``search`` re-partitions the walk, so it is a
+        stale cursor → :class:`InvalidCursorError` (400). Legacy
+        ``{"offset": n}`` cursors (pre-pinning) decode leniently as unpinned —
+        the request's limit/search then apply, as before.
         """
-        offset = 0 if cursor is None else _decode_offset_cursor(cursor)
-        users = await self._admin.list_users(search, offset, limit)
+        offset = 0
+        pinned_limit: int | None = None
+        pinned_search: str | None = None
+        if cursor is not None:
+            offset, pinned_limit, pinned_search = _decode_offset_cursor(cursor)
+            if pinned_limit is not None and pinned_search != search:
+                # A pinned cursor replayed under a different search re-partitions the
+                # walk — the silent re-partition IS the bug; an explicit 400 tells the
+                # client to restart the walk for the new filter.
+                raise InvalidCursorError(
+                    cursor, detail="cursor was issued for a different search filter; restart the walk"
+                )
+        # The cursor pins the walk: a resumed page is served at the pinned limit
+        # (the request's limit only applies to fresh walks and legacy cursors).
+        page_limit = pinned_limit if pinned_limit is not None else limit
+        # limit+1 probe: the extra row only signals has-more — trim before the
+        # role-enrichment gather so the probe row costs no Admin-API role lookups.
+        users = await self._admin.list_users(search, offset, page_limit + 1)
+        has_more = len(users) > page_limit
+        users = users[:page_limit]
         sem = asyncio.Semaphore(_ROLE_GATHER_CONCURRENCY)
 
         async def _is_merchant(user: DirectoryUser) -> bool:
@@ -136,7 +164,7 @@ class IdentityAdminService:
             AdminUserResponse(sub=u.sub, email=u.email, merchant_role=flag, disabled=not u.enabled)
             for u, flag in zip(users, flags, strict=True)
         ]
-        next_cursor = _encode_offset_cursor(offset + limit) if len(items) == limit else None
+        next_cursor = _encode_offset_cursor(offset + page_limit, page_limit, search) if has_more else None
         return PageResponse(items=items, next_cursor=next_cursor)
 
 
@@ -148,18 +176,39 @@ class IdentityAdminService:
 _ROLE_GATHER_CONCURRENCY = 10
 
 
-def _encode_offset_cursor(offset: int) -> str:
-    """Opaque cursor: base64url JSON of the Keycloak Admin API offset (its ``first``)."""
-    return base64.urlsafe_b64encode(json.dumps({"offset": offset}).encode()).decode()
+def _encode_offset_cursor(offset: int, limit: int | None = None, search: str | None = None) -> str:
+    """Opaque cursor: base64url JSON of the Keycloak Admin API offset (its ``first``).
+
+    New-format cursors also pin the walk (``limit`` + ``search``); ``limit=None``
+    emits the legacy ``{"offset": n}`` shape, still decoded (unpinned).
+    """
+    payload: dict[str, object] = {"offset": offset}
+    if limit is not None:
+        payload["limit"] = limit
+        payload["search"] = search
+    return base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
 
 
-def _decode_offset_cursor(cursor: str) -> int:
-    """Decode an offset cursor; any malformed/tampered value → :class:`InvalidCursorError` (→ 400)."""
+def _decode_offset_cursor(cursor: str) -> tuple[int, int | None, str | None]:
+    """Decode an offset cursor → ``(offset, pinned_limit, pinned_search)``.
+
+    New-format cursors pin both; legacy ``{"offset": n}`` ones decode leniently
+    as unpinned (``None, None`` — the request's limit/search apply). Any
+    malformed/tampered value → :class:`InvalidCursorError` (→ 400).
+    """
     try:
         parsed = json.loads(base64.urlsafe_b64decode(cursor.encode()))
         offset = parsed["offset"]
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             raise ValueError("cursor offset must be a non-negative int")
+        pinned_limit = parsed.get("limit")
+        if pinned_limit is None:
+            return offset, None, None  # legacy shape: unpinned
+        if isinstance(pinned_limit, bool) or not isinstance(pinned_limit, int) or pinned_limit < 1:
+            raise ValueError("cursor limit must be a positive int")
+        pinned_search = parsed.get("search")
+        if pinned_search is not None and not isinstance(pinned_search, str):
+            raise ValueError("cursor search must be a string or null")
     except Exception as exc:  # malformed base64 / JSON / wrong shape / bad offset
         raise InvalidCursorError(cursor) from exc
-    return offset
+    return offset, pinned_limit, pinned_search
