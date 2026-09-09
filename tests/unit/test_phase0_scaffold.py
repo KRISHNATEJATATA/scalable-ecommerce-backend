@@ -67,3 +67,21 @@ def test_shipped_reaper_defaults_satisfy_the_invariant(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", _DSN)
     s = AppSettings(_env_file=None)
     assert s.image_upload_reaper_grace_seconds > s.image_visibility_timeout_seconds
+
+
+def test_demo_seeding_enabled_by_default(monkeypatch):
+    """Deliberate contract: seeding is ON unless explicitly
+    switched off — the seeder is a manual, profile-gated compose one-shot, never
+    part of `compose up`."""
+
+    monkeypatch.setenv("DATABASE_URL", _DSN)
+    monkeypatch.delenv("SEED_DEMO_DATA", raising=False)
+    s = AppSettings(_env_file=None)
+    assert s.seed_demo_data is True
+
+
+def test_demo_seeding_kill_switch(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", _DSN)
+    monkeypatch.setenv("SEED_DEMO_DATA", "0")
+    s = AppSettings(_env_file=None)
+    assert s.seed_demo_data is False

@@ -140,14 +140,15 @@ services:
       CORS_ALLOW_ORIGINS: '["http://localhost:3000"]'
     command: ["python", "-m", "scripts.s3_bootstrap"]
 
-  # One-shot (opt-in): seed the demo state — 4 Keycloak users, 11 products
+  # One-shot (explicitly invoked): seed the demo state — 4 Keycloak users, 11 products
   # (5 + 6 across two merchants), 11 images through the real pipeline, stock
   # per product. Explicitly invoked via `make seed` / `make seed-reset`;
   # profile-gated so a normal `compose up` never runs it (the repo is shared
   # by other UI projects). Not the FastAPI lifespan: that runs in prod ECS.
-  # Refuses to run without SEED_DEMO_DATA=1 (the explicit opt-in is also
-  # enforced inside the script, so `python -m scripts.catalog_seed` on a host
-  # without the flag is still a hard refusal).
+  # Seeding is on by default (SEED_DEMO_DATA=1 is the shipped default); set
+  # SEED_DEMO_DATA=0 to make the script a hard refusal — also enforced inside
+  # the script, so `python -m scripts.catalog_seed` on a host with the kill
+  # switch set is still a hard refusal.
   catalog-seed:
     build: .
     profiles: ["seed"]

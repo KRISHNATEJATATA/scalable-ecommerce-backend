@@ -75,10 +75,10 @@ class AppSettings(BaseSettings):
     catalog_cache_queue_url: str | None = None
 
     # --- Demo seeding (dev-only) ---
-    # Explicit opt-in that unlocks `make seed` (scripts/catalog_seed.py). The
-    # seeder refuses to run without it, so hardcoded demo credentials and the
-    # fictional catalog are structurally incapable of reaching a real deployment.
-    # Deliberately NOT a field any server code reads — the seeder is the only consumer.
+    # Kill switch for `make seed` (scripts/catalog_seed.py): seeding is enabled
+    # by default; set SEED_DEMO_DATA=0 to refuse it (hardcoded demo credentials
+    # + fictional catalog stay out of a shared/staging database). Deliberately
+    # NOT a field any server code reads — the seeder is the only consumer.
     seed_demo_data: bool = True
 
     # --- Auth: OIDC via Keycloak (app is a pure resource server, Phase 5) ---

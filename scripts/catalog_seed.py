@@ -41,9 +41,9 @@ them. Local identity rows are
 never hard-deleted (orders may reference them) and runtime orders are left
 untouched — per ticket decision 12, reset tolerates the orphans.
 
-Refuses to run unless ``SEED_DEMO_DATA=1``: hardcoded demo credentials and a
-fictional brand catalog must be structurally incapable of reaching a real
-deployment.
+Demo seeding is enabled by default; set ``SEED_DEMO_DATA=0`` to refuse it — the
+kill switch keeps hardcoded demo credentials and a fictional brand catalog out
+of shared/staging databases.
 """
 
 from __future__ import annotations
@@ -495,9 +495,9 @@ def main() -> None:
     settings = get_settings()
     if not settings.seed_demo_data:
         print(
-            "Refusing to seed: SEED_DEMO_DATA is not enabled.\n"
+            "Refusing to seed: SEED_DEMO_DATA=0 (kill switch).\n"
             "Demo seeding creates hardcoded users with known passwords and a fictional\n"
-            "catalog — it must be explicitly opted into (dev/local only).",
+            "catalog - set SEED_DEMO_DATA=1 (or unset it) to allow it in dev/local.",
             file=sys.stderr,
         )
         raise SystemExit(2)
