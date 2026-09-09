@@ -105,6 +105,7 @@ class ResilientPaymentGateway:
             if is_transient_exception(exc):
                 self._breaker.record_failure()
                 raise DependencyUnavailableError("payment gateway is unavailable") from exc
+            self._breaker.record_success()  # a definitive answer (4xx incl.) proves the gateway is up
             raise
         except BaseException:
             # CancelledError et al.: no outcome, but release any half-open probe slot.
