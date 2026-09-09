@@ -209,6 +209,11 @@ class AppSettings(BaseSettings):
     # the alert signal alive when the relay itself is dead.
     outbox_lag_poll_seconds: float = Field(default=15.0, gt=0)
     consumer_max_messages: int = Field(default=10, ge=1, le=10)  # SQS receive batch (max 10)
+    # Sizing contract : SQS starts every message's visibility clock at
+    # receive time and the batch is processed concurrently, so worst-case batch
+    # duration ≈ the slowest handler. Size the queue so the batch fits the window:
+    # queue visibility timeout >= consumer_lease_ttl_seconds + the per-message
+    # handler budget (time budget x consumer_max_messages must fit the headroom).
     consumer_wait_time_seconds: int = Field(default=10, ge=0, le=20)  # SQS long-poll seconds
     consumer_dedup_ttl_seconds: int = Field(default=86400, gt=0)  # completion-marker TTL (~24h)
     # Short processing-lease TTL: a claim expires this fast, so a worker that
@@ -217,7 +222,10 @@ class AppSettings(BaseSettings):
     # the queue visibility >= this) so a crashed worker's lease has expired by the
     # time SQS redelivers — otherwise the redelivery keeps finding a held lease,
     # bounces, and prematurely hits maxReceiveCount → DLQ. bus_bootstrap sets the
-    # local queue visibility from this value.
+    # local queue visibility from this value (lease x 2, so a whole concurrent
+    # batch of up to `consumer_max_messages` handlers fits the window: visibility
+    # >= lease + max_messages x per-message handler budget — keep the handler
+    # budget <= (visibility - lease) / max_messages).
     consumer_lease_ttl_seconds: int = Field(default=60, gt=0)
 
     # --- Cart (Valkey-only pre-checkout basket) ---
