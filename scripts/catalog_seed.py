@@ -30,11 +30,14 @@ Every mechanism here is first-class — the same ones the app itself uses:
 * **Stock** — the inventory application service's :meth:`InventoryService.upsert_stock`
   (the service behind ``PUT /v1/admin/inventory/{sku}``), never SQL.
 
-Ordering: users → anchors → products → images → stock. On ``--reset`` the four
-Keycloak users are deleted first so the re-created accounts get fresh subs that
-this same run's anchors and products then bind to, and every live product is
-soft-deleted through the domain service (each emits ``ProductDeleted`` so the
-cache/cart consumers invalidate downstream state). Local identity rows are
+Ordering: users → anchors → products → images → stock. On ``--reset`` every
+live product is soft-deleted through the domain service first (each emits
+``ProductDeleted`` so the cache/cart consumers invalidate downstream state),
+then the four Keycloak users are deleted — DB-side wipe before user deletion
+is the crash-convergence guarantee: an interrupted reset leaves at worst
+orphaned Keycloak accounts without local products, which are harmless, and the
+next seed re-creates users (fresh subs → fresh anchors) and products keyed off
+them. Local identity rows are
 never hard-deleted (orders may reference them) and runtime orders are left
 untouched — per ticket decision 12, reset tolerates the orphans.
 
@@ -419,14 +422,18 @@ async def run(reset: bool) -> None:
         await wait_for_keycloak(settings)
 
         if reset:
-            # Users first: fresh accounts → fresh subs → fresh anchors this run.
+            # DB-side wipe BEFORE Keycloak user deletion — this ordering is the
+            # crash-convergence guarantee: a mid-reset crash leaves at worst
+            # orphaned Keycloak users + no local products, so a plain re-seed
+            # recreates users (fresh subs → fresh anchors) and products keyed
+            # off them, converging with no duplicates.
+            wiped = await wipe_products(sessionmaker, settings)
+            log.info("reset: soft-deleted %d product(s)", wiped)
             for username, _email, _role, _password, _first, _last in USERS:
                 sub = await admin.find_sub_by_username(username)
                 if sub is not None:
                     await admin.delete_user(sub)
                     log.info("reset: deleted Keycloak user %s", username)
-            wiped = await wipe_products(sessionmaker, settings)
-            log.info("reset: soft-deleted %d product(s)", wiped)
 
         subs: dict[str, str] = {}
         anchors: dict[str, Any] = {}
@@ -479,7 +486,7 @@ def main() -> None:
     """``python -m scripts.catalog_seed [--reset]`` — the ``make seed`` entrypoint."""
     parser = argparse.ArgumentParser(description="Seed demo users, products, images and stock (dev-only).")
     parser.add_argument(
-        "--reset", action="store_true", help="delete demo Keycloak users + soft-delete products first, then re-seed"
+        "--reset", action="store_true", help="soft-delete demo products, delete demo Keycloak users, then re-seed"
     )
     args = parser.parse_args()
 
