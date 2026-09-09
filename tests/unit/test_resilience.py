@@ -495,6 +495,46 @@ async def test_gateway_retry_exhaustion_raises_unavailable():
     assert down.calls == 3
 
 
+class _ScriptedGateway:
+    """Gateway that raises each queued error in order, then answers ``None`` (a healthy read)."""
+
+    def __init__(self, *errors: Exception) -> None:
+        self._errors = list(errors)
+        self.calls = 0
+
+    async def charge(self, **kwargs):  # noqa: ANN002, ANN202
+        raise AssertionError("charge not expected in this test")
+
+    async def lookup(self, idempotency_key: str):  # noqa: ANN202
+        self.calls += 1
+        if self._errors:
+            raise self._errors.pop(0)
+        return None
+
+
+async def test_gateway_non_transient_probe_fault_releases_half_open_slot():
+    """BUG-007: a non-transient fault during the half-open probe must release the
+    probe slot (record_success — a definitive answer proves the gateway is up), or
+    the breaker wedges and every later call 503s with CircuitOpenError until restart."""
+    gateway = ResilientPaymentGateway(
+        _ScriptedGateway(ConnectionError("gateway down"), ValueError("programming error")),
+        max_attempts=1,
+        failure_threshold=1,
+        reset_timeout_seconds=0.01,
+    )
+    with pytest.raises(DependencyUnavailableError):
+        await gateway.lookup("k1")  # transient fault trips the breaker
+    assert gateway._breaker.state == "open"
+    await asyncio.sleep(0.02)  # reset window elapses → the next call is the probe
+
+    with pytest.raises(ValueError):  # the probe fails non-transiently, untouched
+        await gateway.lookup("k2")
+    assert gateway._breaker.state == "closed"  # slot released — pre-fix it stayed wedged
+
+    assert await gateway.lookup("k3") is None  # healthy call must not CircuitOpenError
+    assert gateway._breaker.state == "closed"
+
+
 # --- Keycloak admin resilience ------------------------------------------------
 
 
