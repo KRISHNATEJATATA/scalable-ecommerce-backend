@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import signal
 
@@ -55,16 +56,22 @@ class ReservationReaper:
         """Loop until ``stop`` is set; sleep ``poll_interval`` only when idle.
 
         A full batch means there is likely more waiting, so the next pass runs
-        immediately — the same drain-then-sleep shape as the outbox relay.
+        immediately — the same drain-then-sleep shape as the outbox relay. The
+        idle sleep wakes the moment ``stop`` is set, so SIGTERM never waits out
+        a full interval (bounded shutdown: finish the current sweep, exit).
         """
         while stop is None or not stop.is_set():
             try:
                 released = await self.sweep_once()
             except Exception:  # boundary: one bad pass must not kill the reaper
-                log.exception("reaper pass failed; retrying after backoff")
+                log.exception("reaper pass failed; retrying after interval")
                 released = 0
             if released < self._batch:
-                await asyncio.sleep(poll_interval)
+                if stop is None:
+                    await asyncio.sleep(poll_interval)
+                    continue
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=poll_interval)
 
 
 async def run_reaper(
