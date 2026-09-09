@@ -292,3 +292,16 @@ class KeycloakConflictError(Exception):
     def __init__(self, detail: str = "Keycloak state conflicts with this request") -> None:
         super().__init__(detail)
         self.detail = detail
+
+
+class KeycloakInvalidRequestError(Exception):
+    """Keycloak refused the payload itself (HTTP 400) → 400.
+
+    Today the one producer is account creation against a malformed email the
+    admin can fix (e.g. ``error-invalid-email``) — provider-refused input is
+    caller-fixable and must not surface as a permanent-looking 500.
+    """
+
+    def __init__(self, detail: str = "Keycloak rejected this request") -> None:
+        super().__init__(detail)
+        self.detail = detail
