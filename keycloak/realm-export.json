@@ -3,6 +3,9 @@
   "enabled": true,
   "sslRequired": "none",
   "accessTokenLifespan": 300,
+  "registrationAllowed": true,
+  "resetPasswordAllowed": true,
+  "verifyEmail": true,
   "roles": {
     "realm": [
       { "name": "consumer", "description": "Default customer role" },

@@ -407,7 +407,7 @@ async def test_same_key_is_per_user_not_global(session):
 
 
 async def test_fast_path_replay_leaves_a_rebuilt_basket_alone(session):
-    """ a replay of a stored 201 must NOT clear a cart the user
+    """a replay of a stored 201 must NOT clear a cart the user
     built after the original checkout — the mop-up clear fires only when the
     current basket still matches the order's lines."""
     line = _line()

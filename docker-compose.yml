@@ -393,10 +393,32 @@ services:
 
   # Local mail catcher: Keycloak's "update account" email (admin user creation)
   # needs an SMTP server or the create rolls back. UI on http://localhost:8025.
+  # Optional relay: with MAILPIT_RELAY_ENABLED=true in the gitignored .env, every
+  # captured mail is auto-relayed to a real SMTP host (Gmail) so Keycloak's
+  # verifyEmail / reset mail reaches actual inboxes while Mailpit keeps the
+  # local copy for debugging. Default off: Mailpit refuses to boot with
+  # relay-all but no relay host, and the repo must start identically without .env.
   mailpit:
     image: axllent/mailpit:latest
     ports:
       - "8025:8025"
+    environment:
+      MP_SMTP_RELAY_HOST: ${MAILPIT_RELAY_HOST:-}
+      MP_SMTP_RELAY_PORT: ${MAILPIT_RELAY_PORT:-587}
+      MP_SMTP_RELAY_STARTTLS: "true"
+      MP_SMTP_RELAY_AUTH: plain
+      MP_SMTP_RELAY_USERNAME: ${MAILPIT_RELAY_USERNAME:-}
+      MP_SMTP_RELAY_PASSWORD: ${MAILPIT_RELAY_PASSWORD:-}
+      # Gmail rejects spoofed From/Return-Path domains (SPF/DMARC) — rewrite
+      # Keycloak's no-reply@ecommerce.local to the authenticated account
+      # (original From preserved in X-Original-From, SPF-valid bounce path).
+      MP_SMTP_RELAY_OVERRIDE_FROM: ${MAILPIT_RELAY_USERNAME:-}
+      MP_SMTP_RELAY_RETURN_PATH: ${MAILPIT_RELAY_USERNAME:-}
+      # Auto-relay every captured mail to its original recipients (gated so an
+      # unconfigured checkout stays a plain catcher). Scoped alternative: set
+      # false and add MP_SMTP_RELAY_MATCHING: '@gmail\.com$' to relay only
+      # matching recipients — the rest still lands in the UI, releasable manually.
+      MP_SMTP_RELAY_ALL: ${MAILPIT_RELAY_ENABLED:-false}
 
   # IdP: imports the ecommerce realm (consumer/merchant/admin/service roles + clients) on boot.
   keycloak:
