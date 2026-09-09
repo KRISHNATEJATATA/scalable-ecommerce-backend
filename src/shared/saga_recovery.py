@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import signal
 import uuid
@@ -155,15 +156,23 @@ class SagaRecovery:
             )
 
     async def run(self, poll_interval: float, stop: asyncio.Event | None = None) -> None:
-        """Loop until ``stop`` is set; sleep ``poll_interval`` only when idle."""
+        """Loop until ``stop`` is set; sleep ``poll_interval`` only when idle.
+
+        The idle sleep wakes the moment ``stop`` is set, so SIGTERM never waits
+        out a full interval (bounded shutdown: finish the current sweep, exit).
+        """
         while stop is None or not stop.is_set():
             try:
                 settled = await self.sweep_once()
             except Exception:  # boundary: one bad pass must not kill recovery
-                log.exception("saga recovery pass failed; retrying after backoff")
+                log.exception("saga recovery pass failed; retrying after interval")
                 settled = {"completed": 0, "compensated": 0, "deferred": 0}
             if sum(settled.values()) == 0:
-                await asyncio.sleep(poll_interval)
+                if stop is None:
+                    await asyncio.sleep(poll_interval)
+                    continue
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=poll_interval)
 
 
 async def run_recovery(
