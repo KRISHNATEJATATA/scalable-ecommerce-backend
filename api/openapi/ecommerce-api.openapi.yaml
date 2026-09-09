@@ -985,7 +985,8 @@ components:
         email:
           type: string
           minLength: 3
-          maxLength: 320
+          maxLength: 255
+          pattern: "^[^\\x00-\\x20@]+@[^\\x00-\\x20@]+(\\.[^\\x00-\\x20@]+)+$"
       required: [email]
     CreateUserResponse:
       type: object
