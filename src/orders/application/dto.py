@@ -40,3 +40,19 @@ class OrderResponse(BaseModel):
     items: list[OrderItemResponse]
     created_at: datetime
     updated_at: datetime
+
+
+class SagaStepResponse(BaseModel):
+    """One journaled saga step attempt (the execution trace's unit)."""
+
+    step: str
+    status: str
+    occurred_at: datetime
+
+
+class OrderExecutionResponse(BaseModel):
+    """The read-only execution state of an order's checkout saga (its journal, oldest first)."""
+
+    order_id: uuid.UUID
+    order_status: OrderStatus
+    steps: list[SagaStepResponse]

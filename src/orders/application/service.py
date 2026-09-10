@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import uuid
 
-from src.orders.application.dto import OrderResponse
+from src.orders.application.dto import OrderExecutionResponse, OrderResponse, SagaStepResponse
 from src.orders.application.mappers import to_domain
 from src.orders.domain.order import OrderStatus
 from src.orders.ports.checkout import StockHoldsPort
@@ -47,6 +47,29 @@ class OrdersService:
             return None
         self._assert_owner(row.user_id, user_id, is_admin)
         return OrderResponse.model_validate(to_domain(row))
+
+    async def get_execution(
+        self, *, user_id: uuid.UUID, order_id: uuid.UUID, is_admin: bool
+    ) -> OrderExecutionResponse | None:
+        """The order's checkout-saga journal, oldest step first (read-only projection).
+
+        Same ownership contract as :meth:`get_order_detail`: another user's id → 403, an
+        absent row → ``None`` (the route maps it to 404). A pure read — the journal is
+        written transactionally by the saga itself, never here, and nothing in the
+        payload identifies users or payment details.
+        """
+        row = await self._repo.get_order(order_id)
+        if row is None:
+            return None
+        self._assert_owner(row.user_id, user_id, is_admin)
+        steps = await self._repo.list_saga_steps(order_id)
+        return OrderExecutionResponse(
+            order_id=row.id,
+            order_status=row.status,
+            steps=[
+                SagaStepResponse(step=entry.step, status=entry.status, occurred_at=entry.created_at) for entry in steps
+            ],
+        )
 
     async def list_orders(
         self, user_id: uuid.UUID, params: PageParams, status: OrderStatus | None = None

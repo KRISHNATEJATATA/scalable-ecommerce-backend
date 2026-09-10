@@ -13,7 +13,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 
-from src.orders.api.schemas import CheckoutRequest, OrderResponse
+from src.orders.api.schemas import CheckoutRequest, OrderExecutionResponse, OrderResponse
 from src.orders.application.checkout_saga import CheckoutSaga
 from src.orders.application.service import OrdersService
 from src.orders.domain.order import OrderStatus
@@ -107,6 +107,25 @@ async def get_order(
     if order is None:
         raise _NOT_FOUND
     return order
+
+
+@router.get("/{order_id}/execution", response_model=OrderExecutionResponse)
+async def get_order_execution(
+    order_id: uuid.UUID,
+    service: OrdersServiceDep,
+    caller: CurrentUserDep,
+    principal: PrincipalDep,
+) -> OrderExecutionResponse:
+    """The order's checkout-saga execution trace: its journal, oldest step first (read-only).
+
+    What the checkout actually did — steps, per-attempt statuses, timestamps — as the
+    saga wrote it into ``orders.saga_log``. Same ownership rule as the order GET
+    (another user's id → 403); a pure read with no side effects.
+    """
+    execution = await service.get_execution(user_id=caller.id, order_id=order_id, is_admin=_is_admin(principal))
+    if execution is None:
+        raise _NOT_FOUND
+    return execution
 
 
 @router.post("/{order_id}/cancel", response_model=OrderResponse)

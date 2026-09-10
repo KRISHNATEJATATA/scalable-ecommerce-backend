@@ -237,6 +237,16 @@ class OrdersRepository:
         stmt = select(SagaLog.id).where(SagaLog.order_id == order_id, SagaLog.updated_at >= since).limit(1)
         return (await self._session.execute(stmt)).scalar_one_or_none() is not None
 
+    async def list_saga_steps(self, order_id: uuid.UUID) -> list[SagaLog]:
+        """The order's full journal, oldest first (the execution-trace read).
+
+        Each journal row is written in its own transaction, so ``created_at``
+        strictly increases along the drive; the id tiebreak keeps the order
+        stable in the (theoretical) same-microsecond case.
+        """
+        stmt = select(SagaLog).where(SagaLog.order_id == order_id).order_by(SagaLog.created_at.asc(), SagaLog.id.asc())
+        return list((await self._session.execute(stmt)).scalars().all())
+
     async def rollback(self) -> None:
         """Drop any half-finished transaction (recovery's per-order error boundary).
 

@@ -303,6 +303,92 @@ async def test_order_history_detail_cancel_and_ownership(app_ctx, rsa_key):
         assert cancel_other.status_code == 403
 
 
+async def test_order_execution_journal_contract(app_ctx, rsa_key):
+    """the saga journal has an HTTP surface — read-only, owner-or-admin.
+
+    A paid drive's trace is exactly the journal sequence (create → reserve →
+    charge → commit → mark_paid, each attempt journaled in order); a
+    stock-refused one ends ``cancelled`` with compensation journaled. Steps are
+    oldest-first, carry no PII/secrets, another user's order is 403, and the
+    admin bypass matches the order GET.
+    """
+    app, sessionmaker = app_ctx
+    consumer, product_id, _merchant = await _setup_cart(app, sessionmaker, rsa_key)
+    other = _make_token(rsa_key, roles=["consumer"])
+    admin = _make_token(rsa_key, roles=["admin"])
+
+    async with _client(app) as client:
+        paid = await client.post(
+            "/v1/checkout",
+            headers={**_auth(consumer), "Idempotency-Key": "exec-key-1"},
+            json={"payment_token": "tok_visa"},
+        )
+        assert paid.status_code == 201
+        order_id = paid.json()["id"]
+
+        trace = await client.get(f"/v1/orders/{order_id}/execution", headers=_auth(consumer))
+        assert trace.status_code == 200, trace.text
+        body = trace.json()
+        assert set(body) == {"order_id", "order_status", "steps"}
+        assert body["order_id"] == order_id
+        assert body["order_status"] == "paid"
+        assert [(step["step"], step["status"]) for step in body["steps"]] == [
+            ("create", "completed"),
+            ("reserve", "started"),
+            ("reserve", "completed"),
+            ("charge", "started"),
+            ("charge", "completed"),
+            ("commit", "started"),
+            ("commit", "completed"),
+            ("mark_paid", "started"),
+            ("mark_paid", "completed"),
+        ]
+        for step in body["steps"]:
+            assert set(step) == {"step", "status", "occurred_at"}  # no PII, no payment data
+        timestamps = [step["occurred_at"] for step in body["steps"]]
+        assert timestamps == sorted(timestamps)  # execution order, oldest first
+
+        # Ownership: same rule as the order GET.
+        assert (await client.get(f"/v1/orders/{order_id}/execution", headers=_auth(other))).status_code == 403
+        assert (await client.get(f"/v1/orders/{order_id}/execution", headers=_auth(admin))).status_code == 200
+        missing = await client.get(f"/v1/orders/{uuid.uuid4()}/execution", headers=_auth(consumer))
+        assert missing.status_code == 404
+
+    # The refused path journals the compensation and ends cancelled. The first
+    # checkout cleared the basket, so stock the cart anew before refusing it.
+    async with _client(app) as client:
+        refill = await client.post(
+            "/v1/cart/items", headers=_auth(consumer), json={"product_id": product_id, "quantity": 1}
+        )
+        assert refill.status_code == 200, refill.text
+    async with sessionmaker() as session:
+        await session.execute(text("UPDATE inventory.inventory SET on_hand = 0 WHERE sku = :sku"), {"sku": product_id})
+        await session.commit()
+    async with _client(app) as client:
+        refused = await client.post(
+            "/v1/checkout",
+            headers={**_auth(consumer), "Idempotency-Key": "exec-key-2"},
+            json={"payment_token": "tok_visa"},
+        )
+        assert refused.status_code == 409
+
+    async with sessionmaker() as session:
+        cancelled_id = (
+            await session.execute(text("SELECT id FROM orders.orders WHERE idempotency_key = 'exec-key-2'"))
+        ).scalar_one()
+    async with _client(app) as client:
+        cancelled = await client.get(f"/v1/orders/{cancelled_id}/execution", headers=_auth(consumer))
+        assert cancelled.status_code == 200
+        body = cancelled.json()
+        assert body["order_status"] == "cancelled"
+        assert [(step["step"], step["status"]) for step in body["steps"]] == [
+            ("create", "completed"),
+            ("reserve", "started"),
+            ("compensate", "started"),
+            ("compensate", "completed"),
+        ]
+
+
 async def test_cancel_pending_order_releases_its_hold(app_ctx, rsa_key):
     app, sessionmaker = app_ctx
     consumer = _make_token(rsa_key, roles=["consumer"], sub="cancel-consumer", email="cancel@test.io")

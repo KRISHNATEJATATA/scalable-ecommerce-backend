@@ -453,6 +453,35 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+  /v1/orders/{order_id}/execution:
+    parameters:
+      - $ref: "#/components/parameters/OrderId"
+    get:
+      tags: [orders]
+      operationId: getOrderExecution
+      summary: Get the order's checkout-saga execution trace
+      description: >-
+        The order's saga journal, oldest step first — what the checkout
+        actually did (create, reserve, charge, commit, mark_paid, compensate,
+        cancel) with per-attempt statuses and timestamps. Read-only: the
+        journal is written transactionally by the saga as it runs, so polling
+        this during a checkout shows real saga progress. Same ownership rule
+        as `getOrder` — another user's id → 403.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: The order's execution trace.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderExecution"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
   /v1/orders/{order_id}/cancel:
     parameters:
       - $ref: "#/components/parameters/OrderId"
@@ -1299,6 +1328,45 @@ components:
           type: [string, "null"]
           description: Opaque cursor for the next page; `null` on the last page.
       required: [items, next_cursor]
+    OrderExecution:
+      description: >-
+        The read-only execution state of an order's checkout saga: the journal
+        the saga wrote transactionally as it drove the order, oldest first.
+        `order_status` is the order's current lifecycle state.
+      type: object
+      properties:
+        order_id:
+          type: string
+          format: uuid
+        order_status:
+          type: string
+          enum: [pending, paid, shipped, cancelled]
+        steps:
+          type: array
+          description: One entry per journaled step attempt, oldest first.
+          items:
+            $ref: "#/components/schemas/SagaStep"
+      required: [order_id, order_status, steps]
+    SagaStep:
+      description: One journaled saga step attempt.
+      type: object
+      properties:
+        step:
+          type: string
+          enum: [create, reserve, charge, commit, mark_paid, compensate, cancel]
+          description: The saga step (or compensation/cancel action) attempted.
+        status:
+          type: string
+          enum: [started, completed, failed, unknown, compensated]
+          description: >-
+            The attempt's outcome. A step may legitimately rest at `started`
+            while it is live, after a crash before recovery resumes it, or
+            while the order settles (e.g. a payment outcome still unknown).
+        occurred_at:
+          type: string
+          format: date-time
+          description: When the attempt was journaled (server time).
+      required: [step, status, occurred_at]
     AdminUser:
       description: One Keycloak directory entry, resolved live from the Admin API — not the local mirror; `sub` is the Keycloak id.
       type: object

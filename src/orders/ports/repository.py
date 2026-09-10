@@ -57,6 +57,10 @@ class OrdersRepositoryPort(Protocol):
         """The most recent journal status for one step, or ``None`` if never attempted."""
         ...
 
+    async def list_saga_steps(self, order_id: uuid.UUID) -> Any:
+        """The order's full journal in execution order (oldest first)."""
+        ...
+
     async def has_recent_saga_activity(self, order_id: uuid.UUID, *, since: datetime) -> bool:
         """Whether any journal row for the order was written after ``since``."""
         ...

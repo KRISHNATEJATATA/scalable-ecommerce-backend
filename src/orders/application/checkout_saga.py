@@ -336,6 +336,9 @@ class CheckoutSaga:
                     raise OrderStateConflictError(
                         "checkout commit timed out; it will be settled automatically"
                     ) from exc
+            # Either attempt landed: close the step in the journal — the execution
+            # trace must not show a paid order's commit stuck at "started".
+            await self._log(order_id, "commit", "completed")
 
             order = await self._orders.get_order(order_id)
             if order is None:  # defensive: we created it moments ago
@@ -471,6 +474,7 @@ class CheckoutSaga:
         payment = await self._charges.find_by_idempotency_key(payment_key_for(order.user_id, order.idempotency_key))
         if payment is not None and payment.succeeded:
             await self._holds.commit_for_order(order.id)
+            await self._orders.log_saga_step(order.id, "commit", "completed")
             await self._orders.log_saga_step(order.id, "mark_paid", "started")
             paid = await self._orders.transition_status(
                 order.id,
