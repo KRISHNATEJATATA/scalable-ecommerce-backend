@@ -7,6 +7,7 @@ part), and every test starts from a truncated schema. Requires Docker; no
 environment-dependent skip.
 """
 
+import asyncio
 import os
 import subprocess
 import sys
@@ -72,7 +73,7 @@ def _valkey_server():
 
     Shared by every test that exercises Valkey-backed code through the real
     engine (cache adapter + cache-aside orchestration, bus dedupe). Tests flush
-    before use, so sharing one container is safe — spinning one per module was
+    before use, so sharing one container is safe — spinning one up per module was
     the slow part.
     """
     from testcontainers.core.container import DockerContainer
@@ -80,6 +81,36 @@ def _valkey_server():
     container = DockerContainer("valkey/valkey:8").with_exposed_ports(6379)
     with container:
         yield container.get_container_host_ip(), int(container.get_exposed_port(6379))
+
+
+@pytest.fixture
+async def real_valkey(_valkey_server):
+    """A ready-gated per-test client on the session Valkey, flushed before use.
+
+    ``_valkey_server`` yields as soon as the container is *running*, which on a
+    loaded CI runner can precede Valkey actually accepting connections: the
+    docker-proxy accepts the TCP handshake, then can't reach the not-yet-listening
+    engine and closes the socket, so the client's first write dies with
+    ``Error UNKNOWN while writing to socket. Connection lost.`` — a CI-only flake
+    (2026-09, test_cold_stampede_single_fills_through_the_real_valkey_adapter).
+    Ping until the engine answers before any real command, and flush per test so
+    sharing the session container stays safe.
+    """
+    from valkey.asyncio import Valkey
+
+    host, port = _valkey_server
+    client = Valkey(host=host, port=port)
+    for _ in range(100):  # ~10s ceiling: wait for "Ready to accept connections"
+        try:
+            if await client.ping():
+                break
+        except Exception:
+            await asyncio.sleep(0.1)
+    else:
+        pytest.fail("Valkey container never became ready")
+    await client.flushdb()
+    yield client
+    await client.aclose()
 
 
 @pytest.fixture
