@@ -9,7 +9,9 @@ Alembic stays sync (psycopg2) even though the app is async everywhere else.
 """
 
 import re
+from collections.abc import MutableMapping
 from logging.config import fileConfig
+from typing import Literal
 
 from alembic import context
 from sqlalchemy import create_engine, pool, text
@@ -24,7 +26,13 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 
-def _include_name(name: str, type_: str, parent_names: dict) -> bool:
+def _include_name(
+    name: str | None,
+    type_: str,
+    # Signature mirrors alembic's include_name callback stub exactly, so both
+    # type checkers accept it; ty is strict about the mutable key Literal.
+    parent_names: MutableMapping[Literal["schema_name", "table_name", "schema_qualified_table_name"], str | None],
+) -> bool:
     # Autogenerate must only ever see this module's own schema — otherwise it
     # proposes dropping sibling modules' tables (incl. their alembic_version).
     if type_ == "schema":

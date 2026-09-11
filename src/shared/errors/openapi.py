@@ -7,9 +7,10 @@ FastAPI documents its own validation failure as ``422 application/json`` with an
 generated from ``/openapi.json`` would otherwise parse the wrong content type and
 look for ``detail[]`` fields that are never sent.
 
-Rewriting the generated document (rather than annotating every route with
-``responses=``) keeps the guarantee global: a new route cannot forget to declare
-it, because the error shape is a property of the app's handlers, not of the route.
+Overriding ``openapi()`` on a :class:`FastAPI` subclass (rather than annotating
+every route with ``responses=``) keeps the guarantee global: a new route cannot
+forget to declare it, because the error shape is a property of the app class,
+not of the route.
 """
 
 from __future__ import annotations
@@ -39,20 +40,20 @@ _PROBLEM_REF = {"$ref": "#/components/schemas/Problem"}
 _UNUSED_SCHEMAS = ("HTTPValidationError", "ValidationError")
 
 
-def use_problem_details_openapi(app: FastAPI) -> None:
-    """Point ``app.openapi`` at a document whose error responses are Problems."""
+class ProblemDetailsFastAPI(FastAPI):
+    """A :class:`FastAPI` whose ``openapi()`` documents every 4xx/5xx as a Problem."""
 
-    def openapi() -> dict[str, Any]:
-        if app.openapi_schema:
-            return app.openapi_schema
+    def openapi(self) -> dict[str, Any]:
+        if self.openapi_schema:
+            return self.openapi_schema
 
         # Generate through FastAPI's own method rather than calling ``get_openapi``
         # with a hand-copied argument list: that list grows (``servers``,
-        # ``webhooks``, ``openapi_tags``, ``separate_input_output_schemas``…) and
+        # ``webhooks``, ``openapi_tags``, ``separate_input_output_schemas``...) and
         # anything not copied is silently dropped from the published document the
-        # day someone sets it on ``create_app``. Delegating keeps this module
+        # day someone sets it on ``create_app``. Delegating keeps this class
         # responsible for exactly one thing — the error shape.
-        schema = FastAPI.openapi(app)
+        schema = FastAPI.openapi(self)
 
         components = schema.setdefault("components", {}).setdefault("schemas", {})
         components["Problem"] = PROBLEM_SCHEMA
@@ -68,7 +69,5 @@ def use_problem_details_openapi(app: FastAPI) -> None:
         for name in _UNUSED_SCHEMAS:
             components.pop(name, None)
 
-        app.openapi_schema = schema  # mutated in place; cache the finished document
+        self.openapi_schema = schema  # mutated in place; cache the finished document
         return schema
-
-    app.openapi = openapi

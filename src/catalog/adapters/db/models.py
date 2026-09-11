@@ -58,7 +58,7 @@ class Product(Base, TimestampMixin, SoftDeleteMixin, VersionIdMixin):
         {"schema": SCHEMA},
     )
 
-    @declared_attr
+    @declared_attr.directive
     def __mapper_args__(cls) -> dict:
         # version_id_col must be the actual Column object, resolved lazily
         # once the table is built (the mixin column isn't available yet at

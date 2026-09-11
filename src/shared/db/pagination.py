@@ -22,6 +22,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 from sqlalchemy import cast, literal, tuple_
+from sqlalchemy.orm import InstrumentedAttribute
 from sqlalchemy.sql import ColumnElement, Select
 
 from src.shared.errors.exceptions import InvalidCursorError, InvalidQueryParamError
@@ -136,26 +137,32 @@ def check_filters(filters: Mapping[str, Any], allowed: frozenset[str]) -> None:
 
 def apply_keyset(
     stmt: Select,
-    sort_col: ColumnElement,
-    id_col: ColumnElement,
+    sort_col: ColumnElement[Any] | InstrumentedAttribute[Any],
+    id_col: ColumnElement[Any] | InstrumentedAttribute[Any],
     params: PageParams,
     cursor: tuple[str, str] | None,
 ) -> Select:
     """Add the keyset ``WHERE`` (if a cursor), the ``(sort, id)`` ORDER BY, and ``LIMIT n+1``.
 
+    ``sort_col``/``id_col`` take either ORM model attributes (``Order.created_at``)
+    or core column expressions; both normalize to the underlying ``ColumnElement``
+    through SQLAlchemy's own ``__clause_element__`` coercion hook.
+
     Uses a row-value comparison ``(sort, id) < (v, i)`` so the ``id`` tiebreaker
     follows the sort direction — total ordering even when the sort field ties
     (the classic keyset dup/skip bug). The ``+1`` row is the has-next probe.
     """
+    sort_column = sort_col if isinstance(sort_col, ColumnElement) else sort_col.__clause_element__()
+    id_column = id_col if isinstance(id_col, ColumnElement) else id_col.__clause_element__()
     if cursor is not None:
         sort_val, id_val = cursor
-        left = tuple_(sort_col, id_col)
-        right = tuple_(cast(literal(sort_val), sort_col.type), cast(literal(id_val), id_col.type))
+        left = tuple_(sort_column, id_column)
+        right = tuple_(cast(literal(sort_val), sort_column.type), cast(literal(id_val), id_column.type))
         stmt = stmt.where(left < right if params.descending else left > right)
     if params.descending:
-        ordering = (sort_col.desc(), id_col.desc())
+        ordering = (sort_column.desc(), id_column.desc())
     else:
-        ordering = (sort_col.asc(), id_col.asc())
+        ordering = (sort_column.asc(), id_column.asc())
     return stmt.order_by(*ordering).limit(params.limit + 1)
 
 

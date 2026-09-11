@@ -31,8 +31,8 @@ from src.shared.clients.s3_client import s3_client
 from src.shared.config.logging import setup_logging
 from src.shared.config.setting import AppSettings, get_settings
 from src.shared.errors.exception_handlers import register_exception_handlers
-from src.shared.errors.openapi import use_problem_details_openapi
-from src.shared.middleware.security import RequestIDMiddleware, SecurityHeadersMiddleware
+from src.shared.errors.openapi import ProblemDetailsFastAPI
+from src.shared.middleware.security import REQUEST_ID_HEADER, RequestIDMiddleware, SecurityHeadersMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +109,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     setup_logging(settings.log_level)
 
     is_prod = settings.environment == "prod"
-    app = FastAPI(
+    # ProblemDetailsFastAPI, not bare FastAPI: it overrides openapi() so the
+    # published contract documents every 4xx/5xx as the RFC 9457 Problem the
+    # registered handlers actually return.
+    app = ProblemDetailsFastAPI(
         title=settings.app_name,
         version="0.1.0",
         lifespan=_lifespan,
@@ -132,6 +135,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
+        # Browsers hide custom response headers from JS unless listed here —
+        # without it the SPA can't read X-Request-ID to correlate rows with logs.
+        expose_headers=[REQUEST_ID_HEADER],
     )
     app.add_middleware(
         SecurityHeadersMiddleware,
@@ -148,8 +154,6 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.add_middleware(metrics.MetricsMiddleware)
 
     register_exception_handlers(app)
-    # ...and make the published contract match those handlers, not FastAPI's default.
-    use_problem_details_openapi(app)
 
     app.include_router(health.router, prefix=settings.api_v1_prefix)
     app.include_router(identity_routes.router, prefix=settings.api_v1_prefix)

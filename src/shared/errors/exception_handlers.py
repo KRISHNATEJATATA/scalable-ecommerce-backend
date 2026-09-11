@@ -7,13 +7,16 @@ Details shape defined in the API contract.
 
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from http import HTTPStatus
+from typing import cast
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm.exc import StaleDataError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse
+from starlette.types import ExceptionHandler
 
 from src.shared.config.logging import request_id_ctx
 from src.shared.errors.error_builder import PROBLEM_CONTENT_TYPE, build_problem
@@ -238,30 +241,45 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
     return response
 
 
+def _register[ExcT: Exception](
+    app: FastAPI, exc_cls: type[ExcT], handler: Callable[[Request, ExcT], Awaitable[JSONResponse]]
+) -> None:
+    """Register one handler, bridging starlette's coarse ``ExceptionHandler`` alias.
+
+    Starlette dispatches by the registered exception class, so the handler only
+    ever receives ``exc_cls`` instances — but the alias types that parameter as
+    ``Exception``, which reads every narrower handler signature as incompatible.
+    The cast records that dispatch invariant; both arguments stay fully
+    type-checked against each other here (the handler's exception type must
+    accept what ``exc_cls`` can raise).
+    """
+    app.add_exception_handler(exc_cls, cast("ExceptionHandler", handler))
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     """Wire the RFC 9457 handlers onto the app (called from the app factory)."""
-    app.add_exception_handler(AuthenticationError, _authentication_error_handler)
-    app.add_exception_handler(AuthorizationError, _authorization_error_handler)
-    app.add_exception_handler(InvalidQueryParamError, _bad_request_handler)
-    app.add_exception_handler(InvalidCursorError, _bad_request_handler)
-    app.add_exception_handler(InvalidUploadError, _detail_bad_request_handler)
-    app.add_exception_handler(InvalidReservationError, _detail_bad_request_handler)
-    app.add_exception_handler(InvalidCartOperationError, _detail_bad_request_handler)
-    app.add_exception_handler(KeycloakInvalidRequestError, _detail_bad_request_handler)
-    app.add_exception_handler(InsufficientStockError, _insufficient_stock_handler)
-    app.add_exception_handler(ReservationConflictError, _reservation_conflict_handler)
-    app.add_exception_handler(ReservationContendedError, _reservation_contended_handler)
-    app.add_exception_handler(StockBelowReservedError, _stock_below_reserved_handler)
-    app.add_exception_handler(PaymentIdempotencyConflictError, _payment_idempotency_conflict_handler)
-    app.add_exception_handler(CheckoutIdempotencyConflictError, _checkout_idempotency_conflict_handler)
-    app.add_exception_handler(OrderStateConflictError, _order_state_conflict_handler)
-    app.add_exception_handler(UnknownPaymentRefError, _unknown_payment_ref_handler)
-    app.add_exception_handler(ConcurrentUpdateError, _concurrent_update_handler)
-    app.add_exception_handler(PreconditionFailedError, _precondition_failed_handler)
-    app.add_exception_handler(StaleDataError, _stale_data_handler)
-    app.add_exception_handler(DependencyUnavailableError, _dependency_unavailable_handler)
-    app.add_exception_handler(KeycloakEntityNotFoundError, _keycloak_not_found_handler)
-    app.add_exception_handler(KeycloakConflictError, _keycloak_conflict_handler)
-    app.add_exception_handler(StarletteHTTPException, _http_exception_handler)
-    app.add_exception_handler(RequestValidationError, _validation_exception_handler)
+    _register(app, AuthenticationError, _authentication_error_handler)
+    _register(app, AuthorizationError, _authorization_error_handler)
+    _register(app, InvalidQueryParamError, _bad_request_handler)
+    _register(app, InvalidCursorError, _bad_request_handler)
+    _register(app, InvalidUploadError, _detail_bad_request_handler)
+    _register(app, InvalidReservationError, _detail_bad_request_handler)
+    _register(app, InvalidCartOperationError, _detail_bad_request_handler)
+    _register(app, KeycloakInvalidRequestError, _detail_bad_request_handler)
+    _register(app, InsufficientStockError, _insufficient_stock_handler)
+    _register(app, ReservationConflictError, _reservation_conflict_handler)
+    _register(app, ReservationContendedError, _reservation_contended_handler)
+    _register(app, StockBelowReservedError, _stock_below_reserved_handler)
+    _register(app, PaymentIdempotencyConflictError, _payment_idempotency_conflict_handler)
+    _register(app, CheckoutIdempotencyConflictError, _checkout_idempotency_conflict_handler)
+    _register(app, OrderStateConflictError, _order_state_conflict_handler)
+    _register(app, UnknownPaymentRefError, _unknown_payment_ref_handler)
+    _register(app, ConcurrentUpdateError, _concurrent_update_handler)
+    _register(app, PreconditionFailedError, _precondition_failed_handler)
+    _register(app, StaleDataError, _stale_data_handler)
+    _register(app, DependencyUnavailableError, _dependency_unavailable_handler)
+    _register(app, KeycloakEntityNotFoundError, _keycloak_not_found_handler)
+    _register(app, KeycloakConflictError, _keycloak_conflict_handler)
+    _register(app, StarletteHTTPException, _http_exception_handler)
+    _register(app, RequestValidationError, _validation_exception_handler)
     app.add_exception_handler(Exception, _unhandled_exception_handler)

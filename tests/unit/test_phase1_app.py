@@ -35,6 +35,22 @@ async def test_health_is_200():
     assert resp.headers["X-Content-Type-Options"] == "nosniff"
 
 
+async def test_cors_exposes_request_id_to_the_browser():
+    """Allowed-origin responses must list X-Request-ID in Access-Control-Expose-Headers.
+
+    Browsers only hand CORS-safelisted response headers to page JavaScript;
+    X-Request-ID is custom, so without the CORS listing the SPA reads ``null``
+    and the demo inspector shows "—" on every success row.
+    """
+    settings = SETTINGS.model_copy(update={"cors_allow_origins": ["http://test"]})
+    app = create_app(settings)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/v1/health", headers={"Origin": "http://test"})
+    assert resp.headers["access-control-allow-origin"] == "http://test"
+    assert resp.headers["access-control-expose-headers"] == "X-Request-ID"
+    assert resp.headers["X-Request-ID"]  # ...and the header being exposed is actually sent
+
+
 async def test_ready_is_503_problem_without_pools():
     async with _client() as client:
         resp = await client.get("/v1/ready")

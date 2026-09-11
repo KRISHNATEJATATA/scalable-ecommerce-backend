@@ -40,9 +40,9 @@ if __name__ == "__main__":
             self.query_params = QueryParams(qs)
 
     allowed = frozenset({"limit", "cursor"})
-    reject_unknown_query_params(_Req("limit=5&cursor=abc"), allowed)  # type: ignore[arg-type]
+    reject_unknown_query_params(cast("Request", _Req("limit=5&cursor=abc")), allowed)
     try:
-        reject_unknown_query_params(_Req("limit=5&price=9"), allowed)  # type: ignore[arg-type]
+        reject_unknown_query_params(cast("Request", _Req("limit=5&price=9")), allowed)
     except InvalidQueryParamError as exc:
         assert (exc.kind, exc.value) == ("query", "price")
     else:

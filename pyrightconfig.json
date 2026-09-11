@@ -27,4 +27,10 @@
   "reportMissingParameterType": false,
   "reportImplicitOverride": false,
   "reportUnusedCallResult": false
+  // --- known false positive left ON (do not silence globally) -----------------
+  // reportCallIssue flags every test's `AppSettings(_env_file=None, ...)` —
+  // pydantic synthesizes __init__ from fields, so the BaseSettings private
+  // kwargs are invisible to the checker while being real at runtime. Kept on
+  // because it also catches genuinely-wrong kwargs (e.g. a test passing a
+  // nonexistent `secret_key=` that extra="ignore" silently swallowed).
 }

@@ -18,7 +18,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import Result, String, bindparam, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,7 +27,13 @@ from sqlalchemy.sql import text
 
 from src.catalog.adapters.db.models import SCHEMA, ImageReclaim, Outbox, Product
 from src.catalog.domain.image_status import ImageStatus
-from src.catalog.ports.repository import ImageFlip, ImageOutboxFactory, ImageReclaimTask, PendingUpload
+from src.catalog.ports.repository import (
+    ImageFlip,
+    ImageOutboxFactory,
+    ImageReclaimTask,
+    PendingUpload,
+    ProductRecord,
+)
 from src.shared.db.outbox import OutboxMessage
 from src.shared.db.pagination import Page, PageParams, build_page, check_filters, decode_cursor
 from src.shared.errors.exceptions import ConcurrentUpdateError, InvalidQueryParamError
@@ -190,7 +196,21 @@ class CatalogRepository:
         await self._commit_versioned(product=product)
         return product
 
-    async def update_product(self, product: Product, changes: dict[str, object], outbox: OutboxMessage) -> Product:
+    @staticmethod
+    def _aggregate(product: ProductRecord) -> Product:
+        """The tracked ``Product`` row behind a port-level ``ProductRecord``.
+
+        The port types products structurally so the application layer never sees
+        the ORM, while the write paths here mutate the aggregate through the unit
+        of work — which needs the concrete row this adapter itself handed out via
+        ``get_product``/``create_product``. That round-trip is the invariant the
+        cast writes down.
+        """
+        return cast(Product, product)
+
+    async def update_product(
+        self, product: ProductRecord, changes: dict[str, object], outbox: OutboxMessage
+    ) -> Product:
         """Apply ``changes`` to an already-loaded product + emit its outbox row.
 
         The product is mutated through the ORM so ``version_id`` auto-bumps
@@ -198,15 +218,17 @@ class CatalogRepository:
         makes this commit raise ``StaleDataError`` instead of silently clobbering,
         which :meth:`_commit_versioned` turns into a retryable 409.
         """
+        aggregate = self._aggregate(product)
         for field, value in changes.items():
-            setattr(product, field, value)
+            setattr(aggregate, field, value)
         self._session.add(self._outbox_row(outbox))
-        await self._commit_versioned(product=product)
-        return product
+        await self._commit_versioned(product=aggregate)
+        return aggregate
 
-    async def soft_delete_product(self, product: Product, outbox: OutboxMessage) -> None:
+    async def soft_delete_product(self, product: ProductRecord, outbox: OutboxMessage) -> None:
         """Soft-delete (``deleted_at``) + emit the ``ProductDeleted`` outbox row."""
-        product.deleted_at = datetime.now(UTC)
+        aggregate = self._aggregate(product)
+        aggregate.deleted_at = datetime.now(UTC)
         self._session.add(self._outbox_row(outbox))
         await self._commit_versioned()
 
@@ -214,7 +236,7 @@ class CatalogRepository:
 
     async def set_image_pending(
         self,
-        product: Product,
+        product: ProductRecord,
         upload_token: str,
         *,
         expires_at: datetime,
@@ -236,9 +258,10 @@ class CatalogRepository:
         written in the **same transaction** to invalidate the read-cache — otherwise
         a cached ready-image response would linger stale after a re-upload starts.
         """
-        product.image_status = ImageStatus.PENDING.value
-        product.image_upload_token = upload_token
-        product.image_upload_expires_at = expires_at
+        aggregate = self._aggregate(product)
+        aggregate.image_status = ImageStatus.PENDING.value
+        aggregate.image_upload_token = upload_token
+        aggregate.image_upload_expires_at = expires_at
         if outbox is not None:
             self._session.add(self._outbox_row(outbox))
         await self._commit_versioned()
@@ -301,7 +324,9 @@ class CatalogRepository:
         previous_key = row["previous_key"] if row is not None else None
         if row is not None:
             if outbox is not None:
-                self._session.add(self._outbox_row(outbox(row)))
+                # dict(): the factory contract is Mapping[str, Any], and the
+                # RowMapping view must not outlive the commit (see _commit_image_flip).
+                self._session.add(self._outbox_row(outbox(dict(row))))
             if previous_key and previous_key != image_key:
                 # Same transaction as the flip that orphaned it: after this commits,
                 # "the product no longer references that image" and "those objects

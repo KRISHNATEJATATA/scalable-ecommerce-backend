@@ -180,7 +180,13 @@ class CatalogService:
         try:
             response = await self._get_product_cached(product_id)
         except _RepositoryFailure as wrapper:
-            raise wrapper.__cause__ from None  # type: ignore[misc]
+            # _RepositoryFailure is only ever raised ``from`` the real repository
+            # error (see _load_product), so the cause is always set; unwrap it so
+            # callers see the domain exception, not the wrapper.
+            cause = wrapper.__cause__
+            if cause is None:  # pragma: no cover - defensive; raised `from exc` above
+                raise wrapper from None
+            raise cause from None
         if response is not None:
             await self._attach_availability([response])
         return response

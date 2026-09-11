@@ -71,7 +71,8 @@ if __name__ == "__main__":  # pragma: no cover - runnable self-check
     tp = format_traceparent(tid)
     assert parse_trace_id(tp) == tid, tp
     # round-trips a non-hex/short id through normalisation
-    assert len(parse_trace_id(format_traceparent("req-42"))) == 32
+    parsed = parse_trace_id(format_traceparent("req-42"))
+    assert parsed is not None and len(parsed) == 32
     # an empty/zero trace id becomes a random one, never the invalid all-zero id
     assert parse_trace_id(format_traceparent("")) is not None
     assert parse_trace_id(format_traceparent("0")) is not None
