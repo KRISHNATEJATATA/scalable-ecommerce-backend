@@ -21,6 +21,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 
 from pydantic import ValidationError
 
@@ -65,6 +66,50 @@ class _RepositoryFailure(Exception):
     port-neutral (no ``SQLAlchemyError`` import in the application layer); the
     public entrypoint unwraps and re-raises the original.
     """
+
+
+class CacheOutcome(StrEnum):
+    """Where a single product read was ultimately served from.
+
+    Exposed read-only on ``GET /products/{id}`` as the ``X-Cache`` response
+    header (the route owns the header; the service only records the outcome):
+
+    - ``hit`` — answered from a cache entry, including a negative-cached 404
+      tombstone and waiters served by a concurrent fill;
+    - ``miss`` — this request drove the DB read that (re)filled the cache
+      (the single-filler fill);
+    - ``bypass`` — the cache was out of the loop for this response: a Valkey
+      fault degraded to the DB, or a wedged fill hit the waiter deadline and
+      the caller read the DB itself (never stored).
+
+    A read with no cache at all (feature flag off) records nothing — the
+    route then omits the header entirely rather than claiming a hit/miss
+    that never happened.
+    """
+
+    HIT = "hit"
+    MISS = "miss"
+    BYPASS = "bypass"
+
+
+@dataclass(slots=True)
+class CacheRead:
+    """Per-call recorder (out-param) for the cache-aside product read.
+
+    The route passes a fresh instance to :meth:`CatalogService.get_product`
+    via the keyword-only ``cache_read`` argument and reads :attr:`outcome`
+    afterwards. This keeps the service's return contract
+    (``ProductResponse | None``) — and every other caller of that method —
+    untouched while still exposing the read's cache outcome to the HTTP layer.
+    """
+
+    outcome: CacheOutcome | None = None
+
+
+def _record_outcome(cache_read: CacheRead | None, outcome: CacheOutcome) -> None:
+    """Record the read's cache outcome when the caller asked for one (no-op otherwise)."""
+    if cache_read is not None:
+        cache_read.outcome = outcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,7 +206,9 @@ class CatalogService:
         )
         return response
 
-    async def get_product(self, product_id: uuid.UUID) -> ProductResponse | None:
+    async def get_product(
+        self, product_id: uuid.UUID, *, cache_read: CacheRead | None = None
+    ) -> ProductResponse | None:
         """Resolve a product by id, or ``None`` if absent (route maps to 404).
 
         Cache-aside: serve from Valkey on a hit; on a miss, a single caller fills
@@ -169,6 +216,11 @@ class CatalogService:
         for that fill (see :meth:`_read_through`) — so a hot key never stampedes the
         DB. Invalidation is event-driven (``ProductUpdated``/``ProductDeleted`` →
         ``catalog-cache`` consumer), not written here.
+
+        Pass a fresh :class:`CacheRead` as ``cache_read`` to learn where the
+        response was served from (:class:`CacheOutcome` — the route turns it into
+        the ``X-Cache`` header); omit it and nothing is recorded, so existing
+        callers are untouched.
 
         The cache is **best-effort**: any Valkey fault degrades to a direct DB read
         rather than surfacing a 5xx (the graceful-degradation contract in
@@ -178,7 +230,7 @@ class CatalogService:
         mislabelled and re-queried.
         """
         try:
-            response = await self._get_product_cached(product_id)
+            response = await self._get_product_cached(product_id, cache_read=cache_read)
         except _RepositoryFailure as wrapper:
             # _RepositoryFailure is only ever raised ``from`` the real repository
             # error (see _load_product), so the cause is always set; unwrap it so
@@ -191,21 +243,25 @@ class CatalogService:
             await self._attach_availability([response])
         return response
 
-    async def _get_product_cached(self, product_id: uuid.UUID) -> ProductResponse | None:
+    async def _get_product_cached(
+        self, product_id: uuid.UUID, *, cache_read: CacheRead | None = None
+    ) -> ProductResponse | None:
         """Cache-aside read; cache faults degrade to the DB, repo faults propagate."""
         if self._cache is None:
-            return await self._load_product(product_id)
+            return await self._load_product(product_id)  # outcome stays unset → no X-Cache header
 
         try:
             cached = await self._cache.get(product_id)
             if cached is not None:
                 hit, value = await self._decode_or_evict(product_id, cached)
                 if hit:
+                    _record_outcome(cache_read, CacheOutcome.HIT)
                     return value  # a real hit, or a cached 404 (negative hit) → answer is None
-            return await self._read_through(product_id)
+            return await self._read_through(product_id, cache_read=cache_read)
         except _RepositoryFailure:
             raise
         except Exception:  # cache boundary: Valkey down / bad reply → serve from DB
+            _record_outcome(cache_read, CacheOutcome.BYPASS)
             log.warning("product read-cache unavailable; serving %s from DB", product_id, exc_info=True)
             return await self._load_product(product_id)
 
@@ -245,7 +301,9 @@ class CatalogService:
         except Exception as exc:
             raise _RepositoryFailure(str(exc)) from exc
 
-    async def _read_through(self, product_id: uuid.UUID) -> ProductResponse | None:
+    async def _read_through(
+        self, product_id: uuid.UUID, *, cache_read: CacheRead | None = None
+    ) -> ProductResponse | None:
         """Fill the cache on a miss with exactly one DB read across concurrent callers.
 
         The caller that wins ``acquire_fill_lock`` is the single filler. It
@@ -267,8 +325,13 @@ class CatalogService:
                 if cached is not None:
                     hit, value = await self._decode_or_evict(product_id, cached)
                     if hit:
+                        # Another caller filled between our miss and our lock: the
+                        # bytes still came from the cache, so this is a hit, not a miss.
+                        _record_outcome(cache_read, CacheOutcome.HIT)
                         return value
-                return await self._fill_holding_lock(product_id, token)
+                response = await self._fill_holding_lock(product_id, token)
+                _record_outcome(cache_read, CacheOutcome.MISS)  # this request drove the DB fill
+                return response
             finally:
                 # A release failure must never mask the body's exception (a DB error
                 # or cancellation): log it and move on. ``Exception`` (not
@@ -277,7 +340,7 @@ class CatalogService:
                     await self._cache.release_fill_lock(product_id, token)
                 except Exception:
                     log.warning("failed to release product fill lock for %s", product_id, exc_info=True)
-        return await self._await_fill(product_id)
+        return await self._await_fill(product_id, cache_read=cache_read)
 
     async def _fill_holding_lock(self, product_id: uuid.UUID, token: str) -> ProductResponse | None:
         """Load from the DB while keeping the fill lock alive, then store-if-owner.
@@ -313,7 +376,9 @@ class CatalogService:
             await self._cache.store_miss_if_owner(product_id, token)  # negative-cache the 404
         return response
 
-    async def _await_fill(self, product_id: uuid.UUID) -> ProductResponse | None:
+    async def _await_fill(
+        self, product_id: uuid.UUID, *, cache_read: CacheRead | None = None
+    ) -> ProductResponse | None:
         """Wait for the lock holder's fill rather than piling onto the DB.
 
         Waits *while the lock is actively held* — the holder renews it during a slow
@@ -335,20 +400,24 @@ class CatalogService:
             if cached is not None:
                 hit, value = await self._decode_or_evict(product_id, cached)
                 if hit:
+                    _record_outcome(cache_read, CacheOutcome.HIT)  # the fill answered us from the cache
                     return value
                 break  # corrupt entry evicted → stop waiting, promote to filler
             if asyncio.get_running_loop().time() >= deadline:
                 log.warning(
                     "product fill for %s exceeded %.1fs; serving from DB", product_id, self._max_fill_wait_seconds
                 )
-                return await self._load_product(product_id)
+                response = await self._load_product(product_id)
+                _record_outcome(cache_read, CacheOutcome.BYPASS)  # cache alive but wedged — out of the loop
+                return response
             await asyncio.sleep(self._FILL_WAIT_SECONDS)
         cached = await self._cache.get(product_id)
         if cached is not None:
             hit, value = await self._decode_or_evict(product_id, cached)
             if hit:
+                _record_outcome(cache_read, CacheOutcome.HIT)
                 return value
-        return await self._read_through(product_id)  # lock lapsed without a value → promote
+        return await self._read_through(product_id, cache_read=cache_read)  # lock lapsed without a value → promote
 
     async def list_products(
         self, params: PageParams, filters: dict[str, object] | None = None, *, search: str | None = None

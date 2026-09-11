@@ -28,7 +28,7 @@ from src.catalog.api.schemas import (
     ProductResponse,
     ProductUpdate,
 )
-from src.catalog.application.service import CatalogService
+from src.catalog.application.service import CacheRead, CatalogService
 from src.shared.api.query import reject_unknown_query_params
 from src.shared.auth.dependencies import PrincipalDep, require_role
 from src.shared.auth.principal import Principal
@@ -45,6 +45,11 @@ _merchant_principal = Depends(require_role("merchant", "admin"))
 MerchantPrincipalDep = Annotated[Principal, _merchant_principal]
 
 _NOT_FOUND = HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="product not found")
+
+# Cache-outcome header on the single-product GET (see ``application.service.CacheOutcome``).
+# Listed in the app's CORS ``expose_headers`` (src/app.py) — browsers hide custom
+# response headers from page JS otherwise, which would defeat the whole header.
+PRODUCT_CACHE_HEADER = "X-Cache"
 
 # Every query param the listing understands; anything else is a 400 (see
 # ``shared/api/query.py``) rather than a silently unfiltered page.
@@ -122,11 +127,24 @@ async def list_products(
 async def get_product(
     product_id: uuid.UUID, service: CatalogServiceDep, _principal: PrincipalDep, response: Response
 ) -> ProductResponse:
-    """Fetch one live product, or 404. The response carries ``ETag: "<version>"``."""
-    product = await service.get_product(product_id)
+    """Fetch one live product, or 404. The response carries ``ETag: "<version>"``.
+
+    Also stamps ``X-Cache: hit | miss | bypass`` — whether the read was served
+    from the cache, drove the DB fill that (re)populated it, or the cache was
+    out of the loop (fault/degraded). Absent when caching is disabled. The 404
+    carries it too: the read that confirms an absent id is a miss, its
+    negative-cached repeat a hit.
+    """
+    cache_read = CacheRead()
+    product = await service.get_product(product_id, cache_read=cache_read)
+    cache_header = {PRODUCT_CACHE_HEADER: cache_read.outcome.value} if cache_read.outcome is not None else None
     if product is None:
-        raise _NOT_FOUND
+        # Same 404 as the other routes, but the cache outcome travels on it —
+        # HTTPException headers survive the Problem-Details mapping.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="product not found", headers=cache_header)
     set_etag(response, product)
+    if cache_header is not None:
+        response.headers.update(cache_header)
     return product
 
 

@@ -18,12 +18,18 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import httpx
 import pytest
 
+from src.app import create_app
 from src.catalog.adapters.cache_worker import make_invalidation_handler
-from src.catalog.application.service import CatalogService
+from src.catalog.application.service import CacheOutcome, CacheRead, CatalogService
 from src.catalog.domain.image_status import ImageStatus
 from src.catalog.ports.cache import MISS
+from src.shared.auth.dependencies import get_current_user
+from src.shared.auth.principal import Principal
+from src.shared.container import get_catalog_service
+from tests.unit.test_phase1_app import SETTINGS  # AppSettings with _env_file=None (avoids re-deriving it here)
 
 
 class FakeProductCache:
@@ -141,6 +147,153 @@ async def test_read_populates_cache_then_next_read_skips_db() -> None:
     second = await service.get_product(pid)
     assert second is not None and second.id == pid
     assert repo.get_calls == 1  # served from cache — no second DB hit
+
+
+# --- the cache read receipt (X-Cache) ----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_read_outcome_is_miss_on_fill_then_hit_from_cache() -> None:
+    """The route's ``X-Cache`` source of truth: a read that drives the DB fill is a
+    miss; the next read, served by the filled entry, is a hit."""
+    pid = uuid.uuid4()
+    cache = FakeProductCache()
+    repo = CountingRepo(_row(pid))
+    service = CatalogService(repo, cache=cache)
+
+    first_read, second_read = CacheRead(), CacheRead()
+    await service.get_product(pid, cache_read=first_read)
+    await service.get_product(pid, cache_read=second_read)
+
+    assert first_read.outcome is CacheOutcome.MISS
+    assert second_read.outcome is CacheOutcome.HIT
+
+
+@pytest.mark.asyncio
+async def test_read_outcome_stays_unset_when_caching_is_disabled() -> None:
+    """No cache configured (feature flag off / no Valkey) → the outcome is never
+    recorded, so the route omits the ``X-Cache`` header entirely instead of
+    claiming a hit/miss that never happened."""
+    pid = uuid.uuid4()
+    repo = CountingRepo(_row(pid))
+    service = CatalogService(repo)  # cache is None
+
+    read = CacheRead()
+    assert (await service.get_product(pid, cache_read=read)) is not None
+    assert read.outcome is None
+
+
+@pytest.mark.asyncio
+async def test_read_outcome_is_bypass_on_valkey_fault() -> None:
+    """A Valkey failure degrades to the DB (graceful degradation): the outcome must
+    say bypass, not miss — no fill happened, the cache was simply out of the loop."""
+
+    class BrokenCache(FakeProductCache):
+        async def get(self, product_id: uuid.UUID) -> str | None:
+            raise ConnectionError("valkey down")
+
+    pid = uuid.uuid4()
+    service = CatalogService(CountingRepo(_row(pid)), cache=BrokenCache())
+
+    read = CacheRead()
+    assert (await service.get_product(pid, cache_read=read)) is not None
+    assert read.outcome is CacheOutcome.BYPASS
+
+
+@pytest.mark.asyncio
+async def test_read_outcome_hit_for_negative_cached_404() -> None:
+    """A repeat read of an absent id is answered by the negative cache — a hit (the
+    tombstone served it), not a miss; the first read that confirmed the 404 is the miss."""
+    pid = uuid.uuid4()
+    cache = FakeProductCache()
+    repo = CountingRepo(None)
+    service = CatalogService(repo, cache=cache)
+
+    first_read, second_read = CacheRead(), CacheRead()
+    assert (await service.get_product(pid, cache_read=first_read)) is None
+    assert (await service.get_product(pid, cache_read=second_read)) is None
+
+    assert first_read.outcome is CacheOutcome.MISS
+    assert second_read.outcome is CacheOutcome.HIT
+    assert repo.get_calls == 1  # second read ran on the tombstone, not the DB
+
+
+@pytest.mark.asyncio
+async def test_read_outcome_waiters_served_by_the_fill_report_hit() -> None:
+    """Under a cold-key burst exactly one request drives the fill (miss) and the
+    rest are served the filled entry from the cache (hit) — the X-Cache spread
+    makes the single-filler lock visible to clients, not just the DB-read count."""
+    pid = uuid.uuid4()
+    cache = FakeProductCache()
+    repo = CountingRepo(_row(pid), delay=0.05)  # widen the race window like the stampede test
+    service = CatalogService(repo, cache=cache)
+
+    reads = [CacheRead() for _ in range(20)]
+    await asyncio.gather(*(service.get_product(pid, cache_read=read) for read in reads))
+
+    outcomes = [read.outcome for read in reads]
+    assert outcomes.count(CacheOutcome.MISS) == 1  # the single filler
+    assert outcomes.count(CacheOutcome.HIT) == 19  # everyone else: answered from the cache
+
+
+@pytest.mark.asyncio
+async def test_read_outcome_bypass_when_fill_wedges_past_deadline() -> None:
+    """A fill that wedges (renewals keep succeeding, value never lands) hits the
+    waiter deadline and serves from the DB itself: bypass — no fill was driven
+    (nothing stored, no lock ownership), the cache was merely in the way."""
+    pid = uuid.uuid4()
+    cache = FakeProductCache()
+    await cache.acquire_fill_lock(pid, "wedged-holder")  # an active lock that will never produce a value
+    repo = CountingRepo(_row(pid))
+    service = CatalogService(repo, cache=cache, max_fill_wait_seconds=0.15)
+
+    read = CacheRead()
+    assert (await service.get_product(pid, cache_read=read)) is not None
+    assert read.outcome is CacheOutcome.BYPASS
+    assert pid not in cache.data  # the deadline read stores nothing (no lock ownership)
+
+
+# --- the header on the wire (HTTP, deps overridden — no DB) ------------------
+
+
+async def test_product_get_stamps_x_cache_on_200_and_404():
+    """The route contract end to end: a live product's first read is a miss and the
+    next a hit; the 404 path carries the outcome too (first absent read: miss, its
+    negative-cached repeat: hit) — through the Problem Details handler, which must
+    forward HTTPException headers. Service and auth deps are overridden, so no DB."""
+    pid = uuid.uuid4()
+    app = create_app(SETTINGS)  # canonical isolated settings (tests.unit.test_phase1_app)
+
+    async def _principal() -> Principal:
+        return Principal(sub="tester", email=None, roles=frozenset({"consumer"}))
+
+    app.dependency_overrides[get_current_user] = _principal
+    # One service instance across requests — a per-request lambda would rebuild the
+    # (empty) cache each call and every read would be a miss.
+    live_service = CatalogService(CountingRepo(_row(pid)), cache=FakeProductCache())
+    app.dependency_overrides[get_catalog_service] = lambda: live_service
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        first = await client.get(f"/v1/products/{pid}")
+        assert first.status_code == 200
+        assert first.headers["X-Cache"] == "miss"
+
+        second = await client.get(f"/v1/products/{pid}")
+        assert second.status_code == 200
+        assert second.headers["X-Cache"] == "hit"
+
+    # A fresh absent id: the fill confirms the 404 (miss); the repeat is the tombstone (hit).
+    absent = uuid.uuid4()
+    absent_service = CatalogService(CountingRepo(None), cache=FakeProductCache())  # one instance, like live_service
+    app.dependency_overrides[get_catalog_service] = lambda: absent_service
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        not_found = await client.get(f"/v1/products/{absent}")
+        assert not_found.status_code == 404
+        assert not_found.headers["X-Cache"] == "miss"
+
+        not_found_again = await client.get(f"/v1/products/{absent}")
+        assert not_found_again.status_code == 404
+        assert not_found_again.headers["X-Cache"] == "hit"
 
 
 @pytest.mark.asyncio

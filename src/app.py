@@ -136,8 +136,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
         # Browsers hide custom response headers from JS unless listed here —
-        # without it the SPA can't read X-Request-ID to correlate rows with logs.
-        expose_headers=[REQUEST_ID_HEADER],
+        # without it the SPA can't read X-Request-ID to correlate rows with logs,
+        # or the catalog product GET's X-Cache (hit/miss/bypass) to show real
+        # cache behaviour instead of describing it.
+        expose_headers=[REQUEST_ID_HEADER, catalog_routes.PRODUCT_CACHE_HEADER],
     )
     app.add_middleware(
         SecurityHeadersMiddleware,
