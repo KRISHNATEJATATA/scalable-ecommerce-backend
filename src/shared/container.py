@@ -50,7 +50,7 @@ from src.orders.ports.checkout import (
 from src.orders.ports.repository import OrdersRepositoryPort
 from src.payments.adapters.db.repository import PaymentsRepository
 from src.payments.adapters.resilient_gateway import ResilientPaymentGateway
-from src.payments.adapters.stub_gateway import StubPaymentGateway
+from src.payments.adapters.stub_gateway import stub_gateway_from_settings
 from src.payments.application.service import PaymentsService
 from src.payments.ports.gateway import PaymentGatewayPort
 from src.payments.ports.repository import PaymentsRepositoryPort
@@ -378,9 +378,10 @@ def get_payment_gateway(request: Request) -> PaymentGatewayPort:
         settings = request.app.state.settings
         # The resilience shell (bounded retry + circuit breaker) wraps whatever
         # concrete gateway is configured, so a real provider drops in behind
-        # the same protection.
+        # the same protection. The shared Valkey client backs the stub's
+        # deferred-charge window when the dev/demo pending trigger is enabled.
         gateway = ResilientPaymentGateway(
-            StubPaymentGateway(settings.payment_stub_fail_token_substring),
+            stub_gateway_from_settings(settings, getattr(request.app.state, "valkey", None)),
             max_attempts=settings.resilience_max_attempts,
             base_delay_seconds=settings.resilience_retry_base_delay_seconds,
             max_delay_seconds=settings.resilience_retry_max_delay_seconds,

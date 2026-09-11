@@ -27,12 +27,14 @@ import logging
 import signal
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
+from valkey.asyncio import Valkey
 
 from src.payments.adapters.db.repository import PaymentsRepository
 from src.payments.adapters.resilient_gateway import ResilientPaymentGateway
-from src.payments.adapters.stub_gateway import StubPaymentGateway
+from src.payments.adapters.stub_gateway import stub_gateway_from_settings
 from src.payments.application.service import PaymentsService
 from src.payments.ports.gateway import PaymentGatewayPort
+from src.shared.clients import valkey_client
 from src.shared.config.setting import AppSettings, get_settings
 
 log = logging.getLogger(__name__)
@@ -96,14 +98,20 @@ async def run_reconciler(
     sessionmaker: async_sessionmaker,
     *,
     gateway: PaymentGatewayPort | None = None,
+    valkey: Valkey | None = None,
     stop: asyncio.Event | None = None,
     once: bool = False,
 ) -> int:
-    """Build a reconciler from settings and run it (one sweep with ``once=True``)."""
+    """Build a reconciler from settings and run it (one sweep with ``once=True``).
+
+    ``valkey`` backs the stub's deferred-charge window — the shared record that
+    lets this process resolve charges the API answered ``pending`` (the
+    dev/demo trigger). Required when that trigger is configured; ignored when
+    an explicit ``gateway`` is injected (tests)."""
     reconciler = PaymentReconciler(
         sessionmaker,
         ResilientPaymentGateway(
-            gateway or StubPaymentGateway(settings.payment_stub_fail_token_substring),
+            gateway if gateway is not None else stub_gateway_from_settings(settings, valkey),
             max_attempts=settings.resilience_max_attempts,
             base_delay_seconds=settings.resilience_retry_base_delay_seconds,
             max_delay_seconds=settings.resilience_retry_max_delay_seconds,
@@ -139,6 +147,11 @@ def main() -> None:  # pragma: no cover - process entrypoint
         serve_worker_metrics(settings, job="payment-reconciler")
     engine = create_engine(settings, worker=True)
     sessionmaker = create_sessionmaker(engine)
+    # The deferred-charge window (dev/demo pending trigger) is shared through
+    # Valkey — without it the reconciler could never resolve what the API
+    # answered "pending". redis-py connects lazily, so creating the client is
+    # free when the trigger is off.
+    valkey = valkey_client.create_client(settings)
     log.info(
         "payment reconciler starting (once=%s, grace=%ss)",
         args.once,
@@ -151,9 +164,10 @@ def main() -> None:  # pragma: no cover - process entrypoint
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, stop.set)
         try:
-            await run_reconciler(settings, sessionmaker, stop=stop, once=args.once)
+            await run_reconciler(settings, sessionmaker, valkey=valkey, stop=stop, once=args.once)
         finally:
             await engine.dispose()
+            await valkey.aclose()
 
     asyncio.run(_run())
     if args.once:

@@ -123,8 +123,9 @@ class CheckoutSaga:
         basket only when it still matches the order's lines (mop-up for a crash
         between the drive's clear and the replay record); a basket rebuilt
         after the checkout is never touched. Raises ``OrderStateConflictError``
-        (409) for an empty cart, a declined payment, a timed-out reservation,
-        or a replay of an already-cancelled checkout,
+        (409) for an empty cart, a declined payment, a payment still processing
+        (outcome unknown — the reconciler/recovery poller settle it), a
+        timed-out reservation, or a replay of an already-cancelled checkout,
         ``CheckoutIdempotencyConflictError`` (409) for same key + different
         body, and ``InsufficientStockError`` (409) when the shelves refuse.
         Every failure path compensates before raising — no half-state escapes
@@ -313,6 +314,16 @@ class CheckoutSaga:
                 await self._compensate(order_id, "charge")
                 raise OrderStateConflictError("checkout payment timed out; the order was cancelled") from None
             if not charge.succeeded:
+                if not charge.failed:
+                    # Still processing (the provider accepted the charge but
+                    # hasn't decided it): money may move the moment it settles,
+                    # so never unwind here. Same contract as the timeout arm
+                    # above — leave it pending for the reconciler/recovery
+                    # poller instead of cancelling a charge that may succeed.
+                    await self._log(order_id, "charge", "unknown")
+                    raise OrderStateConflictError(
+                        "payment outcome unknown; retry with the same Idempotency-Key to settle"
+                    )
                 await self._log(order_id, "charge", "failed")
                 await self._compensate(order_id, "charge")
                 raise OrderStateConflictError("payment was declined; the order was cancelled")

@@ -21,9 +21,11 @@ from sqlalchemy import text
 
 from src.events.registry import validate_event
 from src.payments.adapters.db.repository import PaymentsRepository
-from src.payments.adapters.stub_gateway import StubPaymentGateway
+from src.payments.adapters.stub_gateway import DeferredChargeWindow, StubPaymentGateway, stub_gateway_from_settings
 from src.payments.api.routes import MAX_WEBHOOK_BODY_BYTES, payment_webhook
 from src.payments.application.service import PaymentsService
+from src.payments.ports.gateway import GatewayOutcome
+from src.shared.config.setting import AppSettings
 from src.shared.errors.exception_handlers import _unknown_payment_ref_handler
 from src.shared.errors.exceptions import (
     AuthenticationError,
@@ -424,6 +426,115 @@ async def test_bounded_sweep_resolves_fresh_rows_while_abandoning_stale_ones(ses
     healthy_status, _ = await _status_of(session, healthy["idempotency_key"])
     assert healthy_status == "succeeded"
     assert sorted(await _outbox_types(session)) == ["PaymentFailed", "PaymentSucceeded"]
+
+
+# --- deferred settlement (dev/demo pending trigger) ---------------------------------
+
+
+def _pending_gateway(valkey, *, settle_seconds: int) -> StubPaymentGateway:
+    """The stub with the demo trigger on, over a shared (Valkey) window."""
+    return StubPaymentGateway(
+        "decline",
+        pending_token_substring="pending",
+        pending_settle_seconds=settle_seconds,
+        deferred_window=DeferredChargeWindow(valkey, settle_seconds=settle_seconds),
+    )
+
+
+async def test_pending_token_answers_processing_and_keeps_the_payment_pending(session, real_valkey):
+    """The demo trigger: the gateway accepts the charge but does not decide it,
+    so the payment row stays ``pending`` with no event shipped — the checkout
+    ends in the documented "outcome unknown" 409 and the workers take over."""
+    kwargs = _charge_kwargs(token="tok_pending_demo")
+    service = _service(session, gateway=_pending_gateway(real_valkey, settle_seconds=3600))
+
+    response = await service.charge(**kwargs)
+
+    assert response.status == "pending"
+    status, _ = await _status_of(session, kwargs["idempotency_key"])
+    assert status == "pending"
+    assert await _outbox_types(session) == []
+
+
+async def test_reconciliation_resolves_a_deferred_charge_from_another_process(session, real_valkey):
+    """The recovery story's engine: the reconciler runs in its OWN process with
+    its OWN stub map — the shared Valkey window is what lets its ``lookup``
+    resolve a charge the API deferred."""
+    kwargs = _charge_kwargs(token="tok_pending_demo")
+    await _service(session, gateway=_pending_gateway(real_valkey, settle_seconds=0)).charge(**kwargs)
+    await _backdate_pending(session, kwargs["idempotency_key"])  # past the grace window
+
+    reconciler_side = _pending_gateway(real_valkey, settle_seconds=0)  # fresh instance, shared window
+    resolved = await _service(session, gateway=reconciler_side).reconcile(batch_size=10)
+
+    assert resolved == 1
+    status, _ = await _status_of(session, kwargs["idempotency_key"])
+    assert status == "succeeded"
+    assert await _outbox_types(session) == ["PaymentSucceeded"]
+
+
+async def test_a_deferred_charge_replays_one_answer_and_one_ref_across_instances(real_valkey):
+    """Provider dedup for deferred charges: every replay — including through a
+    different stub instance sharing the window — returns the same ref, pending
+    until the settle deadline."""
+    key = f"checkout-{uuid.uuid4()}"
+
+    async def deferred_charge(gateway: StubPaymentGateway):
+        return await gateway.charge(
+            amount=Decimal("42.50"), idempotency_key=key, payment_method_token="tok_pending_demo"
+        )
+
+    gateway = _pending_gateway(real_valkey, settle_seconds=3600)
+    first = await deferred_charge(gateway)
+    replay = await deferred_charge(gateway)
+    from_other_instance = await deferred_charge(_pending_gateway(real_valkey, settle_seconds=3600))
+
+    assert first.outcome == GatewayOutcome.PENDING
+    assert replay.ref == first.ref
+    assert from_other_instance.ref == first.ref  # cross-process dedup via the shared window
+    lookup = await gateway.lookup(key)
+    assert lookup is not None and lookup.outcome == GatewayOutcome.PENDING
+
+
+async def test_decline_wins_over_the_pending_trigger(session, real_valkey):
+    """A token carrying both substrings declines: the failure knob keeps
+    precedence, so the decline demo is never swallowed by the deferral."""
+    kwargs = _charge_kwargs(token="tok_pending_decline")
+    service = _service(session, gateway=_pending_gateway(real_valkey, settle_seconds=0))
+
+    response = await service.charge(**kwargs)
+
+    assert response.status == "failed"
+
+
+def test_stub_factory_wires_the_pending_trigger_only_when_configured():
+    """Default settings build the plain stub; the trigger needs the shared
+    window, so configuring it without a Valkey client is refused loudly."""
+    settings = AppSettings(
+        _env_file=None, database_url="postgresql+asyncpg://u:p@localhost:5432/db", environment="local"
+    )
+    assert stub_gateway_from_settings(settings)._deferred is None
+
+    triggered = AppSettings(
+        _env_file=None,
+        database_url="postgresql+asyncpg://u:p@localhost:5432/db",
+        environment="local",
+        payment_stub_pending_token_substring="tok_pending",
+    )
+    with pytest.raises(RuntimeError, match="Valkey"):
+        stub_gateway_from_settings(triggered, valkey=None)
+
+
+@pytest.mark.parametrize("env", ["staging", "prod"])
+def test_pending_trigger_is_refused_outside_dev(env):
+    """The demo trigger must be impossible to enable where real checkouts run."""
+    with pytest.raises(ValueError, match="payment_stub_pending_token_substring"):
+        AppSettings(
+            _env_file=None,
+            database_url="postgresql+asyncpg://u:p@localhost:5432/db",
+            environment=env,
+            payment_stub_pending_token_substring="tok_pending",
+        )
 
 
 # --- webhook body cap (route-level) --------------------------------------------------

@@ -297,7 +297,14 @@ class PaymentsService:
     async def _apply_outcome(
         self, payment_id: uuid.UUID, *, outcome: str, gateway_ref: str | None, failure_reason: str | None
     ) -> Any | None:
-        """One guarded flip + its outbox row; ``None`` when the payment was already final."""
+        """One guarded flip + its outbox row; ``None`` when no transition landed.
+
+        ``None`` covers both "already final" and a ``pending`` (processing)
+        answer: the provider accepted the charge but hasn't decided it, so
+        there is nothing to flip and no event to ship — the row stays
+        ``pending`` for the reconciliation poller."""
+        if outcome == GatewayOutcome.PENDING:
+            return None
         if outcome == GatewayOutcome.SUCCEEDED:
             return await self._repo.transition(
                 payment_id,

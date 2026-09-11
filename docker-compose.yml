@@ -33,6 +33,9 @@ services:
       KEYCLOAK_ADMIN_CLIENT_SECRET: change-me-local-only
       CORS_ALLOW_ORIGINS: '["http://localhost:3000"]'
       PAYMENT_STUB_FAIL_TOKEN_SUBSTRING: decline
+      # Demo trigger: tok_pending answers "processing" and settles later, so a
+      # checkout can leave a pending order the workers settle (crash recovery).
+      PAYMENT_STUB_PENDING_TOKEN_SUBSTRING: tok_pending
       PAYMENT_WEBHOOK_SECRET: dev-webhook-secret-change-me
       PAYMENT_RECONCILIATION_GRACE_SECONDS: "30"
     depends_on:
@@ -323,11 +326,17 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      valkey:
+        condition: service_healthy
       migrate:
         condition: service_completed_successfully
     environment:
       DATABASE_URL: postgresql+asyncpg://ecommerce:ecommerce@postgres:5432/ecommerce
+      VALKEY_URL: redis://valkey:6379/0
       PAYMENT_STUB_FAIL_TOKEN_SUBSTRING: decline
+      # Same demo trigger as the app: the reconciler's lookup must see the
+      # deferred charges the API answered "pending" (shared Valkey window).
+      PAYMENT_STUB_PENDING_TOKEN_SUBSTRING: tok_pending
       PAYMENT_RECONCILIATION_GRACE_SECONDS: "30"
       PAYMENT_RECONCILIATION_POLL_INTERVAL_SECONDS: "60"
       PAYMENT_RECONCILIATION_BATCH_SIZE: "50"

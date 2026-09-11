@@ -127,6 +127,17 @@ class AppSettings(BaseSettings):
     # Tokens containing this substring decline — the stub's only failure knob,
     # enough to drive both event paths end to end.
     payment_stub_fail_token_substring: str = "decline"
+    # Dev/demo only: tokens containing this substring make the stub answer
+    # ``pending`` (processing) and settle on the gateway side after
+    # ``payment_stub_pending_settle_seconds``, so a checkout can leave a real
+    # ``pending`` order for the recovery poller to settle — the crash-recovery
+    # demonstration. Empty = disabled (the default).
+    # Refused at startup outside local/dev (enforced below).
+    payment_stub_pending_token_substring: str = ""
+    # How long a deferred (pending-answered) charge takes to resolve on the
+    # stub gateway's side. The payment reconciler picks it up on its next pass
+    # after ``payment_reconciliation_grace_seconds``.
+    payment_stub_pending_settle_seconds: int = Field(default=5, gt=0)
     # HMAC-SHA256 secret verifying gateway webhook bodies
     # (``X-Payment-Signature: sha256=<hex>``). Unset → webhooks are refused
     # (fail closed), never processed unsigned.
@@ -422,6 +433,22 @@ class AppSettings(BaseSettings):
             raise ValueError(
                 "verbose_error_details is only allowed with environment local/dev: "
                 f"raw 5xx detail would leak internals ({self.environment})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _refuse_pending_trigger_outside_dev(self) -> "AppSettings":
+        """Fail-fast: the stub's deferred-settlement trigger is a demo device.
+
+        A ``pending``-answering gateway leaves real orders unsettled for the
+        workers — exactly what a crash-recovery demonstration wants and a live
+        environment must never get by accident. Refuse the config at startup
+        instead of trusting the operator to keep the token unset in prod.
+        """
+        if self.payment_stub_pending_token_substring and self.environment not in ("local", "dev"):
+            raise ValueError(
+                "payment_stub_pending_token_substring is only allowed with environment local/dev: "
+                "the deferred-settlement demo trigger must never be enabled where real checkouts run"
             )
         return self
 

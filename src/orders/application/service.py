@@ -104,13 +104,14 @@ class OrdersService:
             return OrderResponse.model_validate(to_domain(row))
         if row.status != OrderStatus.PENDING:
             raise OrderStateConflictError(f"only pending orders can be cancelled (order is {row.status})")
-        # A charge may be in flight or already landed (a crashed drive leaves
-        # the journal row behind, a live one writes ``started`` before the
-        # gateway call): cancelling now could take money without an order.
-        # Those orders belong to the recovery poller/reconciler; the caller
-        # retries once the outcome settles.
+        # A charge may be in flight, already landed, or undecided (``unknown``:
+        # a timed-out or still-processing charge the gateway may confirm the
+        # moment later — a crashed drive leaves the journal row behind, a live
+        # one writes ``started`` before the gateway call): cancelling now could
+        # take money without an order. Those orders belong to the recovery
+        # poller/reconciler; the caller retries once the outcome settles.
         charge_state = await self._repo.latest_saga_step(order_id, "charge")
-        if charge_state in ("started", "completed"):
+        if charge_state in ("started", "completed", "unknown"):
             raise OrderStateConflictError("payment for this order is in progress; try again once it settles")
         updated = await self._repo.transition_status(
             order_id, expect=[OrderStatus.PENDING], to_status=OrderStatus.CANCELLED

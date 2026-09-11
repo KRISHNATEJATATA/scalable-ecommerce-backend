@@ -31,7 +31,7 @@ from src.orders.application.service import OrdersService
 from src.orders.domain.order import OrderStatus
 from src.orders.ports.checkout import CheckoutLine
 from src.payments.adapters.db.repository import PaymentsRepository
-from src.payments.adapters.stub_gateway import StubPaymentGateway
+from src.payments.adapters.stub_gateway import DeferredChargeWindow, StubPaymentGateway
 from src.payments.application.service import PaymentsService
 from src.shared.container import OrderCharges, OrderStockHolds
 from src.shared.errors.exceptions import (
@@ -632,6 +632,35 @@ async def test_charge_timeout_with_pending_payment_leaves_pending_not_cancelled(
     assert await _stock(session, str(line.product_id)) == (5, 1)  # hold kept, not released
 
 
+async def test_processing_payment_leaves_pending_without_compensating(session, real_valkey):
+    """the stub accepts the charge but answers ``pending``
+    (processing). The saga must refuse to unwind — the gateway may still settle
+    it — so the order stays pending with its holds, exactly like the timeout
+    arm: the reconciler/recovery poller own it from here."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    gateway = StubPaymentGateway(
+        "decline",
+        pending_token_substring="pending",
+        pending_settle_seconds=3600,  # undecided for the whole test
+        deferred_window=DeferredChargeWindow(real_valkey, settle_seconds=3600),
+    )
+    saga = _saga(session, basket, gateway=gateway)
+
+    try:
+        await saga.checkout(user_id=USER_A, idempotency_key="key-processing", payment_token="tok_pending_demo")
+    except OrderStateConflictError as exc:
+        assert "outcome unknown" in exc.detail
+    else:
+        raise AssertionError("expected OrderStateConflictError")
+
+    order_id = (await session.execute(text("SELECT id FROM orders.orders"))).scalar_one()
+    assert await _order_status(session, order_id) == "pending"  # not cancelled
+    assert await _stock(session, str(line.product_id)) == (5, 1)  # hold kept, not released
+
+
 async def test_failure_after_payment_never_compensates(session):
     """Once money moved, even a later step failure leaves the order pending for
     recovery — unwinding would take payment without an order."""
@@ -978,7 +1007,101 @@ async def test_recovery_defers_while_payment_is_pending(session):
     assert await _order_status(session, order.id) == "pending"
 
 
-# --- ownership (13.1: orders half) ------------------------------------------
+async def test_bcr_002_deferred_charge_settles_to_paid_via_the_workers(session, real_valkey):
+    """a checkout with the pending
+    trigger ends 409 with a real pending order; a reconciler pass (fresh stub
+    instance, shared window) resolves the deferred charge; the recovery pass
+    settles the order paid — no manual intervention anywhere."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+
+    def _gateway() -> StubPaymentGateway:
+        # settle_seconds=0: the charge still ANSWERS pending (the answer is
+        # decided at return time), while the shared window resolves at once —
+        # the same order of events as a short settle delay, without waiting.
+        return StubPaymentGateway(
+            "decline",
+            pending_token_substring="pending",
+            pending_settle_seconds=0,
+            deferred_window=DeferredChargeWindow(real_valkey, settle_seconds=0),
+        )
+
+    saga = _saga(session, basket, gateway=_gateway())
+    try:
+        await saga.checkout(user_id=USER_A, idempotency_key="key-bcr002", payment_token="tok_pending_demo")
+    except OrderStateConflictError as exc:
+        assert "outcome unknown" in exc.detail
+    else:
+        raise AssertionError("expected OrderStateConflictError")
+    order_id = (await session.execute(text("SELECT id FROM orders.orders"))).scalar_one()
+    assert await _order_status(session, order_id) == "pending"
+
+    # Reconciler pass: age the payment past the grace window, then a fresh
+    # PaymentsService over a fresh stub (the worker's own map) resolves it.
+    past = datetime.now(UTC) - timedelta(seconds=120)
+    await session.execute(text("UPDATE payments.payments SET created_at = :past, updated_at = :past"), {"past": past})
+    await session.commit()
+    payments = PaymentsService(
+        PaymentsRepository(session),
+        _gateway(),
+        webhook_secret="test-secret",
+        reconciliation_grace_seconds=30,
+        reconciliation_max_age_seconds=604800,
+    )
+    assert await payments.reconcile(batch_size=10) == 1
+    status = (await session.execute(text("SELECT status FROM payments.payments"))).scalar_one()
+    assert status == "succeeded"
+
+    # Recovery pass: the now-succeeded payment settles the order paid, like a
+    # crashed-after-payment checkout.
+    await _backdate_pending(session, order_id)
+    outcome = await saga.recover_stuck(cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50)
+    assert outcome == {"completed": 1, "compensated": 0, "deferred": 0}
+    assert await _order_status(session, order_id) == "paid"
+    assert await _stock(session, str(line.product_id)) == (4, 0)
+    assert await _orders_outbox(session) == ["OrderPlaced"]
+    assert basket.cleared == [USER_A]  # the demo basket cleared like a live checkout
+
+
+async def test_bcr_002_retry_with_the_same_key_settles_the_deferred_charge(session, real_valkey):
+    """The other documented settling path: retrying the checkout with the same
+    Idempotency-Key after the deferred charge resolved drives the saga home —
+    the gateway replays its one (succeeded) answer, no workers needed."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    gateway = StubPaymentGateway(
+        "decline",
+        pending_token_substring="pending",
+        pending_settle_seconds=0,  # answers pending, resolves immediately
+        deferred_window=DeferredChargeWindow(real_valkey, settle_seconds=0),
+    )
+    saga = _saga(session, basket, gateway=gateway)
+    try:
+        await saga.checkout(user_id=USER_A, idempotency_key="key-retry-settle", payment_token="tok_pending_demo")
+    except OrderStateConflictError as exc:
+        assert "outcome unknown" in exc.detail
+    else:
+        raise AssertionError("expected OrderStateConflictError")
+    order_id = (await session.execute(text("SELECT id FROM orders.orders"))).scalar_one()
+    assert await _order_status(session, order_id) == "pending"
+
+    response, created = await saga.checkout(
+        user_id=USER_A, idempotency_key="key-retry-settle", payment_token="tok_pending_demo"
+    )
+
+    assert created is False  # the row pre-existed; this call drove it home
+    assert response.status == OrderStatus.PAID
+    assert await _order_status(session, order_id) == "paid"
+    assert await _stock(session, str(line.product_id)) == (4, 0)  # one hold, committed once
+    assert await _orders_outbox(session) == ["OrderPlaced"]
+    assert basket.cleared == [USER_A]
+
+
+# --- ownership (orders half) ------------------------------------------
 
 
 async def test_consumer_cannot_read_another_users_order(session):

@@ -23,15 +23,22 @@ class GatewayCharge:
     """One gateway-side charge outcome. ``ref`` is the provider's own reference."""
 
     ref: str
-    outcome: str  # ``GatewayOutcome.succeeded`` | ``GatewayOutcome.failed``
+    outcome: str  # ``GatewayOutcome.succeeded`` | ``GatewayOutcome.failed`` | ``GatewayOutcome.pending``
     reason: str | None = None
 
 
 class GatewayOutcome:
-    """The outcome vocabulary of :class:`GatewayCharge` (plain constants: wire-shaped)."""
+    """The outcome vocabulary of :class:`GatewayCharge` (plain constants: wire-shaped).
+
+    ``pending`` is a real provider's "processing" answer: the charge is
+    accepted but not yet decided, so the caller must not treat it as either
+    terminal outcome — the payment row stays ``pending`` and the reconciliation
+    poller asks :meth:`PaymentGatewayPort.lookup` until the provider resolves.
+    """
 
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    PENDING = "pending"
 
 
 class PaymentGatewayPort(Protocol):
