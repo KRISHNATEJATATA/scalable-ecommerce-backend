@@ -3,7 +3,7 @@
 One-shot bootstrap in the ``bus_bootstrap``/``s3_bootstrap`` mold (``python -m
 scripts.catalog_seed``), exposed as a compose one-shot under ``profiles: ["seed"]``
 so a normal ``compose up`` never runs it. Replaces the frontend's one-off seed
-scripts: 4 Keycloak demo users, 11 products split across two merchants (5 + 6),
+scripts: 5 Keycloak demo users, 11 products split across two merchants (5 + 6),
 each with a real image through the pipeline, and stock declared per product
 (9 X 25, one sold-out, one low).
 
@@ -33,7 +33,7 @@ Every mechanism here is first-class — the same ones the app itself uses:
 Ordering: users → anchors → products → images → stock. On ``--reset`` every
 live product is soft-deleted through the domain service first (each emits
 ``ProductDeleted`` so the cache/cart consumers invalidate downstream state),
-then the four Keycloak users are deleted — DB-side wipe before user deletion
+then the five Keycloak users are deleted — DB-side wipe before user deletion
 is the crash-convergence guarantee: an interrupted reset leaves at worst
 orphaned Keycloak accounts without local products, which are harmless, and the
 next seed re-creates users (fresh subs → fresh anchors) and products keyed off
@@ -78,15 +78,21 @@ log = logging.getLogger("catalog_seed")
 
 SEED_ASSETS_DIR = Path(__file__).parent / "seed_assets" / "products"
 
-# (username, email, role, password, first name, last name)
+# (username, email, role, password, first name, last name, provision_disabled)
 # First/last names are load-bearing: the realm's user profile requires them, and
 # a user failing profile validation gets VERIFY_PROFILE resolved at login — every
 # direct grant would answer "Account is not fully set up".
-USERS: list[tuple[str, str, str, str, str, str]] = [
-    ("demo.consumer", "demo.consumer@example.com", "consumer", "DemoConsumer123!", "Demo", "Consumer"),
-    ("demo.merchant", "demo.merchant@example.com", "merchant", "DemoMerchant123!", "Mona", "Tailor"),
-    ("demo.merchant2", "demo.merchant2@example.com", "merchant", "DemoMerchant123!", "Iris", "Knit"),
-    ("demo.admin", "demo.admin@example.com", "admin", "DemoAdmin123!", "Ada", "Admin"),
+# ``demo.suspended`` is a Keycloak-ENABLED account whose local mirror is
+# provisioned already disabled — the exact state an admin disable leaves behind
+# (see IdentityAdminService.disable_user), so sign-in works, the token verifies,
+# and the first ``/v1/me`` answer is the real 403 "account disabled" the client
+# maps to the suspended experience. No app code knows this account exists.
+USERS: list[tuple[str, str, str, str, str, str, bool]] = [
+    ("demo.consumer", "demo.consumer@example.com", "consumer", "DemoConsumer123!", "Demo", "Consumer", False),
+    ("demo.merchant", "demo.merchant@example.com", "merchant", "DemoMerchant123!", "Mona", "Tailor", False),
+    ("demo.merchant2", "demo.merchant2@example.com", "merchant", "DemoMerchant123!", "Iris", "Knit", False),
+    ("demo.admin", "demo.admin@example.com", "admin", "DemoAdmin123!", "Ada", "Admin", False),
+    ("demo.suspended", "demo.suspended@example.com", "consumer", "DemoSuspended123!", "Sami", "Suspend", True),
 ]
 
 # (name, category, price, description, image filename, stock)
@@ -261,16 +267,26 @@ async def wait_for_keycloak(settings: AppSettings) -> None:
 # --- Local anchors: the same JIT-provisioning statement the app runs ------------
 
 
-async def ensure_anchor(sessionmaker: Any, sub: str, email: str) -> Any:
+async def ensure_anchor(sessionmaker: Any, sub: str, email: str, *, provision_disabled: bool = False) -> Any:
     """Provision (or fetch) the local ``identity.users`` mirror for a demo account.
 
     Products anchor ``merchant_id`` to this row's id — the anchor JIT provisioning
     would give the account on its first authenticated request. The row insert (on
     first sight) carries a real ``UserCreated`` outbox event, like any JIT row.
+
+    ``provision_disabled=True`` mirrors what an admin disable provisions: the row
+    lands **already disabled** (no outbox — a row created only to carry the
+    disable), exactly the ``IdentityAdminService.disable_user`` shape, so the
+    account really is disabled locally and the real 403 fires on first request.
+    Idempotent across re-runs: a re-seed of an existing disabled row keeps it
+    (the conflict set of a normal ``get_or_create`` never flips ``is_active``).
     """
     async with sessionmaker() as session:
         repo = IdentityRepository(session)
-        row = await repo.get_or_create(sub, email, user_created_outbox)
+        if provision_disabled:
+            row = await repo.get_or_create(sub, email, None, is_active=False)
+        else:
+            row = await repo.get_or_create(sub, email, user_created_outbox)
         return row.id
 
 
@@ -429,7 +445,7 @@ async def run(reset: bool) -> None:
             # off them, converging with no duplicates.
             wiped = await wipe_products(sessionmaker, settings)
             log.info("reset: soft-deleted %d product(s)", wiped)
-            for username, _email, _role, _password, _first, _last in USERS:
+            for username, _email, _role, _password, _first, _last, *_disabled in USERS:
                 sub = await admin.find_sub_by_username(username)
                 if sub is not None:
                     await admin.delete_user(sub)
@@ -437,9 +453,11 @@ async def run(reset: bool) -> None:
 
         subs: dict[str, str] = {}
         anchors: dict[str, Any] = {}
-        for username, email, role, password, first_name, last_name in USERS:
-            subs[username] = await ensure_user(admin, username, email, role, password, first_name, last_name)
-            anchors[username] = await ensure_anchor(sessionmaker, subs[username], email)
+        for username, email, _role, _password, first_name, last_name, provision_disabled in USERS:
+            subs[username] = await ensure_user(admin, username, email, _role, _password, first_name, last_name)
+            anchors[username] = await ensure_anchor(
+                sessionmaker, subs[username], email, provision_disabled=provision_disabled
+            )
 
         merchant1 = anchors["demo.merchant"]
         merchant2 = anchors["demo.merchant2"]

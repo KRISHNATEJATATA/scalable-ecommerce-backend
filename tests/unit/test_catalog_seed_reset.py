@@ -25,7 +25,7 @@ def _install_fakes(monkeypatch: Any, events: list[str]) -> None:
         """Keycloak stand-in: demo users start existing; delete/create are recorded."""
 
         def __init__(self, settings: Any) -> None:
-            self._users = {username: f"sub-{username}" for username, *_ in seed.USERS}
+            self._users = {username: f"sub-{username}" for username, *_rest in seed.USERS}
 
         async def find_sub_by_username(self, username: str) -> str | None:
             return self._users.get(username)
@@ -53,7 +53,10 @@ def _install_fakes(monkeypatch: Any, events: list[str]) -> None:
         events.append("wipe")
         return len(seed.PRODUCTS)
 
-    async def _fake_ensure_anchor(sessionmaker: Any, sub: str, email: str) -> str:
+    async def _fake_ensure_anchor(sessionmaker: Any, sub: str, email: str, *, provision_disabled: bool = False) -> str:
+        # Recorded per sub: the BCR-005 wiring passes is_active=False ONLY for the
+        # suspended demo account — every other anchor is a normal JIT-provision row.
+        events.append(f"anchor:{sub}:{int(provision_disabled)}")
         return f"anchor-{sub}"  # distinct per sub; satisfies the same-anchor guard
 
     async def _fake_ensure_product(
@@ -107,3 +110,52 @@ async def test_plain_seed_never_wipes_or_deletes(monkeypatch: Any) -> None:
     assert "wipe" not in events
     assert not [e for e in events if e.startswith("delete:")]
     assert not [e for e in events if e.startswith("create:")]  # users already exist → idempotent
+
+
+def _anchor_flags(events: list[str]) -> dict[str, int]:
+    """username → provision_disabled flag, from the recorded anchor events.
+
+    Strips both the pre-existing sub prefix (``sub-``) and the post-reset
+    re-created one (``new-``) so the same helper reads a plain seed and a
+    reset round trip.
+    """
+    flags: dict[str, int] = {}
+    for event in events:
+        if event.startswith("anchor:"):
+            _prefix, sub, flag = event.split(":")
+            flags[sub.removeprefix("sub-").removeprefix("new-")] = int(flag)
+    return flags
+
+
+async def test_suspended_demo_anchor_is_provisioned_disabled(monkeypatch: Any) -> None:
+    """BCR-005: only demo.suspended's mirror lands already disabled (is_active=False,
+    the admin-disable shape); every other demo anchor is a normal active row."""
+    events: list[str] = []
+    _install_fakes(monkeypatch, events)
+
+    await seed.run(reset=False)
+
+    flags = _anchor_flags(events)
+    assert flags["demo.suspended"] == 1, "the suspended demo must provision its mirror disabled"
+    enabled = {username: flag for username, flag in flags.items() if username != "demo.suspended"}
+    assert enabled and all(flag == 0 for flag in enabled.values()), (
+        "no other demo account may be seeded disabled — the real refusal stays untouched"
+    )
+    # All seeded users are anchored exactly once (fresh run: subs come back sub-<username>).
+    assert len(flags) == len(seed.USERS)
+
+
+async def test_suspended_demo_survives_reset_round_trip(monkeypatch: Any) -> None:
+    """--reset re-creates every user (fresh sub → fresh anchor); the suspended
+    flag must survive the round trip — the reset loop unpacks USERS too."""
+    events: list[str] = []
+    _install_fakes(monkeypatch, events)
+
+    await seed.run(reset=True)
+
+    flags = _anchor_flags(events)
+    # After reset, subs are re-created → sub-<username> again via the fake's new-sub mint.
+    assert flags["demo.suspended"] == 1
+    assert all(flag == 0 for username, flag in flags.items() if username != "demo.suspended"), (
+        "reset must not silently flip the other demo accounts' enablement"
+    )

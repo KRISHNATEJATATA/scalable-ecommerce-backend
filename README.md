@@ -59,9 +59,10 @@ make compose-up               # Postgres + Valkey + LocalStack (S3/SNS/SQS) + El
                               # + one-shot migrate/bus-setup/s3-setup
                               # + app + relay + image-worker + cache-worker + cart-consumer
                               # + reaper + payment-reconciler + saga-recovery
-make seed                     # demo state: 4 users, 11 products (5+6 across two
+make seed                     # demo state: 5 users, 11 products (5+6 across two
                               # merchants) with images + stock (9x25, one sold-out, one low).
                               # Idempotent; `make seed-reset` wipes + re-seeds (fresh user subs)
+                              # demo.suspended signs in but is refused 403 on /v1/me
 make run                      # uvicorn main:app --reload
 make lint                     # ruff check + ruff format --check + import-linter
 make test                     # pytest tests/unit/ (coverage reported, not gated)
@@ -100,4 +101,8 @@ has a local default. See [`.env.example`](.env.example) for the full list.
 (a kill switch for shared/staging databases — the compose service sets `1`, and
 `.env.example` ships `1`). Demo accounts (usernames `demo.consumer`,
 `demo.merchant`, `demo.merchant2`, `demo.admin`) are created via the Keycloak
-Admin API with known passwords — dev/local only.
+Admin API with known passwords — dev/local only. A fifth account,
+`demo.suspended` (BCR-005), is **enabled in Keycloak but disabled in the local
+mirror** — the same state an admin disable leaves — so it signs in and is then
+refused `403` on `/v1/me`: the suspended-account edge case, reachable with no
+manual intervention.
