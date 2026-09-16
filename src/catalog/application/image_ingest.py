@@ -17,6 +17,7 @@ repo/store/dedup ports, so it needs neither libmagic nor S3).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import uuid
 from collections.abc import Mapping
@@ -46,6 +47,16 @@ from src.shared.db.outbox import OutboxMessage
 log = logging.getLogger(__name__)
 
 _WEBP = "image/webp"
+
+
+def _token_tag(token: str) -> str:
+    """Correlation-safe stand-in for an upload token in log lines: a truncated
+    SHA-256 of the value. The presigned-upload token is a secret; the
+    ``RedactFilter`` scrubs by *word*, not by hex shape, so the raw value would
+    sail through to INFO logs (and DEBUG is no fix — it gets enabled in prod
+    incidents). Same stale-event lines stay joinable via the hash, with no
+    token exposure."""
+    return "sha256:" + hashlib.sha256(token.encode()).hexdigest()[:12]
 
 
 class DedupStore(Protocol):
@@ -175,7 +186,7 @@ class ImageIngestService:
 
         flip = await self._repo.mark_image_ready(product_id, token, main_key, outbox=_image_outbox)
         if not flip.applied:  # a newer upload superseded this one between download and write
-            log.info("product %s image %s superseded (stale event)", product_id, token)
+            log.info("product %s image %s superseded (stale event)", product_id, _token_tag(token))
             # Queue the cleanup *before* the dedup marker. The marker is what makes a
             # redelivery a no-op, so remembering first would turn a failed enqueue
             # into a permanent leak: SQS would redeliver, dedup would ack instantly,
@@ -195,7 +206,7 @@ class ImageIngestService:
         failed = await self._repo.mark_image_failed(product_id, token, outbox=_image_outbox)
         await self._remember(dedup_key)
         if not failed:  # token no longer current → a newer upload superseded this reject
-            log.info("product %s failed-upload %s superseded (stale event)", product_id, token)
+            log.info("product %s failed-upload %s superseded (stale event)", product_id, _token_tag(token))
             return IngestOutcome.STALE
         return IngestOutcome.FAILED
 

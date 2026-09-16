@@ -52,6 +52,7 @@ class PaymentReconciler:
         grace_seconds: int,
         max_age_seconds: int,
         webhook_secret: str | None = None,
+        webhook_tolerance_seconds: int | None = None,
     ) -> None:
         self._sessionmaker = sessionmaker
         self._gateway = gateway
@@ -59,6 +60,7 @@ class PaymentReconciler:
         self._grace_seconds = grace_seconds
         self._max_age_seconds = max_age_seconds
         self._webhook_secret = webhook_secret
+        self._webhook_tolerance_seconds = webhook_tolerance_seconds
 
     async def sweep_once(self) -> int:
         """One batch: resolve stuck pendings against the gateway; return how many."""
@@ -67,6 +69,7 @@ class PaymentReconciler:
                 PaymentsRepository(session),
                 self._gateway,
                 webhook_secret=self._webhook_secret,
+                webhook_tolerance_seconds=self._webhook_tolerance_seconds,
                 reconciliation_grace_seconds=self._grace_seconds,
                 reconciliation_max_age_seconds=self._max_age_seconds,
             )
@@ -122,6 +125,7 @@ async def run_reconciler(
         grace_seconds=settings.payment_reconciliation_grace_seconds,
         max_age_seconds=settings.payment_reconciliation_max_age_seconds,
         webhook_secret=settings.payment_webhook_secret,
+        webhook_tolerance_seconds=settings.payment_webhook_tolerance_seconds,
     )
     if once:
         return await reconciler.sweep_once()

@@ -216,7 +216,12 @@ class OrderStockHolds(StockHoldsPort):
         return await self._inventory.release_for_order(order_id)
 
     async def commit_for_order(self, order_id: uuid.UUID) -> int:
-        """Consume every still-held reservation of one order (success)."""
+        """Consume every still-held reservation of one order (success).
+
+        Returns the order's committed total after the call — the retry-safe
+        end-state the saga's paid-implies-consumed invariant checks against,
+        not the per-call row count.
+        """
         return await self._inventory.commit_for_order(order_id)
 
 
@@ -402,6 +407,7 @@ def get_payments_service(
         repo,
         get_payment_gateway(request),
         webhook_secret=settings.payment_webhook_secret,
+        webhook_tolerance_seconds=settings.payment_webhook_tolerance_seconds,
         reconciliation_grace_seconds=settings.payment_reconciliation_grace_seconds,
         reconciliation_max_age_seconds=settings.payment_reconciliation_max_age_seconds,
     )

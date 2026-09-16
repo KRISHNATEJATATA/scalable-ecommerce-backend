@@ -5,16 +5,20 @@ matching ``test_phase1_app.py``.
 """
 
 import logging
+import re
 
 import httpx
 import pytest
 from pydantic import ValidationError
+from starlette.requests import Request
+from starlette.responses import Response
 
 from src.app import create_app
 from src.shared.config.logging import RedactFilter
 from src.shared.config.setting import AppSettings
 from src.shared.errors.error_builder import build_problem
 from src.shared.errors.exception_handlers import _status_reason
+from src.shared.middleware.security import REQUEST_ID_HEADER, RequestIDMiddleware
 
 SETTINGS = AppSettings(_env_file=None, database_url="postgresql+asyncpg://u:p@localhost:5432/db")
 
@@ -218,6 +222,46 @@ async def test_5xx_trace_id_matches_client_supplied_request_id():
         resp = await client.get("/_test/boom", headers={"X-Request-ID": "client-trace-42"})
     assert resp.headers["X-Request-ID"] == "client-trace-42"
     assert resp.json()["trace_id"] == "client-trace-42"
+
+
+def _mw_request(headers: dict[str, str]) -> Request:
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/",
+        "query_string": b"",
+        "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+    }
+    return Request(scope)
+
+
+async def _mw_call_next(request: Request) -> Response:
+    return Response(b"ok")
+
+
+async def test_a_malformed_client_request_id_is_discarded_not_echoed():
+    """Ids past 64 chars, or with an unsafe charset (log injection / memory
+    surface), are replaced by a fresh uuid hex — never truncated-and-echoed,
+    which would break log correlation."""
+    middleware = RequestIDMiddleware(lambda app: None)  # dispatch is standalone-testable
+    for bad in (
+        "x" * 65,  # too long
+        "bad id!",  # space + punctuation
+        "id\r\nX-Injected: 1",  # header/log injection attempt
+        "id\x00null",  # control byte
+        "café-ünïcode",  # non-ASCII
+    ):
+        response = await middleware.dispatch(_mw_request({REQUEST_ID_HEADER: bad}), _mw_call_next)
+        assert re.fullmatch(r"[0-9a-f]{32}", response.headers[REQUEST_ID_HEADER]), bad
+
+
+async def test_valid_client_request_id_shapes_are_echoed():
+    """The accepted charset (``[A-Za-z0-9._~-]{1,64}``) passes through verbatim —
+    including the 64-char edge — so legit ids still correlate E2E."""
+    middleware = RequestIDMiddleware(lambda app: None)
+    for good in ("client-trace-42", "a" * 64, "req.1_2~3", "9"):
+        response = await middleware.dispatch(_mw_request({REQUEST_ID_HEADER: good}), _mw_call_next)
+        assert response.headers[REQUEST_ID_HEADER] == good, good
 
 
 async def test_verbose_5xx_details_are_dev_optin_and_refused_outside_dev():

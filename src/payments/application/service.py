@@ -27,6 +27,7 @@ import hmac
 import json
 import logging
 import re
+import time
 import uuid
 from decimal import Decimal
 from typing import Any
@@ -65,6 +66,22 @@ _WEBHOOK_TYPE_TO_OUTCOME = {
     "payment.failed": GatewayOutcome.FAILED,
 }
 
+#: Unix-seconds header binding a webhook delivery to its moment of signing.
+WEBHOOK_TIMESTAMP_HEADER = "X-Webhook-Timestamp"
+
+
+def sign_webhook(body: bytes, secret: str, *, timestamp: int | None = None) -> str:
+    """Mint ``X-Payment-Signature`` for one delivery — the sender's side of the scheme.
+
+    HMAC-SHA256 over ``f"{timestamp}.".encode() + body``: the timestamp sits
+    *inside* the signed payload, so re-dating a captured delivery breaks the
+    signature rather than re-validating it. The verifier (:meth:`PaymentsService._verify_signature`)
+    is this function's mirror image; a real gateway integration (or the tests)
+    must sign through here so the two sides cannot drift.
+    """
+    ts = int(time.time()) if timestamp is None else timestamp
+    return "sha256=" + hmac.new(secret.encode(), f"{ts}.".encode() + body, hashlib.sha256).hexdigest()
+
 
 class PaymentsService:
     """Read + write-side use-cases for payments."""
@@ -75,6 +92,7 @@ class PaymentsService:
         gateway: PaymentGatewayPort | None = None,
         *,
         webhook_secret: str | None = None,
+        webhook_tolerance_seconds: int | None = None,
         reconciliation_grace_seconds: int | None = None,
         reconciliation_max_age_seconds: int | None = None,
     ) -> None:
@@ -84,6 +102,11 @@ class PaymentsService:
         # The fields' declared defaults, not ``get_settings()``: every real call
         # site injects the configured values, so building a service must not
         # require a fully-configured environment (same pattern as CatalogService).
+        self._webhook_tolerance_seconds = (
+            webhook_tolerance_seconds
+            if webhook_tolerance_seconds is not None
+            else AppSettings.model_fields["payment_webhook_tolerance_seconds"].default
+        )
         self._reconciliation_grace_seconds = (
             reconciliation_grace_seconds
             if reconciliation_grace_seconds is not None
@@ -143,13 +166,14 @@ class PaymentsService:
         )
         return await self._apply(row.id, result)
 
-    async def handle_webhook(self, body: bytes, signature: str | None) -> bool:
+    async def handle_webhook(self, body: bytes, signature: str | None, timestamp: str | None) -> bool:
         """Verify + apply one provider notification. Returns ``True`` when it changed state.
 
         ``False`` means a duplicate/out-of-order notification hit an already-final
         payment — an idempotent no-op the sender sees as success. Raises a 401 on
-        a bad/missing signature and a 404 for an unknown reference."""
-        self._verify_signature(body, signature)
+        a bad/missing signature or a timestamp outside the skew window, and a 404
+        for an unknown reference."""
+        self._verify_signature(body, signature, timestamp)
         try:
             payload: Any = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -265,17 +289,34 @@ class PaymentsService:
                 "payment_method_token looks like raw card data; use a hosted-checkout token"
             )
 
-    def _verify_signature(self, body: bytes, signature: str | None) -> None:
-        """HMAC-SHA256 over the raw body, constant-time compared.
+    def _verify_signature(self, body: bytes, signature: str | None, timestamp: str | None) -> None:
+        """HMAC-SHA256 over ``{timestamp}.{body}`` with a skew window, constant-time compared.
 
-        Replay protection rides on the payment-level idempotency instead of a
-        timestamp window: a replayed *valid* notification is a no-op by
-        construction, so there is nothing left to replay into."""
+        Two deliberate replay layers: the signed timestamp (bounded by
+        ``payment_webhook_tolerance_seconds``, future-skew included) expires a
+        captured delivery outside the window, and the payment-level idempotency
+        still no-ops a replay landing inside it — there is no nonce/dedupe
+        store, bounded skew + idempotent flip is the accepted posture
+        (``ponytail:`` revisit only if a payment could be flipped by a replay,
+        which the guarded transition already prevents). Every failure — bad
+        timestamp shape, expired, forged — is the same 401, so the endpoint
+        gives no oracle distinguishing which half failed."""
         if not self._webhook_secret:
             raise DependencyUnavailableError(
                 "PAYMENT_WEBHOOK_SECRET is not configured; refusing webhooks (fail closed)"
             )
-        expected = hmac.new(self._webhook_secret.encode(), body, hashlib.sha256).hexdigest()
+        # The timestamp is canonicalized (parsed → int) before it feeds the HMAC,
+        # so no header spelling (" 12", "+12", "012") can diverge from the form
+        # the signature was computed over.
+        if timestamp is None:
+            raise AuthenticationError("invalid webhook signature")
+        try:
+            ts = int(timestamp)
+        except ValueError:
+            raise AuthenticationError("invalid webhook signature") from None
+        if abs(time.time() - ts) > self._webhook_tolerance_seconds:
+            raise AuthenticationError("invalid webhook signature")
+        expected = hmac.new(self._webhook_secret.encode(), f"{ts}.".encode() + body, hashlib.sha256).hexdigest()
         received = signature.removeprefix("sha256=") if signature else ""
         # compare_digest raises on non-ASCII str; encode both sides so a garbage
         # header answers 401 instead of surfacing a TypeError.

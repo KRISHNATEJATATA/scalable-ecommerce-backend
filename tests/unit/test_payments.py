@@ -8,9 +8,8 @@ the flip's transaction. The gateway is the only mocked external.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -23,7 +22,7 @@ from src.events.registry import validate_event
 from src.payments.adapters.db.repository import PaymentsRepository
 from src.payments.adapters.stub_gateway import DeferredChargeWindow, StubPaymentGateway, stub_gateway_from_settings
 from src.payments.api.routes import MAX_WEBHOOK_BODY_BYTES, payment_webhook
-from src.payments.application.service import PaymentsService
+from src.payments.application.service import PaymentsService, sign_webhook
 from src.payments.ports.gateway import GatewayOutcome
 from src.shared.config.setting import AppSettings
 from src.shared.errors.exception_handlers import _unknown_payment_ref_handler
@@ -39,12 +38,17 @@ SECRET = "test-webhook-secret"
 
 
 def _service(
-    session, gateway: StubPaymentGateway | None = None, secret: str | None = SECRET, max_age: int | None = None
+    session,
+    gateway: StubPaymentGateway | None = None,
+    secret: str | None = SECRET,
+    max_age: int | None = None,
+    tolerance: int | None = None,
 ) -> PaymentsService:
     return PaymentsService(
         PaymentsRepository(session),
         gateway or StubPaymentGateway(),
         webhook_secret=secret,
+        webhook_tolerance_seconds=tolerance,
         reconciliation_grace_seconds=30,
         reconciliation_max_age_seconds=max_age,
     )
@@ -59,8 +63,17 @@ def _charge_kwargs(order_id: uuid.UUID | None = None, *, token: str = "tok_visa_
     }
 
 
-def _sign(body: bytes, secret: str | None = SECRET) -> str:
-    return "sha256=" + hmac.new((secret or "").encode(), body, hashlib.sha256).hexdigest()
+def _sign(body: bytes, secret: str | None = SECRET, timestamp: int | None = None) -> str:
+    """Mint the signature exactly the way a real sender must: through the
+    service module's own signing helper, so test and production senders cannot
+    drift from the verifier's scheme."""
+    return sign_webhook(body, secret or "", timestamp=timestamp)
+
+
+def _signed(body: bytes, secret: str | None = SECRET, timestamp: int | None = None) -> tuple[str, str]:
+    """The (signature, timestamp-header) pair for one delivery, as a sender emits them."""
+    ts = str(int(time.time()) if timestamp is None else timestamp)
+    return _sign(body, secret, int(ts)), ts
 
 
 async def _outbox_types(session) -> list[str]:
@@ -206,7 +219,7 @@ async def test_webhook_applies_the_outcome_and_emits_the_event(session):
     )
 
     body = _webhook_body(kwargs["idempotency_key"], ref="wh_ref_1")
-    applied = await service.handle_webhook(body, _sign(body))
+    applied = await service.handle_webhook(body, *_signed(body))
 
     assert applied is True
     status, _ = await _status_of(session, kwargs["idempotency_key"])
@@ -225,9 +238,9 @@ async def test_duplicate_and_out_of_order_webhooks_are_idempotent_no_ops(session
     success = _webhook_body(kwargs["idempotency_key"])
     failure = _webhook_body(kwargs["idempotency_key"], type_="payment.failed")
 
-    assert await service.handle_webhook(success, _sign(success)) is True
-    assert await service.handle_webhook(success, _sign(success)) is False  # exact duplicate
-    assert await service.handle_webhook(failure, _sign(failure)) is False  # out-of-order loser
+    assert await service.handle_webhook(success, *_signed(success)) is True
+    assert await service.handle_webhook(success, *_signed(success)) is False  # exact duplicate
+    assert await service.handle_webhook(failure, *_signed(failure)) is False  # out-of-order loser
 
     status, _ = await _status_of(session, kwargs["idempotency_key"])
     assert status == "succeeded"  # the first decision stands
@@ -238,40 +251,88 @@ async def test_webhooks_without_a_valid_signature_are_refused(session):
     kwargs = _charge_kwargs()
     service = _service(session)
     body = _webhook_body(kwargs["idempotency_key"])
+    sig, ts = _signed(body)
 
     with pytest.raises(AuthenticationError):
-        await service.handle_webhook(body, None)
+        await service.handle_webhook(body, None, None)
     with pytest.raises(AuthenticationError):
-        await service.handle_webhook(body, "sha256=" + "0" * 64)
+        await service.handle_webhook(body, "sha256=" + "0" * 64, ts)
     tampered = _webhook_body(kwargs["idempotency_key"], type_="payment.failed")
     with pytest.raises(AuthenticationError):
-        await service.handle_webhook(tampered, _sign(body))  # valid sig over DIFFERENT body
+        await service.handle_webhook(tampered, sig, ts)  # valid sig over DIFFERENT body
 
 
 async def test_webhooks_fail_closed_without_a_configured_secret(session):
     service = _service(session, secret=None)
     body = _webhook_body("any-key")
     with pytest.raises(DependencyUnavailableError):
-        await service.handle_webhook(body, _sign(body))
+        await service.handle_webhook(body, *_signed(body))
 
 
 async def test_a_webhook_for_an_unknown_reference_is_a_visible_404(session):
     body = _webhook_body("never-seen-key")
     with pytest.raises(UnknownPaymentRefError):
-        await _service(session).handle_webhook(body, _sign(body))
+        await _service(session).handle_webhook(body, *_signed(body))
 
 
 async def test_a_signed_non_object_webhook_body_is_a_404_not_a_500(session):
     body = b'["payment.succeeded"]'  # valid JSON, not an object
     with pytest.raises(UnknownPaymentRefError):
-        await _service(session).handle_webhook(body, _sign(body))
+        await _service(session).handle_webhook(body, *_signed(body))
 
 
 async def test_a_non_ascii_signature_header_is_a_401_not_a_type_error(session):
     kwargs = _charge_kwargs()
     body = _webhook_body(kwargs["idempotency_key"])
     with pytest.raises(AuthenticationError):
-        await _service(session).handle_webhook(body, "sha256=é" * 32)
+        await _service(session).handle_webhook(body, "sha256=é" * 32, str(int(time.time())))
+
+
+async def test_a_webhook_outside_the_timestamp_window_is_refused(session):
+    """Expired AND future-dated deliveries are the same 401: a captured valid
+    delivery cannot be replayed later, and no oracle probes which half failed."""
+    kwargs = _charge_kwargs()
+    service = _service(session)
+    body = _webhook_body(kwargs["idempotency_key"])
+    expired = int(time.time()) - 301
+    future = int(time.time()) + 301
+    with pytest.raises(AuthenticationError):
+        await service.handle_webhook(body, *_signed(body, timestamp=expired))
+    with pytest.raises(AuthenticationError):
+        await service.handle_webhook(body, *_signed(body, timestamp=future))
+    # Re-dating cannot resurrect a captured delivery: the signature covers the
+    # timestamp it was minted with, so presenting it under a fresh one fails.
+    stale_sig, _ = _signed(body, timestamp=expired)
+    with pytest.raises(AuthenticationError):
+        await service.handle_webhook(body, stale_sig, str(int(time.time())))
+
+
+async def test_a_missing_or_garbage_timestamp_is_the_same_401(session):
+    """Header absent or unparseable → the identical 401, before any HMAC work."""
+    kwargs = _charge_kwargs()
+    service = _service(session)
+    body = _webhook_body(kwargs["idempotency_key"])
+    with pytest.raises(AuthenticationError):
+        await service.handle_webhook(body, _sign(body), None)
+    with pytest.raises(AuthenticationError):
+        await service.handle_webhook(body, _sign(body), "not-a-number")
+
+
+async def test_the_timestamp_window_boundary_follows_tolerance(session):
+    """The operator's tolerance is the contract: a delivery inside the window
+    delivers, one second past it refuses. (The exact inclusive edge can't be
+    probed against a real clock — truncation + sub-second elapsed time makes
+    ``now - tolerance`` always slightly past — so the probes sit 1s inside/out.)"""
+    kwargs = _charge_kwargs()
+    service = _service(session, tolerance=120)
+    await PaymentsRepository(session).create_pending(
+        order_id=kwargs["order_id"], idempotency_key=kwargs["idempotency_key"], amount=kwargs["amount"]
+    )
+    body = _webhook_body(kwargs["idempotency_key"])
+    applied = await service.handle_webhook(body, *_signed(body, timestamp=int(time.time()) - 119))
+    assert applied is True
+    with pytest.raises(AuthenticationError):
+        await service.handle_webhook(body, *_signed(body, timestamp=int(time.time()) - 121))
 
 
 # --- reconciliation ----------------------------------------------------------------
@@ -537,15 +598,34 @@ def test_pending_trigger_is_refused_outside_dev(env):
         )
 
 
+def test_webhook_tolerance_must_be_positive():
+    """A zero/negative skew window would refuse every delivery (or accept none);
+    the config is rejected at startup instead."""
+    with pytest.raises(ValueError, match="payment_webhook_tolerance_seconds"):
+        AppSettings(
+            _env_file=None,
+            database_url="postgresql+asyncpg://u:p@localhost:5432/db",
+            payment_webhook_tolerance_seconds=0,
+        )
+
+
 # --- webhook body cap (route-level) --------------------------------------------------
 
 
-def _route_request(*, content_length: str | None = None, body: bytes = b"", signature: str | None = None) -> Request:
+def _route_request(
+    *,
+    content_length: str | None = None,
+    body: bytes = b"",
+    signature: str | None = None,
+    timestamp: str | None = None,
+) -> Request:
     headers = []
     if content_length is not None:
         headers.append((b"content-length", content_length.encode()))
     if signature is not None:
         headers.append((b"x-payment-signature", signature.encode()))
+    if timestamp is not None:
+        headers.append((b"x-webhook-timestamp", timestamp.encode()))
     scope = {"type": "http", "method": "POST", "path": "/v1/payments/webhook", "headers": headers}
     chunks = [body]
 
@@ -560,7 +640,7 @@ def _route_request(*, content_length: str | None = None, body: bytes = b"", sign
 class _UnreachableService:
     """The service must never be called for an oversized body."""
 
-    async def handle_webhook(self, body: bytes, signature: str | None) -> bool:
+    async def handle_webhook(self, body: bytes, signature: str | None, timestamp: str | None) -> bool:
         raise AssertionError("oversized body reached the service")
 
 
@@ -583,15 +663,16 @@ async def test_webhook_with_normal_body_reaches_the_service():
     seen: dict = {}
 
     class _RecordingService:
-        async def handle_webhook(self, body: bytes, signature: str | None) -> bool:
+        async def handle_webhook(self, body: bytes, signature: str | None, timestamp: str | None) -> bool:
             seen["body"] = body
             seen["signature"] = signature
+            seen["timestamp"] = timestamp
             return True
 
     small = b'{"type":"payment.succeeded"}'
-    request = _route_request(content_length=str(len(small)), body=small, signature="sha256=abc")
+    request = _route_request(content_length=str(len(small)), body=small, signature="sha256=abc", timestamp="1700000000")
     assert await payment_webhook(request, _RecordingService()) is None
-    assert seen == {"body": small, "signature": "sha256=abc"}
+    assert seen == {"body": small, "signature": "sha256=abc", "timestamp": "1700000000"}
 
 
 # --- unknown-ref handler regression --------------------------------------------------

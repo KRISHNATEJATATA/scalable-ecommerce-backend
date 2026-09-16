@@ -4,6 +4,7 @@ Security headers (HSTS, CSP, X-Content-Type-Options, X-Frame-Options),
 request-id propagation, and proxy (X-Forwarded-*) handling. Wired in Phase 1/9.
 """
 
+import re
 import uuid
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -13,6 +14,13 @@ from starlette.responses import Response
 from src.shared.config.logging import request_id_ctx
 
 REQUEST_ID_HEADER = "X-Request-ID"
+
+#: A caller-supplied request id we adopt: bounded length + safe charset, so it
+#: can neither inflate log lines (memory abuse) nor smuggle newlines/controls
+#: into structured logs (log injection). Anything else — longer, odder — is
+#: silently discarded for a fresh ``uuid4().hex``; never echo-and-truncate,
+#: which would break log correlation.
+_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._~-]{1,64}$")
 
 # static header set is enough for now.
 _SECURITY_HEADERS = {
@@ -48,7 +56,8 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request: Request, call_next) -> Response:
-        request_id = request.headers.get(REQUEST_ID_HEADER) or uuid.uuid4().hex
+        supplied = request.headers.get(REQUEST_ID_HEADER)
+        request_id = supplied if supplied and _REQUEST_ID_PATTERN.fullmatch(supplied) else uuid.uuid4().hex
         request.state.request_id = request_id
         token = request_id_ctx.set(request_id)
         try:

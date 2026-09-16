@@ -163,6 +163,11 @@ class AppSettings(BaseSettings):
     # (``X-Payment-Signature: sha256=<hex>``). Unset → webhooks are refused
     # (fail closed), never processed unsigned.
     payment_webhook_secret: str | None = None
+    # Skew window (seconds) for the signed webhook timestamp: a delivery whose
+    # timestamp drifts more than this from now — past OR future — is refused as
+    # a replay instead of applied. Covers normal delivery latency without
+    # letting a captured delivery live forever.
+    payment_webhook_tolerance_seconds: int = Field(default=300, gt=0)
     # How long a charge may sit ``pending`` before the reconciliation poller asks
     # the gateway what happened (covers normal webhook latency; longer than any
     # plausible delivery delay without racing one).

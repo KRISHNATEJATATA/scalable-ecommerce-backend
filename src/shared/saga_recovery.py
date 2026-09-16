@@ -135,6 +135,7 @@ class SagaRecovery:
             PaymentsRepository(session),
             StubPaymentGateway(self._settings.payment_stub_fail_token_substring),
             webhook_secret=self._settings.payment_webhook_secret,
+            webhook_tolerance_seconds=self._settings.payment_webhook_tolerance_seconds,
             reconciliation_grace_seconds=self._settings.payment_reconciliation_grace_seconds,
             reconciliation_max_age_seconds=self._settings.payment_reconciliation_max_age_seconds,
         )

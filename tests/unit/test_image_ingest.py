@@ -8,7 +8,9 @@ reclaim rules that keep ``public/`` from leaking objects.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import uuid
 
 import pytest
@@ -273,6 +275,37 @@ async def test_stale_flip_queues_its_own_unreferenced_renditions(processed):
     store = FakeStore()
     assert await build(repo, store).ingest(KEY, ETAG) is IngestOutcome.STALE
     assert [t.object_key for t in repo.reclaims] == [main]
+
+
+class _LosingRepo(FakeRepo):
+    """``mark_image_failed`` loses the token race: a newer upload superseded this reject."""
+
+    async def mark_image_failed(self, product_id, upload_token, outbox=None) -> bool:
+        return False
+
+
+async def test_stale_events_never_log_the_raw_upload_token(processed, caplog):
+    """The presigned-upload token is a secret the word-based RedactFilter cannot
+    catch by shape: both stale-event INFO lines must carry only a truncated
+    SHA-256 tag of the token — stale lines stay joinable, the token never leaks
+    (DEBUG is no fix; it gets enabled in prod incidents)."""
+    expected_tag = "sha256:" + hashlib.sha256(TOKEN.encode()).hexdigest()[:12]
+
+    with caplog.at_level(logging.INFO, logger="src.catalog.application.image_ingest"):
+        repo = FakeRepo(applied=False, live_key=public_main_key(PID, TOKEN, "other"))
+        assert await build(repo, FakeStore()).ingest(KEY, ETAG) is IngestOutcome.STALE  # stale ready-flip
+        assert (
+            await build(_LosingRepo(), FakeStore(error=ObjectNotFoundError(KEY))).ingest(KEY, ETAG)
+            is IngestOutcome.STALE
+        )  # stale failed-flip
+
+    # INFO only (the ticket's scope): the vanished-object path legitimately logs
+    # the raw S3 object key — the upload token's *address* — at WARNING.
+    info_lines = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert len(info_lines) == 2
+    for line in info_lines:
+        assert TOKEN not in line
+        assert expected_tag in line
 
 
 async def test_redelivery_of_the_live_object_keeps_it(processed):

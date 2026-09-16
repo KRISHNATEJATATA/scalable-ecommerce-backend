@@ -326,8 +326,11 @@ reporting when the reaper is dead.
 ### 9. Payment reconciliation (charges stuck `pending`)
 
 Payment confirmation is async: the gateway confirms via **webhook**
-(`POST /v1/payments/webhook`, HMAC-verified with `PAYMENT_WEBHOOK_SECRET` — refused,
-never processed unsigned). A missed webhook would strand a paid charge in
+(`POST /v1/payments/webhook`, HMAC-verified with `PAYMENT_WEBHOOK_SECRET` over the
+signed `X-Webhook-Timestamp` + body — refused, never processed unsigned; a delivery
+whose signed timestamp drifts more than `PAYMENT_WEBHOOK_TOLERANCE_SECONDS` (default
+300) from now, past or future, is refused as a replay). A missed webhook would strand
+a paid charge in
 `pending` forever, so the `service`-role **payment reconciler**
 (`python -m src.payments.adapters.reconciler`) polls in two sweeps: every pass takes
 the oldest still-`pending` charges inside the
@@ -349,7 +352,7 @@ checkout token (anything PAN-shaped is rejected at the boundary).
 | Symptom | Likely cause | Action |
 |---|---|---|
 | Charges stuck `pending` past grace | reconciler down, or gateway `lookup` failing | check the task is running + healthy; inspect its logs for repeated lookup warnings |
-| Webhooks all rejected 401 | secret drift between gateway config and `PAYMENT_WEBHOOK_SECRET` | rotate the secret on both sides; deliveries are retried by the provider |
+| Webhooks all rejected 401 | secret drift between gateway config and `PAYMENT_WEBHOOK_SECRET`, or gateway clock skew past `PAYMENT_WEBHOOK_TOLERANCE_SECONDS` | rotate the secret on both sides / fix the gateway clock (NTP); deliveries are retried by the provider |
 | 404s from `/v1/payments/webhook` | gateway pointed at the wrong environment/realm | fix the gateway config — do not widen acceptance |
 | `PaymentFailed` with reason `abandoned_by_reconciler` | checkout died between row-create and gateway charge, or the provider lost it | find the order's checkout logs; the charge never landed gateway-side, so retrying checkout with a NEW idempotency key is safe |
 | Sudden `PaymentFailed` spike | upstream decline event or fail-token misconfiguration in tests | compare against gateway-side decline metrics before assuming a code fault |

@@ -47,6 +47,10 @@ dev = [
     "moto",
     "ruff",
     "import-linter",
+    # Type checkers used by `make typecheck` (advisory — both carry a known
+    # pre-existing baseline; see Makefile and AGENTS.md).
+    "basedpyright",
+    "ty",
     # Bundles libmagic so Windows dev machines run the image-sniff tests instead
     # of skipping them (CI installs apt libmagic1; Linux gets real libmagic here).
     "python-magic-bin; sys_platform == 'win32'",

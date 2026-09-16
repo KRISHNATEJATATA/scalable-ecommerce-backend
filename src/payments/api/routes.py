@@ -16,7 +16,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from src.payments.application.service import PaymentsService
+from src.payments.application.service import WEBHOOK_TIMESTAMP_HEADER, PaymentsService
 from src.shared.container import get_payments_service
 
 router = APIRouter(prefix="/payments", tags=["payments"])
@@ -34,9 +34,11 @@ MAX_WEBHOOK_BODY_BYTES = 64 * 1024
 async def payment_webhook(request: Request, service: PaymentsServiceDep) -> None:
     """Receive one gateway confirmation (``payment.succeeded`` / ``payment.failed``).
 
-    Signed with ``X-Payment-Signature: sha256=<HMAC-SHA256(raw_body, secret)>``.
-    Duplicate and out-of-order notifications answer 204 without changing state.
-    Bodies over 64 KiB answer 413 before verification."""
+    Signed with ``X-Payment-Signature: sha256=<HMAC-SHA256("{timestamp}." + raw_body, secret)>``
+    and bound to ``X-Webhook-Timestamp: <unix seconds>`` — deliveries outside the
+    configured skew window are refused, expiring a captured delivery. Duplicate
+    and out-of-order notifications answer 204 without changing state. Bodies over
+    64 KiB answer 413 before verification."""
     declared = request.headers.get("content-length")
     try:
         declared_too_big = declared is not None and int(declared) > MAX_WEBHOOK_BODY_BYTES
@@ -53,4 +55,8 @@ async def payment_webhook(request: Request, service: PaymentsServiceDep) -> None
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=f"webhook body exceeds {MAX_WEBHOOK_BODY_BYTES} bytes",
         )
-    await service.handle_webhook(body, request.headers.get("x-payment-signature"))
+    await service.handle_webhook(
+        body,
+        request.headers.get("x-payment-signature"),
+        request.headers.get(WEBHOOK_TIMESTAMP_HEADER.lower()),
+    )

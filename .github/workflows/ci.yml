@@ -9,8 +9,6 @@ on:
 
 env:
   PYTHON_VERSION: "3.13"
-  # Human-readable branch name used in TestRail run titles
-  RUN_BRANCH: ${{ github.head_ref || github.ref_name }}
 
 jobs:
   lint-and-test:
@@ -43,6 +41,15 @@ jobs:
           RUFF_OUTPUT_FORMAT: github
         run: make lint
 
+      # Advisory typecheck: basedpyright + ty both carry a known pre-existing
+      # diagnostic baseline (AGENTS.md — "fix yours, don't chase the baseline"),
+      # so a hard gate would red every PR for zero signal. continue-on-error
+      # keeps the output visible on every run without blocking merges. Flip to a
+      # hard gate once the baseline is burned down.
+      - name: Typecheck (advisory)
+        continue-on-error: true
+        run: make typecheck
+
       # `python-magic` needs libmagic; without it the image-processing tests skip
       # and the no-skip gate below (deliberately empty allowlist) fails the build.
       # Install it before the tests rather than allowlisting a skip away.
@@ -71,3 +78,14 @@ jobs:
       # green. The gate's allowlist is empty on purpose; see scripts/ci_no_skips.py.
       - name: Fail on any skipped test
         run: python scripts/ci_no_skips.py test-results/unit.xml
+
+  # Build-only: proves the Dockerfile still compiles on every PR. No registry
+  # login, no push — publishing is a deploy concern, not CI.
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build image (no push)
+        run: docker build -t ecommerce-ci:${{ github.sha }} .
