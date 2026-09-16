@@ -24,6 +24,7 @@ from prometheus_client import REGISTRY
 from sqlalchemy import text
 
 from src.inventory.adapters.db.repository import InventoryRepository
+from src.inventory.application.outbox import stock_released_outbox
 from src.inventory.application.service import InventoryService
 from src.orders.adapters.db.repository import OrdersRepository
 from src.orders.application.checkout_saga import CheckoutSaga, payment_key_for
@@ -976,6 +977,158 @@ async def test_recovery_compensates_a_checkout_crashed_before_payment(session):
     assert outcome == {"completed": 0, "compensated": 1, "deferred": 0}
     assert await _order_status(session, order.id) == "cancelled"
     assert await _stock(session, str(line.product_id)) == (5, 0)
+
+
+async def test_recovery_compensates_a_paid_order_whose_holds_were_reaped(session):
+    """P0 regression (paid-without-consume): holds expire + the reaper releases
+    them, then the payment confirms days later — the poller must NOT mark the
+    order paid (its stock was already sold back into the pool). Compensate +
+    count, leave the succeeded payment row on the cancelled order for the
+    manual reconciliation the RUNBOOK §9 query finds."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    repo = OrdersRepository(session)
+    inventory = InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)
+    payments = PaymentsService(PaymentsRepository(session), StubPaymentGateway(), webhook_secret="test-secret")
+
+    order, _ = await repo.create_pending_order(
+        user_id=USER_A,
+        idempotency_key="key-reaped-confirm",
+        body_hash="hash",
+        total=Decimal("19.99"),
+        lines=[(line.product_id, line.name, line.unit_price, line.quantity)],
+    )
+    await inventory.reserve(str(line.product_id), line.quantity, order.id)
+
+    # The drive stalls past the reservation TTL: the reaper gives the unit back.
+    await session.execute(text("UPDATE inventory.reservations SET expires_at = now() - interval '1 hour'"))
+    released = await InventoryRepository(session).release_expired(batch_size=10, outbox_factory=stock_released_outbox)
+    assert released == 1
+    assert await _stock(session, str(line.product_id)) == (5, 0)  # unit is back in the pool
+
+    # Days later the (unknown-outcome) payment confirms — order still pending.
+    payment = await payments.charge(
+        order_id=order.id,
+        idempotency_key=payment_key_for(USER_A, "key-reaped-confirm"),
+        amount=Decimal("19.99"),
+        payment_method_token="tok_visa",
+    )
+    assert payment.status == "succeeded"
+    await _backdate_pending(session, order.id)
+
+    before = _counter("checkout_paid_without_consume_total")
+    outcome = await _saga(session, _Basket()).recover_stuck(
+        cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50
+    )
+
+    assert outcome == {"completed": 0, "compensated": 1, "deferred": 0}
+    assert _counter("checkout_paid_without_consume_total") == before + 1
+    assert await _order_status(session, order.id) == "cancelled"  # never paid
+    assert await _stock(session, str(line.product_id)) == (5, 0)  # no second decrement
+    pair = (
+        await session.execute(
+            text(
+                "SELECT o.status, p.status FROM orders.orders o "
+                "JOIN payments.payments p ON p.order_id = o.id WHERE o.id = :id"
+            ),
+            {"id": order.id},
+        )
+    ).one()
+    assert pair == ("cancelled", "succeeded")  # the orphan pair §9 reconciles by hand
+
+
+async def test_recovery_compensates_when_only_some_holds_survive_until_confirm(session):
+    """Partial variant: of two lines, one hold was reaped before the payment
+    confirmed. Committing the surviving line alone must not pay the order —
+    a partially-consumed paid order would be the same invariant hole."""
+    line_a = _line(product_no=1)
+    line_b = _line(product_no=2)
+    await _seed(session, str(line_a.product_id), 5)
+    await _seed(session, str(line_b.product_id), 5)
+    repo = OrdersRepository(session)
+    inventory = InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)
+    payments = PaymentsService(PaymentsRepository(session), StubPaymentGateway(), webhook_secret="test-secret")
+
+    order, _ = await repo.create_pending_order(
+        user_id=USER_A,
+        idempotency_key="key-partial-reaped",
+        body_hash="hash",
+        total=Decimal("39.98"),
+        lines=[
+            (line_a.product_id, line_a.name, line_a.unit_price, line_a.quantity),
+            (line_b.product_id, line_b.name, line_b.unit_price, line_b.quantity),
+        ],
+    )
+    await inventory.reserve(str(line_a.product_id), line_a.quantity, order.id)
+    await inventory.reserve(str(line_b.product_id), line_b.quantity, order.id)
+
+    # Only line A's hold expires; the reaper releases it. Line B is still held.
+    await session.execute(
+        text("UPDATE inventory.reservations SET expires_at = now() - interval '1 hour' WHERE sku = :sku"),
+        {"sku": str(line_a.product_id)},
+    )
+    released = await InventoryRepository(session).release_expired(batch_size=10, outbox_factory=stock_released_outbox)
+    assert released == 1
+
+    payment = await payments.charge(
+        order_id=order.id,
+        idempotency_key=payment_key_for(USER_A, "key-partial-reaped"),
+        amount=Decimal("39.98"),
+        payment_method_token="tok_visa",
+    )
+    assert payment.status == "succeeded"
+    await _backdate_pending(session, order.id)
+
+    before = _counter("checkout_paid_without_consume_total")
+    outcome = await _saga(session, _Basket()).recover_stuck(
+        cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50
+    )
+
+    assert outcome == {"completed": 0, "compensated": 1, "deferred": 0}
+    assert _counter("checkout_paid_without_consume_total") == before + 1
+    assert await _order_status(session, order.id) == "cancelled"
+    assert await _stock(session, str(line_a.product_id)) == (5, 0)  # was already in the pool
+    assert await _stock(session, str(line_b.product_id)) == (4, 0)  # committed once, not released again
+
+
+async def test_drive_commit_shortfall_leaves_pending_for_recovery(session):
+    """Drive-side guard: a commit that consumed fewer holds than the order has
+    lines must not reach mark_paid even on the live path — the order stays
+    pending for the recovery poller (never a cancel after money moved)."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    inventory = InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)
+    payments = PaymentsService(PaymentsRepository(session), StubPaymentGateway(), webhook_secret="test-secret")
+
+    class _VanishedHolds(OrderStockHolds):
+        """Reports nothing to consume — the holds were reaped out from under
+        the drive between reserve and commit."""
+
+        async def commit_for_order(self, order_id):
+            return 0
+
+    saga = CheckoutSaga(
+        OrdersRepository(session),
+        basket,
+        _VanishedHolds(inventory),
+        OrderCharges(payments),
+        _Idempotency(),
+        step_timeout_seconds=60,
+    )
+    before = _counter("checkout_paid_without_consume_total")
+    try:
+        await saga.checkout(user_id=USER_A, idempotency_key="key-blind-commit", payment_token="tok_visa")
+    except OrderStateConflictError as exc:
+        assert "settled automatically" in exc.detail
+    else:
+        raise AssertionError("expected OrderStateConflictError on commit shortfall")
+
+    assert _counter("checkout_paid_without_consume_total") == before + 1
+    order_id = (await session.execute(text("SELECT id FROM orders.orders"))).scalar_one()
+    assert await _order_status(session, order_id) == "pending"  # left for recovery, not paid
+    assert await _stock(session, str(line.product_id)) == (5, 1)  # hold kept, nothing consumed
 
 
 async def test_recovery_defers_while_payment_is_pending(session):

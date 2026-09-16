@@ -65,7 +65,12 @@ class StockHoldsPort(Protocol):
         ...
 
     async def commit_for_order(self, order_id: uuid.UUID) -> int:
-        """Consume every still-``held`` reservation of one order (success); returns how many."""
+        """Consume every still-``held`` reservation of one order (success).
+
+        Returns how many of the order's reservations are in ``committed`` status
+        after the call — the retry-safe end-state, not the per-call row count
+        (a timed-out-but-landed attempt must not read as a shortfall on retry).
+        """
         ...
 
 

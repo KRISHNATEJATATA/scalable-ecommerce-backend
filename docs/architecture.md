@@ -214,7 +214,8 @@ limit answers **429** as the standard RFC 9457 Problem (`Too Many Requests`) wit
 The limiter **fails open**: the flag off, no Valkey client, or a Valkey fault lets the
 request through (logged), because abuse control must never take checkout or merchant
 writes down with it. In prod the ALB's **AWS WAF rate-based rules** are the outer
-backstop (Terraform tickets); the app-level bucket protects what WAF can't see
+backstop (the WAF/Terraform layer is not yet authored); the
+app-level bucket protects what WAF can't see
 (per-user budgets inside allowed traffic).
 
 ## Checkout saga (orchestrated)
@@ -248,6 +249,13 @@ future returns/refunds reverse saga, never via cancel.
   the payment token (which is never stored); still-`pending` payments are left
   for the payment reconciler. It lives in `shared` deliberately: settling
   composes four modules, and only shared code may do that.
+- **Paid-implies-consumed.** Every commit site (drive and poller alike) checks
+  `commit_for_order`'s answer — the order's committed hold total, retry-safe —
+  against the order's line count before marking `paid`. A shortfall means the
+  reaper released the holds before the payment confirmed (ADR 0019's
+  paid-without-consume window): the order is compensated instead of paid and
+  the succeeded payment waits on manual reconciliation (`checkout_paid_without_consume_total`,
+  RUNBOOK §9).
 - **Timeouts are relationships, enforced at startup**: the per-step saga
   timeout (`CHECKOUT_SAGA_STEP_TIMEOUT_SECONDS`) must stay below
   `RESERVATION_TTL_SECONDS`, so a live checkout can't lose its stock to the
@@ -390,7 +398,7 @@ prod, compose services locally — never `BackgroundTasks`:
 
 ## Deploy target
 
-Docker image → ECR (tagged by git SHA, not `latest`) → **ECS Fargate**, behind an
-ALB, multiple identical tasks. Alembic runs as a one-off migration task (one
-independent chain per module), not at app boot. Terraform is the IaC. See
-[`DEPLOYMENT.md`](DEPLOYMENT.md).
+Docker image → ECR (tagged by git SHA, not `latest`) → **ECS Fargate** (target),
+behind an ALB, multiple identical tasks. Alembic runs as a one-off migration task (one
+independent chain per module), not at app boot. The IaC (Terraform) is **not yet
+authored** — see [`DEPLOYMENT.md`](DEPLOYMENT.md) for the documented target.

@@ -48,7 +48,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the full picture.
 | Observability | `ecs-logging` + `python-json-logger`, Prometheus `/metrics` |
 | Testing | pytest + pytest-asyncio, `httpx.AsyncClient`, Testcontainers-Postgres |
 | Lint | Ruff (line-length 120) + Ruff-format; Spectral for OpenAPI |
-| Deploy | Docker → ECR → ECS Fargate (Terraform) |
+| Deploy | Multi-stage Docker image → ECR; ECS Fargate target documented in [DEPLOYMENT.md](docs/DEPLOYMENT.md) (IaC not yet authored) |
 
 ## Quickstart (local)
 

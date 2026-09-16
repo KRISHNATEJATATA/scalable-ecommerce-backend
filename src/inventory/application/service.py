@@ -137,7 +137,10 @@ class InventoryService:
         """Consume every still-``held`` reservation of one order (saga success).
 
         The recovery poller's finish for a checkout whose payment succeeded but
-        whose per-line commits never ran. Returns how many were consumed.
+        whose per-line commits never ran. Returns how many of the order's
+        reservations are in ``committed`` status after the call — the end-state
+        count (not the per-call rowcount) so a replay of an already-committed
+        order reports its lines instead of a false shortfall.
         """
         return await self._repo.commit_for_order(order_id)
 

@@ -32,7 +32,7 @@ import uuid
 from datetime import datetime
 from typing import Any, cast
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -391,27 +391,47 @@ class InventoryRepository:
         return len(rows)
 
     async def commit_for_order(self, order_id: uuid.UUID) -> int:
-        """Consume every still-``held`` reservation of one order; returns how many.
+        """Consume every still-``held`` reservation of one order; returns the order's committed total.
 
         The saga's success path when the payment already succeeded but the crash
         came before the per-line commits (or the recovery poller finishing a
         crashed checkout). No event: the order/payment events announce the
         outcome. A replay finds no ``held`` rows — idempotent.
+
+        The return is **how many of the order's reservations are in ``committed``
+        status after this call**, not how many rows this call itself moved. The
+        distinction is what makes the answer retry-safe: a timed-out first
+        attempt may have committed server-side after its caller gave up, so a
+        replay's zero-rows claim would otherwise read as "nothing consumed" —
+        a false shortfall the caller would compensate a fully-consumed order
+        over. Counting the end-state (inside the same transaction, own uncommitted
+        marks visible) makes every attempt agree. A concurrent committer is not a
+        hazard: the ``FOR UPDATE`` claim serializes same-order work — the second
+        claimant blocks on the row locks, then re-checks the ``held`` predicate
+        and matches nothing, so its count sees the first's committed rows.
         """
         rows = (
             await self._session.execute(_CLAIM_ORDER_SQL, {"order_id": order_id, "held": ReservationStatus.HELD.value})
         ).all()
-        if not rows:
-            # No rollback on the empty replay — same reason as release_for_order.
-            return 0
-        for row in rows:
-            await self._require_one(_CONSUME_SQL, {"sku": row.sku, "qty": row.qty}, what="order commit consume")
-        await self._session.execute(
-            _MARK_COMMITTED_BATCH_SQL,
-            {"committed": ReservationStatus.COMMITTED.value, "ids": [row.id for row in rows]},
-        )
-        await self._session.commit()
-        return len(rows)
+        if rows:
+            for row in rows:
+                await self._require_one(_CONSUME_SQL, {"sku": row.sku, "qty": row.qty}, what="order commit consume")
+            await self._session.execute(
+                _MARK_COMMITTED_BATCH_SQL,
+                {"committed": ReservationStatus.COMMITTED.value, "ids": [row.id for row in rows]},
+            )
+            await self._session.commit()
+        # Zero-rows replay: a read-only count in the session's implicit
+        # transaction — READ COMMITTED sees a fresh snapshot per statement, so
+        # another committer's landed rows are visible. Nothing to commit.
+        committed = (
+            await self._session.execute(
+                select(func.count())
+                .select_from(Reservation)
+                .where(Reservation.order_id == order_id, Reservation.status == ReservationStatus.COMMITTED.value)
+            )
+        ).scalar_one()
+        return int(committed)
 
     async def _find_active(self, order_id: uuid.UUID, sku: str, qty: int) -> Reservation | None:
         """This order line's existing non-released reservation, or ``None`` if it's gone.

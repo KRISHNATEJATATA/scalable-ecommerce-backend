@@ -112,6 +112,9 @@ class InventoryRepositoryPort(Protocol):
     async def commit_for_order(self, order_id: uuid.UUID) -> int:
         """Consume every still-``held`` reservation of one order (saga success).
 
-        Returns how many were consumed; ``0`` on replay. No event emitted.
+        Returns how many of the order's reservations are in ``committed`` status
+        after the call — the retry-safe end-state, not the per-call rowcount
+        (a replay reports the lines committed earlier, never a false ``0``).
+        No event emitted.
         """
         ...

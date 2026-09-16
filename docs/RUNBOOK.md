@@ -60,7 +60,10 @@ migration aborts before any DDL.
 
 1. Restore RDS from the latest cross-region snapshot / PITR.
 2. Confirm the S3 uploads bucket replica is current.
-3. `terraform apply` the stack in the DR region (image from ECR replica).
+3. Recreate the DR stack (task definitions, services, queues/topics). IaC is
+   not yet authored, so today this is manual — rebuild from `DEPLOYMENT.md`;
+   once Terraform exists: `terraform apply` the stack in the DR region
+   (image from ECR replica).
 4. Run the Alembic one-off task to `upgrade head` (usually a no-op).
 5. Cut DNS/ALB over; verify `/v1/health` and `/v1/ready`.
 
@@ -289,6 +292,7 @@ stock from a slow-but-alive checkout and that checkout fails at payment confirma
 | Expired-hold backlog (query below) climbing fast | checkouts dying mid-saga upstream | investigate the saga/payment step — the reaper is treating a symptom |
 | `inventory_oversell_blocked_total` spiking | genuine contention on a hot SKU, or a saga retry storm | expected under contention; confirm stock levels before assuming a bug |
 | Paid orders' stock returns to the pool | `commit_reservation` not called on payment success | fix the saga's confirm step — the reaper is doing its job |
+| A payment confirmed on an order whose holds were reaped (`checkout_paid_without_consume_total`) | the paid-without-consume window: payment resolved past the reservation TTL (ADR 0019) | expected-by-design handling, not a reaper fault: the saga compensated the order — refund the succeeded payment per §9 |
 
 ```bash
 # Manual one-shot sweep (same image, service role)
@@ -350,6 +354,7 @@ checkout token (anything PAN-shaped is rejected at the boundary).
 | `PaymentFailed` with reason `abandoned_by_reconciler` | checkout died between row-create and gateway charge, or the provider lost it | find the order's checkout logs; the charge never landed gateway-side, so retrying checkout with a NEW idempotency key is safe |
 | Sudden `PaymentFailed` spike | upstream decline event or fail-token misconfiguration in tests | compare against gateway-side decline metrics before assuming a code fault |
 | `checkout_orphaned_paid_payments_total` incremented | payment succeeded for an order a concurrent cancel flipped — money taken, order cancelled; nothing reconciles this pair automatically (the reconciler only scans `pending` charges) | manual reconciliation required (below); the auto-heal scan is a reserved decision, not built |
+| `checkout_paid_without_consume_total` incremented | payment confirmed after the reaper released the order's holds (paid-without-consume, ADR 0019) — the saga compensated the order instead of paying it, so the succeeded payment sits on a cancelled order | manual refund reconciliation required (below — same orphan query); the customer was never given the goods, so refund, don't fulfil |
 
 ```bash
 # Manual one-shot sweep (same image, service role)
@@ -367,6 +372,9 @@ SELECT count(*) FROM payments.payments WHERE status = 'failed' AND failure_reaso
 SELECT status, count(*) FROM payments.payments GROUP BY status;
 -- THE orphaned-payment alert (checkout_orphaned_paid_payments_total > 0):
 -- money taken, order cancelled — reconcile by hand. Healthy = 0 rows.
+-- The same query finds the paid-without-consume pair
+-- (checkout_paid_without_consume_total > 0): a payment that confirmed
+-- after the reaper released the holds — refund it, the stock was never delivered.
 SELECT p.id, p.order_id, p.amount FROM payments.payments p
   JOIN orders.orders o ON o.id = p.order_id
   WHERE p.status = 'succeeded' AND o.status = 'cancelled';

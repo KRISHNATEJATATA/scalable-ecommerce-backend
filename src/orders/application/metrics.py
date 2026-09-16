@@ -44,6 +44,13 @@ incremented in the recovery-poller process — same pattern as
   caller sees are transient, so this counter is the alertable signal: any
   increment means a human must reconcile the payment against the cancelled
   order by hand — the auto-heal scan is a reserved decision, not built.
+* ``checkout_paid_without_consume_total`` — a succeeded payment whose order
+  could not consume its full stock because the reservation reaper released the
+  holds before the payment confirmed (the paid-without-consume window). The
+  saga compensates the order instead of paying it — the stock was already back
+  in the pool — so the succeeded payment lands on a cancelled order: same
+  manual-reconciliation shape as the orphaned pair above, found by the same
+  RUNBOOK §9 query. Any increment is alertable.
 """
 
 from __future__ import annotations
@@ -71,4 +78,10 @@ checkout_recovery_total = Counter(
 checkout_orphaned_paid_payments_total = Counter(
     "checkout_orphaned_paid_payments_total",
     "Succeeded payments on a cancelled order (the cancel won the guarded flip) — manual reconciliation required.",
+)
+
+checkout_paid_without_consume_total = Counter(
+    "checkout_paid_without_consume_total",
+    "Succeeded payments whose order could not consume its full stock (holds reaped before the payment "
+    "confirmed) — the order is compensated instead of paid; manual refund reconciliation required.",
 )

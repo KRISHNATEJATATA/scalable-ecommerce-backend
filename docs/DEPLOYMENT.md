@@ -1,7 +1,10 @@
 # Deployment
 
-Target: **AWS ECS Fargate** behind an ALB, image in **ECR**, IaC in **Terraform**.
-Full Fargate is built (Phase 12b); EKS is described only.
+Target: **AWS ECS Fargate** behind an ALB, image in **ECR**. Scope today: a
+production-shaped **Docker image**, the local parity stack, and CI. The **IaC
+(Terraform task definitions, ALB, VPC) is not yet authored** — this document
+describes the deployment target that IaC must produce; it is not a record of
+provisioned infrastructure. EKS is described only.
 
 ## Build & push
 
@@ -16,13 +19,10 @@ docker push <account>.dkr.ecr.<region>.amazonaws.com/ecommerce-backend:$SHA
 
 ## Apply infrastructure
 
-```bash
-cd infra/terraform          # (Phase 12b)
-terraform init
-terraform validate
-terraform plan  -var "image_tag=$SHA"
-terraform apply -var "image_tag=$SHA"
-```
+**IaC is not yet authored — there is nothing to apply today.** The sections
+below describe the task/service shape and wiring a future Terraform (or
+equivalent) must provision. Until then, deployment stops at the image:
+build, push to ECR, and run it wherever Docker runs.
 
 The ECS service runs multiple identical Fargate tasks (monolith-with-replicas)
 behind the ALB. The task role grants S3 access — **no AWS keys in code or env**.
@@ -71,7 +71,8 @@ pure Valkey (no Postgres): size it by memory, not connections.
 `CART_TTL_SECONDS` is the rolling inactivity expiry (~30d) — eviction empties a
 cart, which is acceptable here and never is for an order.
 
-**Topic ARNs.** Terraform provisions the per-event-type SNS topics, so give the relay task
+**Topic ARNs.** The per-event-type SNS topics must be provisioned out-of-band
+(once IaC exists, Terraform owns them), so give the relay task
 role `sns:Publish` only and point `BUS_TOPIC_ARN_PREFIX` at the ARN namespace
 (`arn:aws:sns:<region>:<account-id>:` — the topic name from `BUS_TOPIC_PREFIX` is appended).
 The relay then resolves ARNs by string with no API call; **it refuses to start** when
@@ -81,8 +82,8 @@ empty and `scripts/bus_bootstrap.py` creates the topics on LocalStack.
 
 **Worker metrics.** Only the API serves `/metrics`, so every worker above needs its own
 export or its counters are invisible. Set `WORKER_METRICS_PORT` on the long-running worker
-services and scrape it like any other target (docker-compose sets it on all six workers and
-publishes 9101–9106). Scheduled `--once` tasks (the reaper) exit
+services and scrape it like any other target (docker-compose sets it on all seven workers and
+publishes 9101–9107). Scheduled `--once` tasks (the reaper) exit
 between scrapes, so they push at exit instead — point `METRICS_PUSHGATEWAY_URL` at a
 Pushgateway. Both are opt-in; unset means no port bound and no push attempted. Alert rules
 and the postgres_exporter query behind the reaper's liveness signal ship in
@@ -178,16 +179,19 @@ aws ecs run-task \
   --cluster ecommerce \
   --task-definition ecommerce-migrate \
   --launch-type FARGATE \
-  --overrides '{"containerOverrides":[{"name":"app","command":["alembic","upgrade","head"]}]}'
+  --overrides '{"containerOverrides":[{"name":"app","command":["sh","-c","python -m alembic -c src/identity/alembic.ini upgrade head && python -m alembic -c src/catalog/alembic.ini upgrade head && python -m alembic -c src/inventory/alembic.ini upgrade head && python -m alembic -c src/orders/alembic.ini upgrade head && python -m alembic -c src/payments/alembic.ini upgrade head"]}]}'
 ```
 
-Alembic uses the **sync** `psycopg2` driver; the app uses async `asyncpg`.
+There is **no root `alembic.ini`**: each module owns an independent chain
+(the same loop `make migrate` runs). Alembic uses the **sync** `psycopg2`
+driver; the app uses async `asyncpg`.
 
 ## Secret & config wiring
 
 - Config is typed on `AppSettings`; supply values via ECS task-definition
   environment / secrets.
-- Secrets (DB password, JWT private key) come from **Secrets Manager / SSM**,
+- Secrets (DB password, payment webhook signing secret, Keycloak Admin API
+  client secret) come from **Secrets Manager / SSM**,
   injected as env vars — never baked into the image.
 - Every env var maps to an `AppSettings` field and appears in `.env.example`.
 
@@ -209,7 +213,7 @@ receives ECS SIGTERM directly — a shell-form `CMD` wraps it in `sh -c`, which
 does not forward signals. The shutdown chain is bounded, each stage strictly
 inside the next:
 
-1. **ECS `stopTimeout`** (30s default; the Terraform task definition must keep
+1. **ECS `stopTimeout`** (30s default; the task definition must keep
    it above everything below).
 2. **gunicorn `--graceful-timeout 15`** — workers stop accepting and finish
    in-flight requests; anything still running is SIGKILLed at the bound.
@@ -261,8 +265,8 @@ POST's size policy is pinned to the declared `content_length` (clamped by
 `IMAGE_MAX_UPLOAD_BYTES`). Bootstrap the local bucket, lifecycle rule, queue and
 notification with `make s3-setup` (or the `s3-setup` compose service); the queue's
 visibility timeout comes from `IMAGE_VISIBILITY_TIMEOUT_SECONDS` and the S3→SQS
-send policy is scoped with `aws:SourceArn`/`aws:SourceAccount` — mirror both in
-Terraform.
+send policy is scoped with `aws:SourceArn`/`aws:SourceAccount` — mirror both
+when authoring the IaC.
 
 #### Required task-role S3 permissions
 

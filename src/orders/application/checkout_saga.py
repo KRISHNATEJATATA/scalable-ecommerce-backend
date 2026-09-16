@@ -39,6 +39,7 @@ from src.orders.application.metrics import (
     checkout_attempts_total,
     checkout_compensation_total,
     checkout_orphaned_paid_payments_total,
+    checkout_paid_without_consume_total,
     checkout_recovery_total,
 )
 from src.orders.application.outbox import order_placed_outbox
@@ -347,6 +348,21 @@ class CheckoutSaga:
                     raise OrderStateConflictError(
                         "checkout commit timed out; it will be settled automatically"
                     ) from exc
+            # The paid-without-consume guard: commit_for_order reports how many
+            # of the order's holds it actually consumed (counted as the order's
+            # committed total, so a timed-out-but-landed first attempt is not a
+            # false shortfall). Fewer than the order has lines means the
+            # reaper released stock this payment never owned — paying would
+            # take money for units already sellable to someone else. Compensate
+            # is forbidden here (money moved): journal the shortfall, count it,
+            # and leave the order pending for the recovery poller, which
+            # cancels it and leaves the succeeded payment row for the manual
+            # reconciliation the RUNBOOK §9 query finds.
+            if not await self._commit_holds(order_id, expected=len(lines)):
+                await self._log(order_id, "commit", "shortfall")
+                raise OrderStateConflictError(
+                    "checkout stock could not be committed; the order will be settled automatically"
+                ) from None
             # Either attempt landed: close the step in the journal — the execution
             # trace must not show a paid order's commit stuck at "started".
             await self._log(order_id, "commit", "completed")
@@ -416,11 +432,12 @@ class CheckoutSaga:
     async def _compensate(self, order_id: uuid.UUID, failed_step: str) -> None:
         """Release every hold taken for the order, then cancel it (reverse order of the drive).
 
-        ``failed_step`` is ``reserve``/``charge`` on the live path and
-        ``crashed`` from the recovery poller — it labels
-        ``checkout_compensation_total``. A user-facing cancel is the mirror
-        image of compensation (Orders glossary) and deliberately never lands
-        here.
+        ``failed_step`` is ``reserve``/``charge`` on the live path,
+        ``crashed`` (payment failed or absent) or ``paid-without-consume``
+        (payment succeeded but the holds were reaped, ADR 0019) from the
+        recovery poller — it labels ``checkout_compensation_total``. A
+        user-facing cancel is the mirror image of compensation (Orders
+        glossary) and deliberately never lands here.
         """
         checkout_compensation_total.labels(failed_step).inc()
         await self._log(order_id, "compensate", "started")
@@ -484,7 +501,24 @@ class CheckoutSaga:
         """Settle one crashed order; returns which counter to bump."""
         payment = await self._charges.find_by_idempotency_key(payment_key_for(order.user_id, order.idempotency_key))
         if payment is not None and payment.succeeded:
-            await self._holds.commit_for_order(order.id)
+            # The paid-without-consume guard: a payment can confirm long after
+            # the reaper released this order's holds (the reconciler window
+            # spans days against a 15-minute reservation TTL). Committing
+            # fewer holds than the order has lines means the units were
+            # already sold back into the pool — marking the order PAID would
+            # take money for stock it no longer owns. Compensate instead:
+            # release whatever remains, cancel the order, count it loudly.
+            # The succeeded payment on the cancelled order is the orphan pair
+            # the RUNBOOK §9 query finds for a manual refund — the same
+            # accepted stance as the cancel-won race (no auto-repair).
+            if not await self._commit_holds(order.id, expected=len(order.items)):
+                log.error(
+                    "checkout order %s: payment succeeded after its stock holds expired; "
+                    "compensating instead of paying — manual refund reconciliation required",
+                    order.id,
+                )
+                await self._compensate(order.id, "paid-without-consume")
+                return "compensated"
             await self._orders.log_saga_step(order.id, "commit", "completed")
             await self._orders.log_saga_step(order.id, "mark_paid", "started")
             paid = await self._orders.transition_status(
@@ -503,6 +537,22 @@ class CheckoutSaga:
             await self._compensate(order.id, "crashed")
             return "compensated"
         return "deferred"  # payment still pending: the reconciler owns it for now
+
+    async def _commit_holds(self, order_id: uuid.UUID, *, expected: int) -> bool:
+        """Commit the order's holds and enforce the paid-implies-consumed invariant.
+
+        Returns ``True`` when every one of the order's lines was consumed
+        (``commit_for_order`` reports the order's committed total, so this is
+        retry-idempotent). On shortfall — holds the reaper released before the
+        payment confirmed — bumps ``checkout_paid_without_consume_total`` and
+        returns ``False``; the caller decides the terminal move (the drive
+        raises and leaves the order pending, the poller compensates).
+        """
+        committed = await self._holds.commit_for_order(order_id)
+        if committed >= expected:
+            return True
+        checkout_paid_without_consume_total.inc()
+        return False
 
     # --- internals -------------------------------------------------------
 
