@@ -141,6 +141,20 @@ class AuthorizationError(Exception):
         self.detail = detail
 
 
+class RateLimitExceededError(Exception):
+    """The caller exhausted a per-subject token-bucket limit → 429, retry later.
+
+    Carries the whole seconds until the next token refills so the RFC 9457 handler
+    can set the ``Retry-After`` header RFC 6585 requires on a 429; the client backs
+    off exactly that long instead of guessing. Raised by the rate-limit dependency
+    only when Valkey answered (a Valkey fault fails open, never this)."""
+
+    def __init__(self, *, retry_after_seconds: int, detail: str = "too many requests; slow down and retry") -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.retry_after_seconds = max(1, retry_after_seconds)
+
+
 class InsufficientStockError(Exception):
     """A reservation was rejected because free stock did not cover the request → 409.
 

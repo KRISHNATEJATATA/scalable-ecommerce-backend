@@ -39,6 +39,7 @@ from src.shared.errors.exceptions import (
     OrderStateConflictError,
     PaymentIdempotencyConflictError,
     PreconditionFailedError,
+    RateLimitExceededError,
     ReservationConflictError,
     ReservationContendedError,
     StockBelowReservedError,
@@ -66,6 +67,15 @@ async def _authentication_error_handler(_: Request, exc: AuthenticationError) ->
 
 async def _authorization_error_handler(_: Request, exc: AuthorizationError) -> JSONResponse:
     return _problem_response(403, title="Forbidden", detail=exc.detail)
+
+
+async def _rate_limit_handler(_: Request, exc: RateLimitExceededError) -> JSONResponse:
+    # 429 per RFC 6585: the flat Problem body plus the ``Retry-After`` delta-seconds
+    # header (how long until the next token refills), so a well-behaved client backs
+    # off the exact interval instead of hammering and re-tripping the same bucket.
+    response = _problem_response(429, title="Too Many Requests", detail=exc.detail)
+    response.headers["Retry-After"] = str(exc.retry_after_seconds)
+    return response
 
 
 async def _bad_request_handler(_: Request, exc: InvalidQueryParamError | InvalidCursorError) -> JSONResponse:
@@ -260,6 +270,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     """Wire the RFC 9457 handlers onto the app (called from the app factory)."""
     _register(app, AuthenticationError, _authentication_error_handler)
     _register(app, AuthorizationError, _authorization_error_handler)
+    _register(app, RateLimitExceededError, _rate_limit_handler)
     _register(app, InvalidQueryParamError, _bad_request_handler)
     _register(app, InvalidCursorError, _bad_request_handler)
     _register(app, InvalidUploadError, _detail_bad_request_handler)

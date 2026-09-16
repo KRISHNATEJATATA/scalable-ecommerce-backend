@@ -23,12 +23,17 @@ from src.shared.auth.principal import Principal
 from src.shared.container import CurrentUserDep, get_checkout_saga, get_orders_service
 from src.shared.db.pagination import DEFAULT_LIMIT, MAX_LIMIT, PageParams, PageResponse
 from src.shared.errors.exceptions import InvalidQueryParamError
+from src.shared.ratelimit import BUCKET_CHECKOUT, rate_limited
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 checkout_router = APIRouter(prefix="/checkout", tags=["checkout"])
 
 OrdersServiceDep = Annotated[OrdersService, Depends(get_orders_service)]
 CheckoutSagaDep = Annotated[CheckoutSaga, Depends(get_checkout_saga)]
+
+# Per-consumer checkout budget (Valkey token bucket keyed by the caller's sub). A
+# burst is an impatient shopper or a buggy retry loop, not a stream of real orders.
+_checkout_rate_limit = Depends(rate_limited(BUCKET_CHECKOUT))
 
 _NOT_FOUND = HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="order not found")
 
@@ -52,7 +57,9 @@ _STATUS_VALUES = {
 IdempotencyKeyDep = Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=200)]
 
 
-@checkout_router.post("", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
+@checkout_router.post(
+    "", response_model=OrderResponse, status_code=status.HTTP_201_CREATED, dependencies=[_checkout_rate_limit]
+)
 async def checkout(
     body: CheckoutRequest,
     saga: CheckoutSagaDep,

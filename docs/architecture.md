@@ -197,6 +197,26 @@ unavailable the read **degrades to a direct DB read** rather than erroring. The
 listing hot path stays uncached. Staleness is bounded by the relay poll + the
 entry TTL.
 
+### Rate limiting (app-level token bucket)
+
+Write-shaped endpoints are throttled by a per-subject **token bucket** in Valkey
+(`src/shared/ratelimit`): checkout, item create/update/delete (the `write` bucket),
+and image presign (`upload`). One atomic Lua script refills and spends the budget, so
+every API replica shares one view of a subject's tokens. A bucket is keyed by the
+authenticated caller's **OIDC `sub`** (the rate-limit dependency reuses the
+request-cached token validation — no second JWT decode); unauthenticated routes fall
+back to the **client IP** as rewritten by `ProxyHeadersMiddleware` for peers in
+`TRUSTED_PROXIES`. Capacity (burst), refill, and the refill period are
+`RATE_LIMIT_*` `AppSettings` fields per bucket — never inline constants. Exceeding a
+limit answers **429** as the standard RFC 9457 Problem (`Too Many Requests`) with the
+`Retry-After` header naming when the next token accrues.
+
+The limiter **fails open**: the flag off, no Valkey client, or a Valkey fault lets the
+request through (logged), because abuse control must never take checkout or merchant
+writes down with it. In prod the ALB's **AWS WAF rate-based rules** are the outer
+backstop (Terraform tickets); the app-level bucket protects what WAF can't see
+(per-user budgets inside allowed traffic).
+
 ## Checkout saga (orchestrated)
 
 Checkout is an **orchestrated saga** (`src/orders/application/checkout_saga.py`),

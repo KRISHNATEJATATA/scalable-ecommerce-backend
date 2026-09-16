@@ -109,6 +109,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "422":
           description: Invalid request body (e.g. non-positive price).
           content:
@@ -221,6 +223,8 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
     delete:
       tags: [catalog]
       operationId: deleteProduct
@@ -270,6 +274,8 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
   /v1/products/{product_id}/image:presign:
     parameters:
       - $ref: "#/components/parameters/ProductId"
@@ -316,6 +322,8 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
   /v1/checkout:
     post:
       tags: [checkout]
@@ -391,6 +399,8 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
   /v1/orders:
     get:
       tags: [orders]
@@ -983,6 +993,19 @@ components:
             $ref: "#/components/schemas/Problem"
     BadRequest:
       description: The request was malformed or failed validation (e.g. unsupported image type or size).
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    TooManyRequests:
+      description: >-
+        A per-subject rate-limit bucket is empty (Valkey token bucket, keyed by the
+        caller's `sub` — or client IP on unauthenticated routes). `Retry-After`
+        (seconds) names when the next token accrues; back off and retry then.
+      headers:
+        Retry-After:
+          description: Whole seconds until at least one token has refilled.
+          schema: { type: integer, minimum: 1 }
       content:
         application/problem+json:
           schema:

@@ -120,6 +120,27 @@ class AppSettings(BaseSettings):
         default_factory=lambda: ["127.0.0.1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
     )
 
+    # --- Rate limiting (app-level Valkey token bucket; ALB AWS WAF complements in prod) ---
+    # A per-subject token bucket: ``*_capacity`` is the burst ceiling, ``*_refill``
+    # tokens are restored every ``*_refill_seconds`` (sustained rate ≈ refill/period).
+    # Buckets are keyed by the authenticated user's OIDC ``sub``; unauthenticated
+    # routes fall back to the client IP (see ``src/shared/ratelimit``). ``false`` for
+    # the enabled flag short-circuits the check (tests/local or an emergency disable);
+    # a Valkey fault always fails open rather than refusing every write.
+    rate_limit_enabled: bool = True
+    # checkout (consumer): a burst is retries on one cart, not a stream of orders.
+    rate_limit_checkout_capacity: int = Field(default=30, gt=0)
+    rate_limit_checkout_refill: int = Field(default=30, gt=0)
+    rate_limit_checkout_refill_seconds: int = Field(default=60, gt=0)
+    # item create/update/delete (merchant console writes).
+    rate_limit_write_capacity: int = Field(default=120, gt=0)
+    rate_limit_write_refill: int = Field(default=120, gt=0)
+    rate_limit_write_refill_seconds: int = Field(default=60, gt=0)
+    # image presign (uploads) — minted one per image an editor attaches.
+    rate_limit_upload_capacity: int = Field(default=30, gt=0)
+    rate_limit_upload_refill: int = Field(default=30, gt=0)
+    rate_limit_upload_refill_seconds: int = Field(default=60, gt=0)
+
     # --- Feature flags (plain env booleans; not a flag service) ---
     enable_reviews: bool = False
 

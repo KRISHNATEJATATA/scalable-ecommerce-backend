@@ -34,6 +34,7 @@ from src.shared.auth.dependencies import PrincipalDep, require_role
 from src.shared.auth.principal import Principal
 from src.shared.container import CurrentUserDep, get_catalog_service
 from src.shared.db.pagination import DEFAULT_LIMIT, MAX_LIMIT, PageParams, PageResponse
+from src.shared.ratelimit import BUCKET_UPLOAD, BUCKET_WRITE, rate_limited
 
 router = APIRouter(prefix="/products", tags=["catalog"])
 
@@ -43,6 +44,13 @@ CatalogServiceDep = Annotated[CatalogService, Depends(get_catalog_service)]
 # also injects the ``Principal`` (update/delete need ``is_admin``).
 _merchant_principal = Depends(require_role("merchant", "admin"))
 MerchantPrincipalDep = Annotated[Principal, _merchant_principal]
+
+# Per-merchant write/upload budgets (Valkey token bucket keyed by the caller's sub).
+# One shared marker per bucket, reused across every gated route (like the merchant
+# gate above), so create/update/delete share the "write" bucket and the image
+# presign has its own "upload" bucket.
+_write_rate_limit = Depends(rate_limited(BUCKET_WRITE))
+_upload_rate_limit = Depends(rate_limited(BUCKET_UPLOAD))
 
 _NOT_FOUND = HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="product not found")
 
@@ -149,14 +157,17 @@ async def get_product(
 
 
 @router.post(
-    "", response_model=ProductResponse, status_code=status.HTTP_201_CREATED, dependencies=[_merchant_principal]
+    "",
+    response_model=ProductResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[_merchant_principal, _write_rate_limit],
 )
 async def create_product(body: ProductCreate, service: CatalogServiceDep, caller: CurrentUserDep) -> ProductResponse:
     """Create a product owned by the authenticated merchant (emits ``ProductCreated``)."""
     return await service.create_product(merchant_id=caller.id, data=body)
 
 
-@router.patch("/{product_id}", response_model=ProductResponse)
+@router.patch("/{product_id}", response_model=ProductResponse, dependencies=[_write_rate_limit])
 async def update_product(
     product_id: uuid.UUID,
     body: ProductUpdate,
@@ -184,7 +195,9 @@ async def update_product(
     return product
 
 
-@router.delete("/{product_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
+@router.delete(
+    "/{product_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None, dependencies=[_write_rate_limit]
+)
 async def delete_product(
     product_id: uuid.UUID,
     service: CatalogServiceDep,
@@ -204,7 +217,7 @@ async def delete_product(
         raise _NOT_FOUND
 
 
-@router.post("/{product_id}/image:presign", response_model=ImagePresignResponse)
+@router.post("/{product_id}/image:presign", response_model=ImagePresignResponse, dependencies=[_upload_rate_limit])
 async def presign_product_image(
     product_id: uuid.UUID,
     body: ImagePresignRequest,
