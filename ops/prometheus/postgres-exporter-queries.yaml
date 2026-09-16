@@ -20,3 +20,34 @@ inventory_reservations:
     - expired_holds:
         usage: "GAUGE"
         description: "Reservations past expires_at still held — the reaper's backlog. Healthy = near zero."
+
+retention_backlog:
+  # The retention prune's *liveness* signal, same doctrine as the reaper's: a
+  # prune that never runs deletes nothing, so its counter stays silent — the
+  # prunable-row backlog in Postgres keeps answering regardless. Row counts are
+  # cheap seq scans here because a healthy prune empties them; keep the day
+  # windows in sync with the OUTBOX_/RESERVATION_/SAGA_LOG_RETENTION_DAYS
+  # defaults (docs/RUNBOOK.md §14). Alert: ops/prometheus/retention-prune-alerts.yaml.
+  query: >-
+    SELECT
+      (SELECT count(*) FROM catalog.outbox WHERE published_at IS NOT NULL AND occurred_at < now() - interval '7 days')
+      + (SELECT count(*) FROM inventory.outbox WHERE published_at IS NOT NULL AND occurred_at < now() - interval '7 days')
+      + (SELECT count(*) FROM orders.outbox WHERE published_at IS NOT NULL AND occurred_at < now() - interval '7 days')
+      + (SELECT count(*) FROM payments.outbox WHERE published_at IS NOT NULL AND occurred_at < now() - interval '7 days')
+      + (SELECT count(*) FROM identity.outbox WHERE published_at IS NOT NULL AND occurred_at < now() - interval '7 days')
+        AS prunable_outbox,
+      (SELECT count(*) FROM inventory.reservations
+        WHERE status IN ('released', 'committed') AND updated_at < now() - interval '90 days') AS prunable_reservations,
+      (SELECT count(*) FROM orders.saga_log s JOIN orders.orders o ON o.id = s.order_id
+        WHERE o.status <> 'pending' AND o.updated_at < now() - interval '90 days') AS prunable_saga_log
+  master: true
+  metrics:
+    - prunable_outbox:
+        usage: "GAUGE"
+        description: "Published outbox rows past outbox_retention_days across all five module schemas."
+    - prunable_reservations:
+        usage: "GAUGE"
+        description: "Terminal reservations past reservation_retention_days."
+    - prunable_saga_log:
+        usage: "GAUGE"
+        description: "saga_log rows of terminal-status orders past saga_log_retention_days."

@@ -58,7 +58,7 @@ make install                  # pip install -r requirements.txt && pip install -
 make compose-up               # Postgres + Valkey + LocalStack (S3/SNS/SQS) + ElasticMQ + Keycloak + Mailpit
                               # + one-shot migrate/bus-setup/s3-setup
                               # + app + relay + image-worker + cache-worker + cart-consumer
-                              # + reaper + payment-reconciler + saga-recovery
+                              # + reaper + payment-reconciler + saga-recovery + retention-prune
 make seed                     # demo state: 5 users, 11 products (5+6 across two
                               # merchants) with images + stock (9x25, one sold-out, one low).
                               # Idempotent; `make seed-reset` wipes + re-seeds (fresh user subs)

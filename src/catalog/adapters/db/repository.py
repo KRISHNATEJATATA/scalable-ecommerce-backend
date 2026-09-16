@@ -226,10 +226,33 @@ class CatalogRepository:
         return aggregate
 
     async def soft_delete_product(self, product: ProductRecord, outbox: OutboxMessage) -> None:
-        """Soft-delete (``deleted_at``) + emit the ``ProductDeleted`` outbox row."""
+        """Soft-delete (``deleted_at``) + emit the ``ProductDeleted`` outbox row.
+
+        Also queues the product's public renditions into ``catalog.image_reclaim``
+        **in the same transaction** — the same durable-queue pattern the
+        superseded-flip path uses. A soft-deleted product can never serve its
+        objects again (``deleted_at`` is the tombstone; the reclaim worker's
+        liveness re-check reads only live products), yet nothing else would ever
+        delete them: ``public/`` is live CDN content outside the ``uploads/``
+        lifecycle rule, so without this row an orphaned product's images would be
+        served from the CDN forever.
+
+        One row for the **main** key — the worker derives and deletes the two
+        thumbnails from it (:func:`~src.catalog.domain.image_keys.public_rendition_keys`),
+        exactly like every other reclaim row. Idempotent under replay via the
+        table's unique ``object_key`` (``ON CONFLICT DO NOTHING``).
+        """
         aggregate = self._aggregate(product)
         aggregate.deleted_at = datetime.now(UTC)
         self._session.add(self._outbox_row(outbox))
+        if aggregate.image_key:
+            await self._session.execute(
+                text(
+                    f"INSERT INTO {SCHEMA}.image_reclaim (product_id, object_key) "
+                    "VALUES (:pid, :key) ON CONFLICT (object_key) DO NOTHING"
+                ),
+                {"pid": aggregate.id, "key": aggregate.image_key},
+            )
         await self._commit_versioned()
 
     # --- image pipeline state (presign sets pending; the worker marks ready/failed) ---

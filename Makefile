@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help install run lint typecheck test loadtest migrate compose-up compose-down seed seed-reset hooks gen-alembic-env relay bus-setup s3-setup image-worker cache-worker cart-consumer reaper
+.PHONY: help install run lint typecheck test loadtest migrate compose-up compose-down seed seed-reset hooks gen-alembic-env relay bus-setup s3-setup image-worker cache-worker cart-consumer reaper prune
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS=":.*?## "}; {printf "%-14s %s\n", $$1, $$2}'
@@ -55,6 +55,9 @@ cart-consumer: ## Run the cart product-event worker (service role; ProductUpdate
 
 reaper: ## Run the reservation reaper (service role; releases expired stock holds)
 	python -m src.inventory.adapters.reaper
+
+prune: ## Run the retention prune (published outbox / terminal reservations / settled saga_log; --once for scheduled mode)
+	python -m scripts.retention_prune
 
 gen-alembic-env: ## Regenerate each module's env.py from scripts/alembic_env.py.tmpl
 	python scripts/generate_alembic_env.py

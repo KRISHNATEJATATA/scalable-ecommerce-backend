@@ -272,6 +272,8 @@ Published through a **transactional outbox → SNS/SQS bus** (see ADR 0007), nev
 and an `outbox` row in **one transaction**; a `service`-role **relay** claims unpublished rows
 (`FOR UPDATE SKIP LOCKED`), publishes them to SNS (**topic per event type**, **standard**
 queues), then marks them published — publish-then-mark, so a crash re-ships (at-least-once).
+Published rows are history, not storage: the retention prune deletes them after
+`OUTBOX_RETENTION_DAYS` (7) so they don't accumulate forever (RUNBOOK §14).
 
 Each consumer reads its own SQS subscription and is **idempotent**: it dedupes on the envelope
 `event_id`, namespaced by its own consumer identity (`event:{consumer}:{event_id}`, so fan-out
@@ -336,6 +338,11 @@ prod, compose services locally — never `BackgroundTasks`:
   (the missed-webhook backstop; same guarded transitions as the webhook).
 - **Saga recovery poller** (`src.shared.saga_recovery`): settles checkout
   orders still `pending` past the saga step timeout (see Checkout saga).
+- **Retention prune** (`scripts.retention_prune`): one shared batched sweep
+  deleting terminal history past its retention — published outbox rows,
+  released/committed reservations, `saga_log` of terminal orders. The
+  reservation/saga-log retentions are validated to exceed the payment
+  reconciliation window so a recovery replay never under-counts (RUNBOOK §14).
 
 ## Correctness invariants (never simplify away)
 

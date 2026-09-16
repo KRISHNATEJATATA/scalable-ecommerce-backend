@@ -481,6 +481,52 @@ capacity suspicion before/after changes. Tune arrivals with `K6_RATE`
 CI or a jumpbox against a staging service rather than from a laptop: the SLO is
 a service-level claim, not a client-network claim.
 
+### 14. Retention prune (terminal history nobody reads)
+
+Four growth paths are written forever and read never once their settlement window
+closes — a pure write-amplification tax on every committed transaction. One shared
+batched sweep (`python -m scripts.retention_prune`, compose service
+`retention-prune`; EventBridge-scheduled `--once` ECS task in prod, reaper-shaped)
+deletes them; there is deliberately **no hard delete of soft-deleted products**
+(`deleted_at` *is* the feature) and **no `public/` S3 lifecycle rule** (live CDN
+content — orphaned renditions are reclaimed in code by the image worker's drain,
+see §6):
+
+| Growth path | Where | Prune | Default retention | Safe because |
+|---|---|---|---|---|
+| Published outbox rows | `<schema>.outbox` ×5 | `published_at IS NOT NULL` past age | `OUTBOX_RETENTION_DAYS` (7) | terminal once shipped — the relay claims only unpublished rows |
+| Terminal reservations | `inventory.reservations` | `released`/`committed` past age | `RESERVATION_RETENTION_DAYS` (90) | must exceed the reconciliation window (validator) — the recovery replay's retry-safety counts committed rows |
+| Settled saga journal | `orders.saga_log` | rows of terminal-status orders past age | `SAGA_LOG_RETENTION_DAYS` (90) | the recovery poller journals only `pending` checkouts |
+| Orphaned `public/` images | S3 objects | **not this job** — `catalog.image_reclaim` + the image worker's drain (§6) | until drained | soft-delete queues the main key in the delete transaction |
+
+The reservation/saga-log retentions are **enforced** to exceed
+`PAYMENT_RECONCILIATION_MAX_AGE_SECONDS` (`AppSettings` validator): pruning them
+inside the settlement window would let a crashed-checkout replay under-count
+committed rows and compensate a settled order — the paid-without-consume class.
+
+Deletes run in batches (`RETENTION_PRUNE_BATCH_SIZE`, 1000) until a pass comes back
+short, so a prune never holds a long lock on a hot table. Each deleted table counts
+into `retention_pruned_total{table}` (scrape port when looping, Pushgateway when
+`--once`).
+
+```sql
+-- THE prune alert: prunable rows still sitting there. Healthy = near zero
+-- between passes (three hours continuous > 0 ⇒ ≥3 passes missed).
+SELECT (SELECT count(*) FROM catalog.outbox WHERE published_at IS NOT NULL
+          AND occurred_at < now() - interval '7 days') AS prunable_outbox,
+       (SELECT count(*) FROM inventory.reservations
+          WHERE status IN ('released','committed')
+          AND updated_at < now() - interval '90 days') AS prunable_reservations,
+       (SELECT count(*) FROM orders.saga_log s JOIN orders.orders o ON o.id = s.order_id
+          WHERE o.status <> 'pending' AND o.updated_at < now() - interval '90 days') AS prunable_saga_log;
+```
+
+**Monitoring.** If the prune task is down, `retention_pruned_total` goes stale — a
+worker that never runs emits nothing, so liveness is the backlog query above, shipped
+as `ops/prometheus/retention-prune-alerts.yaml` (`RetentionPruneBacklog`, `for: 3h`)
+fed by the `retention_backlog` postgres_exporter query. The per-table counter says
+what ran; the backlog says what it failed to.
+
 ## Post-incident
 - Re-enable automated backups on the promoted instance.
 - Rotate any exposed secrets (JWT keys, DB creds) via Secrets Manager.

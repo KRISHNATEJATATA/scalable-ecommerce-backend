@@ -1,0 +1,35 @@
+# Prometheus alerting rules for the retention prune — add to `rule_files:`.
+#
+# One signal, because the prune is one shared job over all five module schemas
+# (not five workers): the **backlog** — prunable rows still sitting in Postgres,
+# sourced from postgres-exporter-queries.yaml so it fires even when the prune is
+# completely dead. Liveness-by-backlog, the reaper's doctrine: a prune that
+# never runs emits nothing, so `retention_pruned_total` silence is ambiguous
+# while a stuck backlog is not.
+#
+# `for: 3h` absorbs normal idleness: the local loop prunes hourly, so the
+# backlog routinely rises between passes and returns to zero after each one.
+# Three hours of *continuous* backlog means at least three passes were missed.
+# Runbook: docs/RUNBOOK.md §14.
+
+groups:
+  - name: retention-prune
+    rules:
+      - alert: RetentionPruneBacklog
+        # Terminal history accumulating past its retention — a write tax on
+        # every committed transaction in the affected tables.
+        expr: >-
+          retention_backlog_prunable_outbox > 0
+          or retention_backlog_prunable_reservations > 0
+          or retention_backlog_prunable_saga_log > 0
+        for: 3h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Terminal rows are accumulating past their retention"
+          description: >-
+            The retention prune is down or falling behind: rows past their
+            retention window (outbox {{ $value | humanize }} across five schemas
+            when outbox leads) have not been deleted for 3h. Check the
+            retention-prune task/schedule; per-table breakdown in
+            docs/RUNBOOK.md §14.

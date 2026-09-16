@@ -12,6 +12,7 @@ global:
 
 rule_files:
   - /etc/prometheus/inventory-reaper-alerts.yaml
+  - /etc/prometheus/retention-prune-alerts.yaml
 
 scrape_configs:
   # The API's /metrics: RED per endpoint (http_requests_total,
@@ -35,6 +36,7 @@ scrape_configs:
           - reaper:9100
           - payment-reconciler:9100
           - saga-recovery:9100
+          - retention-prune:9100
 
   # The DB itself: expired-hold backlog, outbox age checks — the alert signal
   # that outlives a dead exporter or worker (postgres_exporter with

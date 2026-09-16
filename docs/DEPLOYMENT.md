@@ -41,6 +41,7 @@ depth):
 | Cart consumer | `python -m src.cart.adapters.cart_consumer` | `cart-events` | refresh/prune Valkey cart snapshots on `ProductUpdated`/`ProductDeleted` |
 | Reservation reaper | `python -m src.inventory.adapters.reaper` | Postgres `reservations` | release holds past `expires_at` (SKIP LOCKED) so a stalled saga can't leak stock |
 | Payment reconciler | `python -m src.payments.adapters.reconciler` | Postgres `payments` | resolve charges still `pending` past their grace window by asking the gateway (missed-webhook backstop) |
+| Retention prune | `python -m scripts.retention_prune` | Postgres `outbox`×5 + `reservations` + `saga_log` | batched deletes of terminal history past its retention (published outbox rows, released/committed reservations, saga_log of terminal orders) — see RUNBOOK §14 |
 
 The reaper polls Postgres, not a queue: run it as a small always-on service, or as
 an **EventBridge-scheduled one-off task** with `--once` (it exits after a single
@@ -52,6 +53,17 @@ for liveness rather than on counter silence — a worker that never runs emits n
 `inventory_reaper_released_total` still reaches Prometheus via `WORKER_METRICS_PORT` (looping)
 or `METRICS_PUSHGATEWAY_URL` (`--once`); see `docs/RUNBOOK.md` §8. Set
 `RESERVATION_TTL_SECONDS` **longer than the checkout saga's step timeouts**.
+
+The **retention prune** is the same reaper shape: a small always-on service, or —
+the recommended prod shape — an **EventBridge-scheduled one-off task** with `--once`
+(hourly is plenty; the backlog is dead history, not live stock). Losing it doesn't
+lose data; it just lets published outbox rows, terminal reservations and settled
+`saga_log` rows accumulate forever as a write tax. Keep
+`RESERVATION_RETENTION_DAYS` / `SAGA_LOG_RETENTION_DAYS` **longer than
+`PAYMENT_RECONCILIATION_MAX_AGE_SECONDS`** (startup refuses smaller values) so a
+crashed-checkout recovery replay never under-counts committed rows. Liveness is
+liveness-by-backlog — alarm on `RetentionPruneBacklog` (`ops/prometheus/`), not on
+counter silence; `retention_pruned_total{table}` says what ran (RUNBOOK §14).
 
 The **image, cache, and cart workers** drain a standard SQS queue with a DLQ; set the queue
 **visibility timeout ≥ the consumer's processing lease** (`CONSUMER_LEASE_TTL_SECONDS`)
@@ -82,11 +94,11 @@ empty and `scripts/bus_bootstrap.py` creates the topics on LocalStack.
 
 **Worker metrics.** Only the API serves `/metrics`, so every worker above needs its own
 export or its counters are invisible. Set `WORKER_METRICS_PORT` on the long-running worker
-services and scrape it like any other target (docker-compose sets it on all seven workers and
-publishes 9101–9107). Scheduled `--once` tasks (the reaper) exit
+services and scrape it like any other target (docker-compose sets it on all eight workers and
+publishes 9101–9108). Scheduled `--once` tasks (the reaper, the retention prune) exit
 between scrapes, so they push at exit instead — point `METRICS_PUSHGATEWAY_URL` at a
 Pushgateway. Both are opt-in; unset means no port bound and no push attempted. Alert rules
-and the postgres_exporter query behind the reaper's liveness signal ship in
+and the postgres_exporter queries behind the workers' liveness signals ship in
 `ops/prometheus/`.
 
 **Connection budget.** Every process builds its own pool, and they all draw on the same

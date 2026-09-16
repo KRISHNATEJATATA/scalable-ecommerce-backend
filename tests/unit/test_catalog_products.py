@@ -819,6 +819,67 @@ async def test_mark_image_ready_returns_the_key_it_replaced(sessionmaker):
     assert [(r.object_key, r.attempts) for r in queued] == [("public/first.webp", 0)]
 
 
+async def test_soft_delete_queues_public_renditions_for_reclaim(sessionmaker):
+    """Deleting a product must schedule its public images for deletion **in the same
+    transaction** — ``public/`` sits outside the ``uploads/`` lifecycle rule, so without
+    this an orphaned product's CDN objects would live forever. One row for the main
+    key: the drain derives and deletes both thumbnails from it. Idempotent under a
+    pre-queued same-key row (``ON CONFLICT DO NOTHING``)."""
+
+    pid = await _seed_pending(sessionmaker, "tokD")
+    async with sessionmaker() as s:
+        await CatalogRepository(s).mark_image_ready(pid, "tokD", "public/dead.webp")
+
+    async with sessionmaker() as s:  # pre-queue the same key: a replay must not double-queue
+        await CatalogRepository(s).schedule_image_reclaim(pid, "public/dead.webp")
+    async with sessionmaker() as s:
+        repo = CatalogRepository(s)
+        product = await repo.get_product(pid)
+        await repo.soft_delete_product(product, ("ProductDeleted", json.dumps({"type": "ProductDeleted"})))
+
+    async with sessionmaker() as s:
+        deleted_at = (
+            await s.execute(text("SELECT deleted_at FROM catalog.products WHERE id = :id"), {"id": pid})
+        ).scalar_one()
+        queued = (
+            (await s.execute(text("SELECT object_key FROM catalog.image_reclaim WHERE product_id = :id"), {"id": pid}))
+            .scalars()
+            .all()
+        )
+    assert deleted_at is not None
+    assert queued == ["public/dead.webp"]  # one row, not three — thumbnails derive at drain time
+
+    # The worker half on the real repository: claim → (liveness re-check finds the
+    # product deleted) → finish drops the row, so a re-run claims nothing.
+    async with sessionmaker() as s:
+        claimed = [t for t in await CatalogRepository(s).claim_image_reclaims(batch_size=50) if t.product_id == pid]
+    assert [t.object_key for t in claimed] == ["public/dead.webp"]
+    async with sessionmaker() as s:
+        assert await CatalogRepository(s).current_image_key(pid) is None  # deleted → drain proceeds
+        await CatalogRepository(s).finish_image_reclaim([t.id for t in claimed])
+    async with sessionmaker() as s:
+        left = (
+            await s.execute(text("SELECT count(*) FROM catalog.image_reclaim WHERE product_id = :id"), {"id": pid})
+        ).scalar_one()
+    assert left == 0
+
+
+async def test_soft_delete_without_image_queues_nothing(sessionmaker):
+    """A product that never had an image leaves no reclaim work behind."""
+
+    pid = await _seed_pending(sessionmaker, "tokE")  # pending, no image_key yet
+    async with sessionmaker() as s:
+        repo = CatalogRepository(s)
+        product = await repo.get_product(pid)
+        await repo.soft_delete_product(product, ("ProductDeleted", json.dumps({"type": "ProductDeleted"})))
+
+    async with sessionmaker() as s:
+        queued = (
+            await s.execute(text("SELECT count(*) FROM catalog.image_reclaim WHERE product_id = :id"), {"id": pid})
+        ).scalar_one()
+    assert queued == 0
+
+
 async def test_image_reclaim_is_leased_on_claim_and_dropped_when_finished(sessionmaker):
     """The cleanup queue behaves like a lease: a claim bumps ``attempts`` and pushes
     ``next_attempt_at`` out, so a crashed sweep retries instead of leaking the object,

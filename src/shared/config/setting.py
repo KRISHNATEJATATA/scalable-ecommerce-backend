@@ -304,6 +304,29 @@ class AppSettings(BaseSettings):
     # duplicate order, degrading to re-reading the stored order (or 409).
     checkout_idempotency_ttl_seconds: int = Field(default=86400, gt=0)  # ~24h
 
+    # --- Retention prune (scripts/retention_prune.py) ---
+    # Growth hygiene: published outbox rows, terminal reservations and settled
+    # saga_log rows are history nobody reads after their settlement window, but
+    # without pruning they accumulate forever in five schemas — a write tax on
+    # every committed transaction. One shared one-shot/looping prune (never five
+    # workers) deletes them in batches.
+    # Published outbox rows are terminal-once-shipped (the relay never re-reads
+    # them, the reconciler never reads the outbox), so their retention has no
+    # settlement coupling. The other two DO: the reservation reaper/recovery
+    # poller can still settle a crashed checkout inside
+    # PAYMENT_RECONCILIATION_MAX_AGE_SECONDS (they count committed rows /
+    # journal reads for retry-safety), so pruning those earlier re-opens the
+    # paid-without-consume class — enforced below, not documented and hoped for.
+    outbox_retention_days: int = Field(default=7, gt=0)
+    reservation_retention_days: int = Field(default=90, gt=0)
+    saga_log_retention_days: int = Field(default=90, gt=0)
+    # Compose runs the prune as a looping service (EventBridge-scheduled --once
+    # in prod); this is the idle cadence, like the reaper's poll interval.
+    retention_prune_poll_interval_seconds: float = Field(default=3600.0, gt=0)
+    # Max rows deleted per DELETE statement/table per pass: a prune must never
+    # hold a long lock on a hot table.
+    retention_prune_batch_size: int = Field(default=1000, gt=0)
+
     # --- Resilience: bounded retries + circuit breakers (payment gateway, Keycloak Admin API) ---
     # Retries back off exponentially with full jitter and are **bounded**
     # (``resilience_max_attempts`` total tries) — the breaker is the real defense.
@@ -476,6 +499,35 @@ class AppSettings(BaseSettings):
                 "payment_stub_pending_token_substring is only allowed with environment local/dev: "
                 "the deferred-settlement demo trigger must never be enabled where real checkouts run"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _require_retention_beyond_reconciliation_window(self) -> "AppSettings":
+        """Fail-fast: never prune settlement-sensitive history inside the settlement window.
+
+        The reservation reaper and the saga recovery poller settle crashed
+        checkouts for up to ``payment_reconciliation_max_age_seconds``; the
+        recovery replay's retry-safety counts committed reservation rows and
+        reads the ``saga_log`` journal. Pruning either before that window
+        closes makes a replay under-count (a false shortfall) and compensate a
+        fully-consumed order — re-opening the exact paid-without-consume class
+        ADR 0019 handles. The relationship is what makes pruning safe, so it is
+        enforced, not documented and hoped for. Published outbox rows are
+        deliberately NOT coupled: the relay never re-reads them and the
+        reconciler never reads the outbox, so their retention is pure storage
+        hygiene.
+        """
+        window_days = self.payment_reconciliation_max_age_seconds / 86400
+        for name, days in (
+            ("reservation_retention_days", self.reservation_retention_days),
+            ("saga_log_retention_days", self.saga_log_retention_days),
+        ):
+            if days <= window_days:
+                raise ValueError(
+                    f"{name} must exceed payment_reconciliation_max_age_seconds "
+                    f"({days}d <= {self.payment_reconciliation_max_age_seconds}s): "
+                    "pruning inside the settlement window can compensate a settled order"
+                )
         return self
 
     @model_validator(mode="after")

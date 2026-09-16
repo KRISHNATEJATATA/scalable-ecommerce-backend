@@ -371,6 +371,30 @@ services:
       - "9107:9100"
     command: ["python", "-m", "src.shared.saga_recovery"]
 
+  # The shared retention prune: one batched sweep deleting terminal history
+  # nobody reads after the settlement window — published outbox rows (five
+  # module schemas), released/committed reservations, saga_log of terminal
+  # orders. Cron-style loop locally; an EventBridge-scheduled `--once` ECS task
+  # in prod, exactly like the reaper. Retentions MUST stay beyond the payment
+  # reconciliation window (validated at startup).
+  retention-prune:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ecommerce:ecommerce@postgres:5432/ecommerce
+      OUTBOX_RETENTION_DAYS: "7"
+      RESERVATION_RETENTION_DAYS: "90"
+      SAGA_LOG_RETENTION_DAYS: "90"
+      RETENTION_PRUNE_POLL_INTERVAL_SECONDS: "3600.0"
+      WORKER_METRICS_PORT: "9100"
+    ports:
+      - "9108:9100"
+    command: ["python", "-m", "scripts.retention_prune"]
+
   # Optional monitoring profile: scrapes the API's /metrics (RED per endpoint,
   # checkout counters, outbox lag) and every worker's WORKER_METRICS_PORT.
   # Start with: docker compose --profile monitoring up -d prometheus
@@ -382,6 +406,7 @@ services:
     volumes:
       - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./ops/prometheus/inventory-reaper-alerts.yaml:/etc/prometheus/inventory-reaper-alerts.yaml:ro
+      - ./ops/prometheus/retention-prune-alerts.yaml:/etc/prometheus/retention-prune-alerts.yaml:ro
       - ./ops/prometheus/postgres-exporter-queries.yaml:/etc/prometheus/postgres-exporter-queries.yaml:ro
 
   # Same profile, second half: the DB-side exporter whose queries (expired-hold
