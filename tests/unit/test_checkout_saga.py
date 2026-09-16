@@ -564,7 +564,13 @@ async def test_charge_timeout_with_unknown_outcome_leaves_pending_for_recovery(s
         OrderStockHolds(inventory),
         _HangingCharges(),
         _Idempotency(),
-        step_timeout_seconds=0.05,
+        # One timeout for every step — including the reserve step's own DB
+        # commits. 50 ms raced them on slow CI runners: cancelling an in-flight
+        # asyncpg statement poisoned the session and the drive died with
+        # PendingRollbackError instead of the charge timeout under test.
+        # 0.5 s gives the reserve 10× margin while the hanging charge still
+        # blows straight past it (sleeps 30 s).
+        step_timeout_seconds=0.5,
     )
     try:
         await saga.checkout(user_id=USER_A, idempotency_key="key-hang", payment_token="tok_visa")
@@ -619,7 +625,10 @@ async def test_charge_timeout_with_pending_payment_leaves_pending_not_cancelled(
         OrderStockHolds(inventory),
         _HangingAfterRowCharges("key-hang-pending"),
         _Idempotency(),
-        step_timeout_seconds=0.05,
+        # Same margin as the unknown-outcome test above: the timeout covers the
+        # reserve step's and the payment row's own DB commits too — 50 ms raced
+        # them on slow CI runners and poisoned the session mid-statement.
+        step_timeout_seconds=0.5,
     )
     try:
         await saga.checkout(user_id=USER_A, idempotency_key="key-hang-pending", payment_token="tok_visa")
