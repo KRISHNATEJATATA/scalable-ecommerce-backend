@@ -10,9 +10,10 @@ from src.shared.config.setting import AppSettings
 _DB_URL_SCHEME = "postgresql+asyncpg"
 _DSN = f"{_DB_URL_SCHEME}://u:p@localhost:5432/db"
 
-_MODULES = ["catalog", "inventory", "orders", "payments", "identity", "cart"]
+_MODULES = ["catalog", "inventory", "orders", "payments", "identity", "cart", "notifications"]
 _LAYERS = ["api", "application", "domain", "ports", "adapters"]
-_DB_MODULES = ["catalog", "inventory", "orders", "payments", "identity"]  # cart has no DB schema (Valkey-only)
+# cart has no DB schema (Valkey-only); notifications does (sent_emails + recipients + suppressions).
+_DB_MODULES = ["catalog", "inventory", "orders", "payments", "identity", "notifications"]
 
 SRC_MODULES = [
     "src",

@@ -24,6 +24,7 @@ modules =
     src.payments
     src.identity
     src.cart
+    src.notifications
 ; the composition root (src/shared/container.py) is the one place allowed to
 ; wire every module together for DI — routes depending on it isn't a
 ; cross-module import, so exclude that edge from the independence check.
@@ -143,4 +144,23 @@ source_modules =
 forbidden_modules =
     src.cart.ports
     src.cart.adapters
+
+[importlinter:contract:notifications-layers]
+name = notifications: api -> application -> domain (ports/adapters at the edges only)
+type = layers
+layers =
+    api
+    application
+    domain
+containers =
+    src.notifications
+
+[importlinter:contract:notifications-domain-forbidden]
+name = notifications.domain never imports ports/adapters (wiring happens in src/shared/container.py)
+type = forbidden
+source_modules =
+    src.notifications.domain
+forbidden_modules =
+    src.notifications.ports
+    src.notifications.adapters
 

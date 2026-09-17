@@ -1,6 +1,6 @@
 """Regenerate each module's Alembic ``env.py`` from one template.
 
-The 5 per-module ``env.py`` files are identical except for the module name
+The 6 per-module ``env.py`` files are identical except for the module name
 This script is the single place to change the shared body; the generated
 files stay boring and reviewable in git.
 
@@ -14,7 +14,7 @@ from string import Template
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE_PATH = REPO_ROOT / "scripts" / "alembic_env.py.tmpl"
-MODULES = ["identity", "catalog", "inventory", "orders", "payments"]
+MODULES = ["identity", "catalog", "inventory", "orders", "payments", "notifications"]
 
 
 def main() -> None:

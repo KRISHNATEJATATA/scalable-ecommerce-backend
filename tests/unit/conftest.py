@@ -21,7 +21,7 @@ from testcontainers.postgres import PostgresContainer
 from src.shared.config.setting import get_settings
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-MODULES = ["identity", "catalog", "inventory", "orders", "payments"]
+MODULES = ["identity", "catalog", "inventory", "orders", "payments", "notifications"]
 
 # Every table the tests can write, truncated (with CASCADE for the intra-module
 # FKs) so no rows leak between tests — payments accumulate per order_id today,
@@ -31,7 +31,9 @@ _TRUNCATE = text(
     "orders.order_items, orders.orders, orders.outbox, "
     "inventory.reservations, inventory.inventory, inventory.outbox, "
     "identity.users, identity.outbox, "
-    "payments.payments, payments.outbox CASCADE"
+    "payments.payments, payments.outbox, "
+    "notifications.recipients, notifications.sent_emails, "
+    "notifications.email_suppressions CASCADE"
 )
 
 

@@ -274,6 +274,25 @@ class AppSettings(BaseSettings):
     # SQS queue the cart product-event consumer drains. LocalStack locally.
     cart_queue_url: str | None = None
 
+    # --- Notifications (order-confirmation consumer) ---
+    # The worker drains OrderPlaced (+ UserCreated) from its own queue and sends
+    # the order-confirmation email. The recipient is materialized bus-side from
+    # UserCreated events (which carry user_id + email) into the module's own
+    # notifications.recipients table — no cross-module identity read.
+    notifications_queue_url: str | None = None
+    # The sender transport: smtp (Mailpit locally) or ses (AWS SES in prod; the
+    # ECS task role supplies credentials, no keys in code).
+    notifications_transport: Literal["smtp", "ses"] = "smtp"
+    # SMTP host/port for the smtp transport (compose: `mailpit` on the compose
+    # network). Unset with the smtp transport is a worker-boot failure.
+    notification_smtp_host: str | None = None
+    notification_smtp_port: int = Field(default=1025, gt=0)
+    # From address on outgoing confirmation mail. Mailpit's relay rewrites it for
+    # SPF when relaying to real inboxes (X-Original-From preserved).
+    notification_from_address: str = "no-reply@ecommerce.local"
+    # SES region (prod). LocalStack has no SES mock; the ses transport is real-AWS only.
+    notification_region: str = "us-east-1"
+
     # --- Inventory reservations + reaper ---
     # A reservation holds stock (bumps `reserved`) until the checkout saga commits
     # or compensates. The TTL is the backstop for a saga that never does either:

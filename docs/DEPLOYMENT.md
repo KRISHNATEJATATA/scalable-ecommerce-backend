@@ -39,6 +39,7 @@ depth):
 | Image worker | `python -m src.catalog.adapters.image_worker` | `image-uploads` | sniff · re-encode · thumbnails → `image_status` |
 | Cache worker | `python -m src.catalog.adapters.cache_worker` | `catalog-cache` | invalidate Valkey read-cache on `ProductUpdated`/`ProductDeleted` |
 | Cart consumer | `python -m src.cart.adapters.cart_consumer` | `cart-events` | refresh/prune Valkey cart snapshots on `ProductUpdated`/`ProductDeleted` |
+| Notification consumer | `python -m src.notifications.adapters.notification_worker` | `notifications` | send the order-confirmation email on `OrderPlaced` (recipients materialized from `UserCreated`); SMTP locally, SES in prod |
 | Reservation reaper | `python -m src.inventory.adapters.reaper` | Postgres `reservations` | release holds past `expires_at` (SKIP LOCKED) so a stalled saga can't leak stock |
 | Payment reconciler | `python -m src.payments.adapters.reconciler` | Postgres `payments` | resolve charges still `pending` past their grace window by asking the gateway (missed-webhook backstop) |
 | Retention prune | `python -m scripts.retention_prune` | Postgres `outbox`×5 + `reservations` + `saga_log` | batched deletes of terminal history past its retention (published outbox rows, released/committed reservations, saga_log of terminal orders) — see RUNBOOK §14 |
@@ -83,6 +84,22 @@ pure Valkey (no Postgres): size it by memory, not connections.
 `CART_TTL_SECONDS` is the rolling inactivity expiry (~30d) — eviction empties a
 cart, which is acceptable here and never is for an order.
 
+The **notification consumer** drains the `notifications` queue (`OrderPlaced` +
+`UserCreated`) and sends the order-confirmation email. Recipients are
+materialized bus-side from `UserCreated` events into `notifications.recipients`
+(the event carries `user_id` + `email`), so it never reads identity/Keycloak —
+a user created before the consumer first ran has no recipient until their next
+JIT (first authenticated request); until then their first order's confirmation
+is left for redrive → DLQ rather than silently dropped. Double-sends are
+blocked twice over: the Valkey dedupe (per-subscription, on `event_id`) and the
+`UNIQUE(order_id, email_type)` backstop in `notifications.sent_emails`. The
+sender is SMTP locally (Mailpit) and **AWS SES via `aioboto3`** in prod — the
+ECS task role supplies credentials, no keys in code. SES bounce/complaint
+handling (an `email_suppressions` table maintained by a second consumer) is a
+future SES step — the suppression check is live now. Deliverability (SES domain
+verification + SPF/DKIM/DMARC) is DNS-level: it belongs in the IaC ticket, not
+app code.
+
 **Topic ARNs.** The per-event-type SNS topics must be provisioned out-of-band
 (once IaC exists, Terraform owns them), so give the relay task
 role `sns:Publish` only and point `BUS_TOPIC_ARN_PREFIX` at the ARN namespace
@@ -94,8 +111,8 @@ empty and `scripts/bus_bootstrap.py` creates the topics on LocalStack.
 
 **Worker metrics.** Only the API serves `/metrics`, so every worker above needs its own
 export or its counters are invisible. Set `WORKER_METRICS_PORT` on the long-running worker
-services and scrape it like any other target (docker-compose sets it on all eight workers and
-publishes 9101–9108). Scheduled `--once` tasks (the reaper, the retention prune) exit
+services and scrape it like any other target (docker-compose sets it on all nine workers and
+publishes 9101–9109). Scheduled `--once` tasks (the reaper, the retention prune) exit
 between scrapes, so they push at exit instead — point `METRICS_PUSHGATEWAY_URL` at a
 Pushgateway. Both are opt-in; unset means no port bound and no push attempted. Alert rules
 and the postgres_exporter queries behind the workers' liveness signals ship in

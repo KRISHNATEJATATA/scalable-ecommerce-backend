@@ -44,7 +44,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the full picture.
 | Config/validation | Pydantic v2 + pydantic-settings |
 | Storage | S3 via `aioboto3` (LocalStack S3 locally) — presigned uploads + S3-event image worker |
 | Event bus | Transactional outbox → SNS/SQS relay + idempotent consumers + DLQs (LocalStack locally) |
-| Async worker | SNS/SQS consumers (LocalStack locally); `service`-role workers — outbox relay, image worker (S3 ObjectCreated), catalog cache-invalidation consumer, cart product-event consumer, reservation reaper, payment reconciler, saga recovery poller |
+| Async worker | SNS/SQS consumers (LocalStack locally); `service`-role workers — outbox relay, image worker (S3 ObjectCreated), catalog cache-invalidation consumer, cart product-event consumer, reservation reaper, payment reconciler, saga recovery poller, notification consumer (order-confirmation email) |
 | Observability | `ecs-logging` + `python-json-logger`, Prometheus `/metrics` |
 | Testing | pytest + pytest-asyncio, `httpx.AsyncClient`, Testcontainers-Postgres |
 | Lint | Ruff (line-length 120) + Ruff-format; Spectral for OpenAPI |
@@ -58,7 +58,8 @@ make install                  # pip install -r requirements.txt && pip install -
 make compose-up               # Postgres + Valkey + LocalStack (S3/SNS/SQS) + Keycloak + Mailpit
                               # + one-shot migrate/bus-setup/s3-setup
                               # + app + relay + image-worker + cache-worker + cart-consumer
-                              # + reaper + payment-reconciler + saga-recovery + retention-prune
+                              # + notification-consumer + reaper + payment-reconciler
+                              # + saga-recovery + retention-prune
 make seed                     # demo state: 5 users, 11 products (5+6 across two
                               # merchants) with images + stock (9x25, one sold-out, one low).
                               # Idempotent; `make seed-reset` wipes + re-seeds (fresh user subs)

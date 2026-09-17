@@ -59,7 +59,7 @@ services:
     command:
       - sh
       - -c
-      - "for m in identity catalog inventory orders payments; do alembic -c src/$$m/alembic.ini upgrade head; done"
+      - "for m in identity catalog inventory orders payments notifications; do alembic -c src/$$m/alembic.ini upgrade head; done"
 
   postgres:
     image: postgres:16
@@ -290,6 +290,38 @@ services:
       - "9106:9100"
     command: ["python", "-m", "src.cart.adapters.cart_consumer"]
 
+  # The `service`-role notification worker: drains OrderPlaced (+UserCreated) →
+  # sends the order-confirmation email via SMTP (Mailpit locally; SES in prod).
+  # Recipients are materialized bus-side from UserCreated — no identity read.
+  notification-consumer:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      bus-setup:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ecommerce:ecommerce@postgres:5432/ecommerce
+      VALKEY_URL: redis://valkey:6379/0
+      NOTIFICATIONS_QUEUE_URL: http://localstack:4566/000000000000/notifications
+      NOTIFICATIONS_TRANSPORT: smtp
+      NOTIFICATION_SMTP_HOST: mailpit
+      NOTIFICATION_SMTP_PORT: "1025"
+      BUS_ENDPOINT_URL: http://localstack:4566
+      BUS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      WORKER_METRICS_PORT: "9100"
+    ports:
+      - "9109:9100"
+    command: ["python", "-m", "src.notifications.adapters.notification_worker"]
+
   # The `service`-role reservation reaper: releases stock holds whose TTL expired
   # (a stalled checkout saga must not leak stock into a phantom oversell-block).
   # Cron-style loop locally; an EventBridge-scheduled `--once` ECS task in prod.
@@ -418,7 +450,8 @@ services:
         condition: service_healthy
 
   # Local mail catcher: Keycloak's "update account" email (admin user creation)
-  # needs an SMTP server or the create rolls back. UI on http://localhost:8025.
+  # needs an SMTP server or the create rolls back. UI on http://localhost:8025;
+  # SMTP on :1025 (host mapping for host-run workers' debugging).
   # Optional relay: with MAILPIT_RELAY_ENABLED=true in the gitignored .env, every
   # captured mail is auto-relayed to a real SMTP host (Gmail) so Keycloak's
   # verifyEmail / reset mail reaches actual inboxes while Mailpit keeps the
@@ -428,6 +461,7 @@ services:
     image: axllent/mailpit:latest
     ports:
       - "8025:8025"
+      - "1025:1025"
     environment:
       MP_SMTP_RELAY_HOST: ${MAILPIT_RELAY_HOST:-}
       MP_SMTP_RELAY_PORT: ${MAILPIT_RELAY_PORT:-587}

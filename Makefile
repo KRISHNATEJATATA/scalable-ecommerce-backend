@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help install run lint typecheck test loadtest migrate compose-up compose-down seed seed-reset hooks gen-alembic-env relay bus-setup s3-setup image-worker cache-worker cart-consumer reaper prune
+.PHONY: help install run lint typecheck test loadtest migrate compose-up compose-down seed seed-reset hooks gen-alembic-env relay bus-setup s3-setup image-worker cache-worker cart-consumer notification-consumer reaper prune
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS=":.*?## "}; {printf "%-14s %s\n", $$1, $$2}'
@@ -34,6 +34,7 @@ migrate: ## Run every module's independent Alembic chain to head (portable: one 
 	python -m alembic -c src/inventory/alembic.ini upgrade head
 	python -m alembic -c src/orders/alembic.ini upgrade head
 	python -m alembic -c src/payments/alembic.ini upgrade head
+	python -m alembic -c src/notifications/alembic.ini upgrade head
 
 relay: ## Run the transactional-outbox relay worker (service role; outbox → SNS)
 	python -m src.shared.bus.relay
@@ -52,6 +53,9 @@ cache-worker: ## Run the catalog cache-invalidation worker (service role; Produc
 
 cart-consumer: ## Run the cart product-event worker (service role; ProductUpdated/Deleted → refresh/prune carts)
 	python -m src.cart.adapters.cart_consumer
+
+notification-consumer: ## Run the notification worker (service role; OrderPlaced → order-confirmation email)
+	python -m src.notifications.adapters.notification_worker
 
 reaper: ## Run the reservation reaper (service role; releases expired stock holds)
 	python -m src.inventory.adapters.reaper

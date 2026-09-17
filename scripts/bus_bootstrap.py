@@ -30,6 +30,10 @@ CONSUMERS: dict[str, list[str]] = {
     "order-events": ["OrderPlaced"],
     "catalog-cache": ["ProductUpdated", "ProductDeleted"],
     "cart-events": ["ProductUpdated", "ProductDeleted"],
+    # Order-confirmation emails: the notification consumer materializes
+    # recipients from UserCreated (which carries user_id + email) and sends on
+    # OrderPlaced (see src/notifications) — no cross-module identity read.
+    "notifications": ["OrderPlaced", "UserCreated"],
     # The checkout saga reacts to these outcomes in-process today (the
     # orchestrator calls the services directly and the recovery poller reads
     # the payment row), so no SQS consumer drains this queue yet — the
