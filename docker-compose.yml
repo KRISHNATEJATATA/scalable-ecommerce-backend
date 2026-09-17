@@ -1,4 +1,4 @@
-# Local stack: app + Postgres + Valkey + LocalStack (S3/SNS/SQS) + ElasticMQ + Keycloak + workers.
+# Local stack: app + Postgres + Valkey + LocalStack (S3/SNS/SQS) + Keycloak + workers.
 # The single stack every later phase runs against. `make compose-up`.
 
 services:
@@ -16,8 +16,6 @@ services:
       S3_PUBLIC_BASE_URL: http://localhost:4566/ecommerce-uploads
       IMAGE_QUEUE_URL: http://localstack:4566/000000000000/image-uploads
       CATALOG_CACHE_QUEUE_URL: http://localstack:4566/000000000000/catalog-cache
-      SQS_ENDPOINT_URL: http://elasticmq:9324
-      SQS_QUEUE_URL: http://elasticmq:9324/queue/emails
       BUS_ENDPOINT_URL: http://localstack:4566
       BUS_REGION: us-east-1
       AWS_ACCESS_KEY_ID: test
@@ -89,14 +87,7 @@ services:
       timeout: 3s
       retries: 10
 
-  elasticmq:
-    image: softwaremill/elasticmq-native:latest
-    ports:
-      - "9324:9324"
-      - "9325:9325"
-
-  # SNS + SQS for the transactional-outbox event bus. ElasticMQ above
-  # is SQS-only; the bus needs SNS fan-out, so it runs on LocalStack.
+  # SNS + SQS for the transactional-outbox event bus (the bus needs SNS fan-out).
   localstack:
     image: localstack/localstack:3.8
     environment:

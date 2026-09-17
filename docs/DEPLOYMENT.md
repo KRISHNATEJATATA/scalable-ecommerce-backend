@@ -251,7 +251,7 @@ natively since the CMD is exec-form and cannot expand shell defaults).
 | RDS Postgres | Postgres container |
 | S3 | LocalStack S3 (`S3_ENDPOINT_URL`) |
 | ElastiCache for Valkey | Valkey container |
-| SQS / SNS | LocalStack (bus); ElasticMQ (relay dev) |
+| SQS / SNS | LocalStack (bus) |
 | Secrets Manager / SSM | `.env` + env vars |
 
 ## LocalStack S3 vs real S3 caveat

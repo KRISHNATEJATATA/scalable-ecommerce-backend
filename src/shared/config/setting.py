@@ -218,10 +218,6 @@ class AppSettings(BaseSettings):
     # it would clear the token its flip is guarded on.
     image_upload_reaper_grace_seconds: int = Field(default=900, gt=0)
 
-    # --- SQS async worker (Phase 8) ---
-    sqs_queue_url: str | None = None
-    sqs_endpoint_url: str | None = None  # ElasticMQ locally
-
     # --- Event bus: transactional outbox → SNS/SQS ---
     # Relay publishes outbox rows to per-event-type SNS topics; consumers read
     # per-subscription SQS queues with DLQs. LocalStack locally; None → real AWS

@@ -62,7 +62,7 @@ prune: ## Run the retention prune (published outbox / terminal reservations / se
 gen-alembic-env: ## Regenerate each module's env.py from scripts/alembic_env.py.tmpl
 	python scripts/generate_alembic_env.py
 
-compose-up: ## Start local backing services (Postgres, Valkey, LocalStack S3/SNS/SQS, ElasticMQ) + app + workers
+compose-up: ## Start local backing services (Postgres, Valkey, LocalStack S3/SNS/SQS) + app + workers
 	docker compose up -d
 
 seed: ## Seed the demo state into the running stack (idempotent: 5 users — incl. the suspended demo, 11 products, images, stock)

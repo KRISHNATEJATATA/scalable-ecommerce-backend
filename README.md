@@ -44,7 +44,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the full picture.
 | Config/validation | Pydantic v2 + pydantic-settings |
 | Storage | S3 via `aioboto3` (LocalStack S3 locally) — presigned uploads + S3-event image worker |
 | Event bus | Transactional outbox → SNS/SQS relay + idempotent consumers + DLQs (LocalStack locally) |
-| Async worker | SNS/SQS consumers (LocalStack locally; ElasticMQ hosts the legacy `emails` queue); `service`-role workers — outbox relay, image worker (S3 ObjectCreated), catalog cache-invalidation consumer, cart product-event consumer, reservation reaper, payment reconciler, saga recovery poller |
+| Async worker | SNS/SQS consumers (LocalStack locally); `service`-role workers — outbox relay, image worker (S3 ObjectCreated), catalog cache-invalidation consumer, cart product-event consumer, reservation reaper, payment reconciler, saga recovery poller |
 | Observability | `ecs-logging` + `python-json-logger`, Prometheus `/metrics` |
 | Testing | pytest + pytest-asyncio, `httpx.AsyncClient`, Testcontainers-Postgres |
 | Lint | Ruff (line-length 120) + Ruff-format; Spectral for OpenAPI |
@@ -55,7 +55,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the full picture.
 ```bash
 cp .env.example .env          # DATABASE_URL is required (app fails fast if unset)
 make install                  # pip install -r requirements.txt && pip install -e ".[dev]"
-make compose-up               # Postgres + Valkey + LocalStack (S3/SNS/SQS) + ElasticMQ + Keycloak + Mailpit
+make compose-up               # Postgres + Valkey + LocalStack (S3/SNS/SQS) + Keycloak + Mailpit
                               # + one-shot migrate/bus-setup/s3-setup
                               # + app + relay + image-worker + cache-worker + cart-consumer
                               # + reaper + payment-reconciler + saga-recovery + retention-prune
