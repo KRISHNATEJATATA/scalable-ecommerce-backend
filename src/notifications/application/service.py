@@ -29,9 +29,10 @@ import uuid
 from typing import Any
 
 from src.notifications.application.metrics import notification_sent_total, notification_suppressed_total
-from src.notifications.domain.email import EmailType, render_order_confirmation
+from src.notifications.domain.email import EmailType
 from src.notifications.ports.repository import NotificationRepositoryPort
 from src.notifications.ports.sender import NotificationSenderPort
+from src.notifications.themes import EmailTheme
 
 log = logging.getLogger(__name__)
 
@@ -41,11 +42,18 @@ class UnknownRecipientError(RuntimeError):
 
 
 class NotificationService:
-    """Order-confirmation use-case over the repository + sender ports."""
+    """Order-confirmation use-case over the repository + sender ports.
 
-    def __init__(self, repo: NotificationRepositoryPort, sender: NotificationSenderPort) -> None:
+    The confirmation copy comes from the loaded :class:`EmailTheme` (the
+    startup-decided, file-based theme — packaged minimal default or a
+    frontend-mounted one); the item lines stay data-shaped here and are
+    rendered per format for the theme's ``$items`` placeholder.
+    """
+
+    def __init__(self, repo: NotificationRepositoryPort, sender: NotificationSenderPort, theme: EmailTheme) -> None:
         self._repo = repo
         self._sender = sender
+        self._theme = theme
 
     async def handle_user_created(self, event: dict[str, Any]) -> None:
         """Materialize the ``UserCreated`` payload into the recipients table."""
@@ -65,9 +73,19 @@ class NotificationService:
         if await self._repo.has_sent(order_id, EmailType.ORDER_CONFIRMATION.value):
             notification_suppressed_total.labels(reason="already_sent").inc()
             return
-        items = [(str(line["product_id"]), int(line["quantity"]), str(line["unit_price"])) for line in data["items"]]
-        subject, body = render_order_confirmation(str(data["order_id"]), str(data["total"]), items)
-        await self._sender.send(to=email, subject=subject, body=body)
+        items = [
+            # The label is the checkout-time product snapshot's name — the mail
+            # shows what the user bought, not the opaque id. Events written
+            # before the field existed carry None → fall back to the id.
+            (str(line.get("product_name") or line["product_id"]), int(line["quantity"]), str(line["unit_price"]))
+            for line in data["items"]
+        ]
+        items_text = "\n".join(f"  - {label} x{quantity} @ {unit_price}" for label, quantity, unit_price in items)
+        items_html = "\n".join(f"<li>{label} x{quantity} @ {unit_price}</li>" for label, quantity, unit_price in items)
+        subject, body, body_html = self._theme.render_order_confirmation(
+            str(data["order_id"]), str(data["total"]), items_text, items_html
+        )
+        await self._sender.send(to=email, subject=subject, body=body, body_html=body_html)
         if not await self._repo.record_sent(order_id, EmailType.ORDER_CONFIRMATION.value, email):
             # A concurrent worker recorded it first (the crash window) — sent either way.
             log.debug("sent_emails backstop hit for order %s (concurrent send); tolerated", order_id)

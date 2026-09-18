@@ -1,0 +1,7 @@
+Thanks for your order!
+
+Order: $order_id
+Total: $total
+
+Items:
+$items

@@ -106,6 +106,21 @@ def test_schema_and_consumer_agree_on_decimals() -> None:
     validate_event(json.dumps(raw))
 
 
+def test_order_placed_line_without_name_still_validates() -> None:
+    """Events written before ``product_name`` existed still validate (the field is
+    optional): the consumer falls back to the product id, never DLQs."""
+    raw = OrderPlaced.new(
+        trace_id="t",
+        data=OrderPlacedData(
+            order_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            total=Decimal("19.99"),
+            items=[OrderPlacedLine(product_id=uuid.uuid4(), quantity=1, unit_price=Decimal("19.99"))],
+        ),
+    ).model_dump(mode="json")
+    assert validate_event(json.dumps(raw))["data"]["items"][0]["product_name"] is None
+
+
 def test_optional_payload_fields_are_not_schema_required() -> None:
     """The envelope's required-defaults rule must not leak into payloads."""
     product = schema_for("ProductCreated", 1)["$defs"]["ProductWriteData"]

@@ -33,6 +33,9 @@ def order_placed_outbox(*, order_id: uuid.UUID, user_id: uuid.UUID, total: Decim
             items=[
                 OrderPlacedLine(
                     product_id=item.product_id,
+                    # the checkout-time snapshot (NOT NULL on the order line) — the
+                    # confirmation mail shows the name, not the opaque id.
+                    product_name=item.product_name,
                     quantity=item.quantity,
                     unit_price=item.unit_price
                     if isinstance(item.unit_price, Decimal)

@@ -206,7 +206,12 @@ class StockReleased(DomainEvent):
 
 
 class OrderPlacedLine(_Strict):
+    """One order line on the wire. ``product_name`` is the checkout-time snapshot
+    (the orders aggregate carries it) — optional, so events written before the
+    field existed still validate; consumers fall back to ``product_id``."""
+
     product_id: uuid.UUID
+    product_name: str | None = None
     quantity: int = Field(gt=0)
     unit_price: Decimal
 

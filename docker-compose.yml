@@ -493,10 +493,17 @@ services:
       # Backchannel stays static (not *_DYNAMIC) so internal calls keep this issuer.
       KC_HOSTNAME: http://localhost:8080
       KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "false"
+      # Email theme is startup-decided: the realm import resolves the
+      # ${REALM_EMAIL_THEME} placeholder (Keycloak's documented import
+      # substitution) at container start.
+      REALM_EMAIL_THEME: ${REALM_EMAIL_THEME:-ecommerce-minimal}
     ports:
       - "8080:8080"
     volumes:
       - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+      # The minimal email theme (parent=keycloak): mounted so the import's
+      # emailTheme always resolves.
+      - ./keycloak/themes/ecommerce-minimal:/opt/keycloak/themes/ecommerce-minimal:ro
 
 volumes:
   postgres-data:

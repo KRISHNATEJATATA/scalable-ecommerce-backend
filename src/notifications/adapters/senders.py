@@ -42,12 +42,15 @@ class SmtpSender(NotificationSenderPort):
         with smtplib.SMTP(self._host, self._port, timeout=_SMTP_TIMEOUT_SECONDS) as smtp:
             smtp.send_message(message)
 
-    async def send(self, *, to: str, subject: str, body: str) -> None:
+    async def send(self, *, to: str, subject: str, body: str, body_html: str | None = None) -> None:
         message = EmailMessage()
         message["From"] = self._from
         message["To"] = to
         message["Subject"] = subject
         message.set_content(body)
+        if body_html is not None:
+            # multipart/alternative: text-first clients get the plain part.
+            message.add_alternative(body_html, subtype="html")
         await run_in_threadpool(self._send_sync, message)
 
 
@@ -58,13 +61,16 @@ class SesSender(NotificationSenderPort):
         self._client = client
         self._from = from_address
 
-    async def send(self, *, to: str, subject: str, body: str) -> None:
+    async def send(self, *, to: str, subject: str, body: str, body_html: str | None = None) -> None:
+        body_block: dict[str, dict[str, str]] = {"Text": {"Data": body, "Charset": "UTF-8"}}
+        if body_html is not None:
+            body_block["Html"] = {"Data": body_html, "Charset": "UTF-8"}
         await self._client.send_email(
             Source=self._from,
             Destination={"ToAddresses": [to]},
             Message={
                 "Subject": {"Data": subject, "Charset": "UTF-8"},
-                "Body": {"Text": {"Data": body, "Charset": "UTF-8"}},
+                "Body": body_block,
             },
         )
 

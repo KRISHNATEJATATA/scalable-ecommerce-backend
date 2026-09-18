@@ -290,6 +290,13 @@ class AppSettings(BaseSettings):
     # From address on outgoing confirmation mail. Mailpit's relay rewrites it for
     # SPF when relaying to real inboxes (X-Original-From preserved).
     notification_from_address: str = "no-reply@ecommerce.local"
+    # Email theme directory for the confirmation copy (subject.txt + body.txt +
+    # body.html, string.Template placeholders). Empty = the packaged minimal
+    # theme (src/notifications/themes/ecommerce-minimal) — the shared backend
+    # stays unbranded. A frontend's compose override mounts its own theme dir
+    # into the notification-consumer container and points this at it to brand
+    # the confirmation mail — decided at container start, never mid-run.
+    notification_email_theme_dir: str = ""
     # SES region (prod). LocalStack has no SES mock; the ses transport is real-AWS only.
     notification_region: str = "us-east-1"
 

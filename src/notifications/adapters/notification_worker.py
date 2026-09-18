@@ -32,6 +32,7 @@ from typing import Any
 from src.notifications.adapters.db.repository import NotificationRepository
 from src.notifications.adapters.senders import make_sender_cm
 from src.notifications.application.service import NotificationService
+from src.notifications.themes import EmailTheme
 from src.shared.bus.client import sqs_client
 from src.shared.bus.consumer import Handler, SqsConsumer
 from src.shared.config.setting import AppSettings, get_settings
@@ -39,17 +40,18 @@ from src.shared.config.setting import AppSettings, get_settings
 log = logging.getLogger(__name__)
 
 
-def make_notification_handler(sessionmaker: Any, sender: Any) -> Handler:
+def make_notification_handler(sessionmaker: Any, sender: Any, theme: Any) -> Handler:
     """Build the SqsConsumer handler routing validated events into the service.
 
     A per-message session (the worker pool's shape: one session at a time per
-    coroutine) wraps the repository + service for each event.
+    coroutine) wraps the repository + service for each event. The loaded
+    :class:`~src.notifications.themes.EmailTheme` carries the confirmation copy.
     """
 
     async def _handle(event: dict[str, Any]) -> None:
         event_type = event.get("type")
         async with sessionmaker() as session:
-            service = NotificationService(NotificationRepository(session), sender)
+            service = NotificationService(NotificationRepository(session), sender, theme)
             if event_type == "UserCreated":
                 await service.handle_user_created(event)
             elif event_type == "OrderPlaced":
@@ -64,12 +66,19 @@ async def run_worker(settings: AppSettings, sessionmaker: Any, valkey: Any, stop
     """Build a real SQS-backed notification consumer and run its loop."""
     if not settings.notifications_queue_url:
         raise RuntimeError("NOTIFICATIONS_QUEUE_URL must be configured for the notification worker")
+    # The theme loads first (fail-fast at boot: a missing/misrouted theme dir is
+    # a boot failure, before any queue or SMTP contact — same contract as the
+    # sender selection below).
+    theme = EmailTheme.from_settings(settings.notification_email_theme_dir)
+    # "theme", not "email theme" — the RedactFilter scrubs any message containing
+    # a _REDACT_KEYS substring ("email" is one), and this line carries no secret.
+    log.info("notification worker theme: %s", theme.name)
     async with make_sender_cm(settings) as sender, sqs_client(settings) as sqs:
         consumer = SqsConsumer(
             sqs,
             valkey,
             settings.notifications_queue_url,
-            make_notification_handler(sessionmaker, sender),
+            make_notification_handler(sessionmaker, sender, theme),
             consumer_name="notifications",
             dedup_ttl_seconds=settings.consumer_dedup_ttl_seconds,
             lease_ttl_seconds=settings.consumer_lease_ttl_seconds,

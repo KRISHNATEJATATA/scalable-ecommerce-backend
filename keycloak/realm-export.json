@@ -6,6 +6,7 @@
   "registrationAllowed": true,
   "resetPasswordAllowed": true,
   "verifyEmail": true,
+  "emailTheme": "${REALM_EMAIL_THEME}",
   "roles": {
     "realm": [
       { "name": "consumer", "description": "Default customer role" },

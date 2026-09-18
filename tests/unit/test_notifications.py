@@ -15,6 +15,11 @@ from src.notifications.adapters.db.models import EmailSuppression
 from src.notifications.adapters.db.repository import NotificationRepository
 from src.notifications.adapters.notification_worker import make_notification_handler
 from src.notifications.application.service import NotificationService, UnknownRecipientError
+from src.notifications.themes import EmailTheme
+
+# The packaged minimal theme (from_settings("") = the default): exercises the
+# loader + the template files alongside the send path.
+_THEME = EmailTheme.from_settings("")
 
 
 def _order_placed_event(order_id: uuid.UUID, user_id: uuid.UUID) -> dict:
@@ -25,7 +30,11 @@ def _order_placed_event(order_id: uuid.UUID, user_id: uuid.UUID) -> dict:
             order_id=order_id,
             user_id=user_id,
             total=Decimal("25.00"),
-            items=[OrderPlacedLine(product_id=uuid.uuid4(), quantity=2, unit_price=Decimal("12.50"))],
+            items=[
+                OrderPlacedLine(
+                    product_id=uuid.uuid4(), product_name="Leather Ankle Boots", quantity=2, unit_price=Decimal("12.50")
+                )
+            ],
         ),
     ).model_dump(mode="json")
 
@@ -38,13 +47,13 @@ class _RecordingSender:
     """Test double for the sender port: records sends, optionally fails."""
 
     def __init__(self, fail: bool = False) -> None:
-        self.calls: list[dict[str, str]] = []
+        self.calls: list[dict[str, str | None]] = []
         self.fail = fail
 
-    async def send(self, *, to: str, subject: str, body: str) -> None:
+    async def send(self, *, to: str, subject: str, body: str, body_html: str | None = None) -> None:
         if self.fail:
             raise RuntimeError("smtp down")
-        self.calls.append({"to": to, "subject": subject, "body": body})
+        self.calls.append({"to": to, "subject": subject, "body": body, "body_html": body_html})
 
 
 async def test_record_sent_replay_returns_false_via_the_unique_backstop(session):
@@ -58,7 +67,7 @@ async def test_record_sent_replay_returns_false_via_the_unique_backstop(session)
 async def test_order_placed_sends_the_confirmation_and_records_it(session):
     repo = NotificationRepository(session)
     sender = _RecordingSender()
-    service = NotificationService(repo, sender)
+    service = NotificationService(repo, sender, _THEME)
     user_id, order_id = uuid.uuid4(), uuid.uuid4()
     await service.handle_user_created(_user_created_event(user_id, "buyer@example.com"))
     await service.handle_order_placed(_order_placed_event(order_id, user_id))
@@ -66,6 +75,13 @@ async def test_order_placed_sends_the_confirmation_and_records_it(session):
     assert sender.calls[0]["to"] == "buyer@example.com"
     assert "Order confirmation" in sender.calls[0]["subject"]
     assert str(order_id) in sender.calls[0]["body"]
+    # The item line carries the checkout-time product snapshot's NAME, not the id.
+    assert "Leather Ankle Boots" in sender.calls[0]["body"]
+    assert "Leather Ankle Boots" in (sender.calls[0]["body_html"] or "")
+    # The theme-driven HTML alternative carries the order too (the <li> lines).
+    assert sender.calls[0]["body_html"] is not None
+    assert str(order_id) in sender.calls[0]["body_html"]
+    assert "<li>" in sender.calls[0]["body_html"]
     assert await repo.has_sent(order_id, "order_confirmation") is True
 
 
@@ -75,7 +91,7 @@ async def test_redelivery_after_dedupe_ttl_expiry_cannot_double_send(session):
     ever double-sending."""
     repo = NotificationRepository(session)
     sender = _RecordingSender()
-    service = NotificationService(repo, sender)
+    service = NotificationService(repo, sender, _THEME)
     user_id, order_id = uuid.uuid4(), uuid.uuid4()
     event = _order_placed_event(order_id, user_id)
     await service.handle_user_created(_user_created_event(user_id, "buyer@example.com"))
@@ -87,7 +103,7 @@ async def test_redelivery_after_dedupe_ttl_expiry_cannot_double_send(session):
 async def test_suppressed_recipient_is_never_sent(session):
     repo = NotificationRepository(session)
     sender = _RecordingSender()
-    service = NotificationService(repo, sender)
+    service = NotificationService(repo, sender, _THEME)
     user_id, order_id = uuid.uuid4(), uuid.uuid4()
     email = "bounced@example.com"
     session.add(EmailSuppression(recipient=email, reason="hard_bounce"))
@@ -103,7 +119,7 @@ async def test_unknown_recipient_raises_for_redrive(session):
     the message is left for SQS redrive → DLQ, never silently dropped."""
     repo = NotificationRepository(session)
     sender = _RecordingSender()
-    service = NotificationService(repo, sender)
+    service = NotificationService(repo, sender, _THEME)
     with pytest.raises(UnknownRecipientError):
         await service.handle_order_placed(_order_placed_event(uuid.uuid4(), uuid.uuid4()))
     assert sender.calls == []
@@ -114,7 +130,7 @@ async def test_send_failure_before_the_record_retries_cleanly(session):
     retries cleanly and the second attempt sends."""
     repo = NotificationRepository(session)
     failing = _RecordingSender(fail=True)
-    service = NotificationService(repo, failing)
+    service = NotificationService(repo, failing, _THEME)
     user_id, order_id = uuid.uuid4(), uuid.uuid4()
     event = _order_placed_event(order_id, user_id)
     await service.handle_user_created(_user_created_event(user_id, "buyer@example.com"))
@@ -124,15 +140,37 @@ async def test_send_failure_before_the_record_retries_cleanly(session):
         pass
     assert await repo.has_sent(order_id, "order_confirmation") is False
     sender = _RecordingSender()
-    await NotificationService(repo, sender).handle_order_placed(event)
+    await NotificationService(repo, sender, _THEME).handle_order_placed(event)
     assert len(sender.calls) == 1
 
 
 async def test_handler_routes_user_created_and_order_placed(sessionmaker_factory):
     sender = _RecordingSender()
-    handler = make_notification_handler(sessionmaker_factory, sender)
+    handler = make_notification_handler(sessionmaker_factory, sender, _THEME)
     user_id = uuid.uuid4()
     await handler(_user_created_event(user_id, "buyer@example.com"))
     await handler(_order_placed_event(uuid.uuid4(), user_id))
     assert len(sender.calls) == 1
     assert sender.calls[0]["to"] == "buyer@example.com"
+
+
+def test_missing_theme_dir_fails_fast(tmp_path):
+    """A missing theme dir/file is a worker-BOOT failure (the fail-fast contract):
+    from_settings raises before any queue or SMTP contact."""
+    with pytest.raises(RuntimeError, match="missing"):
+        EmailTheme.from_settings(str(tmp_path / "no-such-theme"))
+
+
+def test_custom_theme_dir_override(tmp_path):
+    """A frontend-mounted dir overrides the packaged default: the copy comes from
+    the pointed-at files (the startup-decided branding switch)."""
+    theme_dir = tmp_path / "acme-mail"
+    theme_dir.mkdir()
+    (theme_dir / "subject.txt").write_text("Your ACME order — $order_id\n", encoding="utf-8")
+    (theme_dir / "body.txt").write_text("Thanks!\n\n$order_id\n", encoding="utf-8")
+    (theme_dir / "body.html").write_text("<p>$order_id</p>\n", encoding="utf-8")
+    theme = EmailTheme.from_settings(str(theme_dir))
+    subject, body, body_html = theme.render_order_confirmation("o-1", "1.00", "- x1", "<li>x1</li>")
+    assert subject == "Your ACME order — o-1"
+    assert "Thanks!" in body and "o-1" in body
+    assert body_html == "<p>o-1</p>\n"
