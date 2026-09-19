@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main, develop]
   workflow_dispatch:          # Allows the workflow to be triggered manually.
+  schedule:
+    # Nightly loadtest: the p95 gate is too environment-sensitive to gate every
+    # PR on a shared runner (see the loadtest job's runner-limitation note), so
+    # it runs on a schedule and signals drift, not per-PR regressions.
+    - cron: "0 3 * * *"
 
 env:
   PYTHON_VERSION: "3.13"
@@ -89,3 +94,60 @@ jobs:
 
       - name: Build image (no push)
         run: docker build -t ecommerce-ci:${{ github.sha }} .
+
+  # Nightly k6 load test: the full stack in compose, then checkout.js with its
+  # p(95) < 300 ms threshold — k6 exits non-zero when a threshold fails, so the
+  # gate is the script's own assertion, not a parsed report.
+  #
+  # RUNNER LIMITATION (documented, per ticket 02): GitHub-hosted runners are
+  # shared VMs (2 cores) — absolute p95 numbers are noisy and a red run may be
+  # the runner, not a regression. The honest long-term answer is a self-hosted
+  # runner with pinned hardware; until then this job is a scheduled canary:
+  # treat a *trend* of failures as the signal, not a single red run. The
+  # multi-replica proof (loadtest/multi_replica.js) is correctness, not
+  # latency — it tolerates runner noise and can be run here too by flipping
+  # the script argument below.
+  loadtest:
+    # Scheduled nightly + manual; NOT per-PR (shared-runner latency noise
+    # would gate merges on load the runner doesn't control).
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # A wedged compose stack must not burn the 6-hour scheduled-runner window;
+    # the concurrency group cancels a superseded run instead of stacking them.
+    timeout-minutes: 30
+    concurrency:
+      group: loadtest-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Start the full stack (2 app replicas)
+        run: docker compose up -d --build --scale app=2
+
+      - name: Seed the demo state
+        run: docker compose run --rm catalog-seed
+
+      - name: Wait for the API to answer
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/v1/health >/dev/null 2>&1; then
+              echo "API is up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "API did not come up in 60s"; docker compose logs app --tail 50; exit 1
+
+      # k6 via its docker image: no k6 install step to drift. --network host so
+      # the container reaches the compose-published ports on the runner host.
+      - name: Run k6 checkout load test (p95 gate)
+        run: |
+          docker run --rm --network host \
+            -v "$PWD/loadtest:/scripts" \
+            -e BASE_URL=http://localhost:8000 \
+            -e KEYCLOAK_URL=http://localhost:8080 \
+            grafana/k6:0.54.0 run /scripts/checkout.js
+
+      - name: Dump stack logs on failure
+        if: failure()
+        run: docker compose logs --tail 200

@@ -87,6 +87,25 @@ iteration lands on the happy path. Its pass/fail line is the ticket-16 SLO —
 `KEYCLOAK_URL`. Requires `k6` on PATH (`winget install k6 --source winget` /
 `brew install k6`).
 
+### Multi-replica proof (concurrency under real scale-out)
+
+`make compose-up-multi` runs the **same compose file** with `--scale app=2
+--scale relay=2 --scale notification-consumer=2` — the documented one-command
+multi-replica topology (port ranges in `docker-compose.yml` keep host mappings
+collision-free). Then `make multi-loadtest` runs
+[`loadtest/multi_replica.js`](loadtest/multi_replica.js), which deliberately
+re-adds the contention the regular load test removes: **one shared user, one
+shared cart, and two concurrent checkouts firing the same `Idempotency-Key`**
+(`http.batch()`) so both app replicas see the same `(user_id, key)` at the same
+instant. The composite `UNIQUE(user_id, idempotency_key)` must arbitrate — the
+winner inserts, the loser rolls back and replays the winner's stored response —
+and the run **fails when `proof_failures > 0`** (any non-201 racer or mismatched
+order ids). This is "exactly one order per idempotency key" as an observation,
+not an architecture-diagram claim. The nightly CI loadtest job brings the stack
+up with 2 app replicas too, but it runs `checkout.js` (the latency SLO), **not**
+this correctness proof — run `make multi-loadtest` to exercise it. See
+`.github/workflows/ci.yml` for the shared-runner limitation the p95 gate carries.
+
 ## Environment variables
 
 All config is typed on `AppSettings` (`src/shared/config/setting.py`) — code

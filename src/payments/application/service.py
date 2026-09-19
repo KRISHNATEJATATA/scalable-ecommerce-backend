@@ -194,6 +194,12 @@ class PaymentsService:
 
         ref = payload.get("gateway_ref")
         reason = payload.get("reason")
+        # Capture the identity + pre-transition status NOW: a lost flip rolls
+        # the session back (the zero-rows path in the repo), which expires the
+        # identity map — touching ``row.id``/``row.status`` after that would be
+        # a synchronous lazy-load (MissingGreenlet on asyncpg).
+        payment_id = row.id
+        prior_status = row.status
         updated = await self._apply_outcome(
             row.id,
             outcome=outcome,
@@ -201,9 +207,9 @@ class PaymentsService:
             failure_reason=reason if isinstance(reason, str) else None,
         )
         if updated is not None:
-            log.info("webhook applied: payment %s → %s", row.id, outcome)
+            log.info("webhook applied: payment %s → %s", payment_id, outcome)
         else:  # already final: duplicate or out-of-order delivery — nothing to do
-            log.info("webhook for %s ignored: payment already %s", row.id, row.status)
+            log.info("webhook for %s ignored: payment already %s", payment_id, prior_status)
         return updated is not None
 
     # --- reconciliation -------------------------------------------------------------
@@ -227,46 +233,58 @@ class PaymentsService:
         compensate."""
         gateway = self._require_gateway()
         resolved = 0
-        candidates = await self._repo.due_for_reconciliation(
-            grace_seconds=self._reconciliation_grace_seconds,
-            max_age_seconds=self._reconciliation_max_age_seconds,
-            batch_size=batch_size,
-        )
-        for row in candidates:
+        # Snapshot the two fields the loop needs BEFORE any transition: a lost
+        # guarded flip rolls the session back, which expires EVERY loaded
+        # instance in the session — touching ``row.id``/``row.idempotency_key``
+        # on a later iteration would then be a synchronous lazy-load
+        # (MissingGreenlet on asyncpg). Same discipline as the checkout saga's
+        # ``claimed_ids`` extraction.
+        candidates = [
+            (row.id, row.idempotency_key)
+            for row in await self._repo.due_for_reconciliation(
+                grace_seconds=self._reconciliation_grace_seconds,
+                max_age_seconds=self._reconciliation_max_age_seconds,
+                batch_size=batch_size,
+            )
+        ]
+        for payment_id, idempotency_key in candidates:
             try:
-                result = await gateway.lookup(row.idempotency_key)
+                result = await gateway.lookup(idempotency_key)
             except Exception:  # boundary: one flaky lookup postpones, never blocks
-                log.warning("gateway lookup failed for %s; will retry next pass", row.idempotency_key, exc_info=True)
+                log.warning("gateway lookup failed for %s; will retry next pass", idempotency_key, exc_info=True)
                 continue
             if result is None:
                 continue  # the gateway never saw this charge: leave it for a later pass
             if await self._apply_outcome(
-                row.id, outcome=result.outcome, gateway_ref=result.ref, failure_reason=result.reason
+                payment_id, outcome=result.outcome, gateway_ref=result.ref, failure_reason=result.reason
             ):
                 resolved += 1
-        stale = await self._repo.abandonable(
-            max_age_seconds=self._reconciliation_max_age_seconds, batch_size=batch_size
-        )
-        for row in stale:
+        stale = [
+            (row.id, row.idempotency_key)
+            for row in await self._repo.abandonable(
+                max_age_seconds=self._reconciliation_max_age_seconds, batch_size=batch_size
+            )
+        ]
+        for payment_id, idempotency_key in stale:
             try:
-                result = await gateway.lookup(row.idempotency_key)
+                result = await gateway.lookup(idempotency_key)
             except Exception:  # boundary: a down gateway abandons nothing
-                log.warning("gateway lookup failed for %s; will retry next pass", row.idempotency_key, exc_info=True)
+                log.warning("gateway lookup failed for %s; will retry next pass", idempotency_key, exc_info=True)
                 continue
             if result is not None:
                 # The gateway *did* see it after all — resolve it like an
                 # in-window row (money may have moved) instead of abandoning.
                 if await self._apply_outcome(
-                    row.id, outcome=result.outcome, gateway_ref=result.ref, failure_reason=result.reason
+                    payment_id, outcome=result.outcome, gateway_ref=result.ref, failure_reason=result.reason
                 ):
                     resolved += 1
                 continue
             if await self._apply_outcome(
-                row.id, outcome=GatewayOutcome.FAILED, gateway_ref=None, failure_reason=_ABANDONED_REASON
+                payment_id, outcome=GatewayOutcome.FAILED, gateway_ref=None, failure_reason=_ABANDONED_REASON
             ):
                 log.warning(
                     "payment %s abandoned: gateway never saw the charge after %ds",
-                    row.id,
+                    payment_id,
                     self._reconciliation_max_age_seconds,
                 )
                 resolved += 1

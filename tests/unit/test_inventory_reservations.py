@@ -36,8 +36,8 @@ def _metric(name: str) -> float:
     return REGISTRY.get_sample_value(name) or 0.0
 
 
-def _reaper(sessionmaker) -> ReservationReaper:
-    return ReservationReaper(sessionmaker, batch_size=10, reservation_ttl_seconds=900)
+def _reaper(sessionmaker, batch_size: int = 10) -> ReservationReaper:
+    return ReservationReaper(sessionmaker, batch_size=batch_size, reservation_ttl_seconds=900)
 
 
 async def _seed(session, sku: str, on_hand: int) -> None:
@@ -281,6 +281,39 @@ async def test_commit_turns_a_hold_into_a_deduction_and_survives_the_reaper(sess
 
     await _expire_all(session)
     assert await _reaper(sessionmaker_factory).sweep_once() == 0
+
+
+async def test_two_concurrent_reapers_split_the_expired_batch_without_double_release(
+    async_engine, session, sessionmaker_factory
+):
+    """The multi-replica reaper race : two reapers start the
+    same instant against six expired holds, batch size 4 — the ``FOR UPDATE SKIP
+    LOCKED`` claim splits the batch (4 + 2 in some order; neither can take all
+    six in one sweep), no hold is released twice, and the stock is returned
+    exactly once."""
+    await _seed(session, "sku-two-reapers", 6)
+    service = _service(session)
+    for _ in range(6):
+        await service.reserve("sku-two-reapers", 1, uuid.uuid4())
+    assert await _stock(session, "sku-two-reapers") == (6, 6)
+
+    await _expire_all(session)  # the sagas stalled; the TTL lapsed
+    assert await _expired_backlog(session) == 6
+    before = _metric("inventory_reaper_released_total")
+
+    reaper_a = _reaper(sessionmaker_factory, batch_size=4)
+    reaper_b = _reaper(sessionmaker_factory, batch_size=4)
+    released = await asyncio.wait_for(asyncio.gather(reaper_a.sweep_once(), reaper_b.sweep_once()), timeout=15)
+
+    assert sum(released) == 6, f"the claim must split the whole batch: {released}"
+    assert min(released) > 0, "the SKIP LOCKED claim must split, not let one reaper take everything"
+    assert _metric("inventory_reaper_released_total") == before + 6
+    assert await _expired_backlog(session) == 0  # backlog drained
+    assert await _stock(session, "sku-two-reapers") == (6, 0)  # returned exactly once
+    events = (
+        await session.execute(text("SELECT count(*) FROM inventory.outbox WHERE event_type = 'StockReleased'"))
+    ).scalar_one()
+    assert events == 6  # one release event per hold — never a duplicate
 
 
 async def test_reaper_releases_expired_holds_and_restores_available_stock(session, sessionmaker_factory):

@@ -5,7 +5,9 @@ services:
   app:
     build: .
     ports:
-      - "8000:8000"
+      # Port RANGE, not a single mapping: `--scale app=2` assigns 8001 to the
+      # second replica without a host-side conflict (Part B multi-replica proof).
+      - "8000-8001:8000"
     environment:
       ENVIRONMENT: local
       DATABASE_URL: postgresql+asyncpg://ecommerce:ecommerce@postgres:5432/ecommerce
@@ -202,7 +204,8 @@ services:
       AWS_SECRET_ACCESS_KEY: test
       WORKER_METRICS_PORT: "9100"
     ports:
-      - "9101:9100"
+      # Range for the multi-replica proof (`make compose-up-multi`, --scale relay=2).
+      - "9101-9102:9100"
     command: ["python", "-m", "src.shared.bus.relay"]
 
   # The `service`-role image worker: drains S3 ObjectCreated events → sniff +
@@ -232,7 +235,10 @@ services:
       AWS_SECRET_ACCESS_KEY: test
       WORKER_METRICS_PORT: "9100"
     ports:
-      - "9102:9100"
+      # Host-debug port moved off 9102: the relay now claims 9101-9102 for its
+      # multi-replica proof (`make compose-up-multi`, --scale relay=2).
+      # Prometheus scrapes by container name, so this host mapping is free to move.
+      - "9111:9100"
     command: ["python", "-m", "src.catalog.adapters.image_worker"]
 
   # The `service`-role catalog cache worker: drains ProductUpdated/ProductDeleted
@@ -319,7 +325,8 @@ services:
       AWS_SECRET_ACCESS_KEY: test
       WORKER_METRICS_PORT: "9100"
     ports:
-      - "9109:9100"
+      # Range for the multi-replica proof (`make compose-up-multi`, --scale notification-consumer=2).
+      - "9109-9110:9100"
     command: ["python", "-m", "src.notifications.adapters.notification_worker"]
 
   # The `service`-role reservation reaper: releases stock holds whose TTL expired

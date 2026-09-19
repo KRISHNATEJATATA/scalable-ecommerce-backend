@@ -348,3 +348,45 @@ async def test_delete_failure_does_not_stop_the_rest_of_the_batch() -> None:
     assert calls == [failing, sibling]  # both handlers ran
     assert sqs.deleted == ["del-ok"]  # only the successful delete recorded
     assert handled == 1  # failed delete is NOT counted as handled
+
+
+class DeadValkey:
+    """A Valkey mid-outage: every lease/dedup op raises a connection error, the
+    worst seam — the consumer cannot claim, dedupe, complete or
+    release anything."""
+
+    async def get(self, key: str):
+        raise ConnectionError("valkey is down")
+
+    async def set(self, key: str, value: str, *, nx: bool = False, ex: int | None = None):
+        raise ConnectionError("valkey is down")
+
+    async def eval(self, script: str, numkeys: int, *args):  # noqa: ANN002, ANN003
+        raise ConnectionError("valkey is down")
+
+
+@pytest.mark.asyncio
+async def test_valkey_down_leaves_healthy_messages_for_redrive_by_attrition() -> None:
+    """Valkey-down behavior characterized : with the lease ops
+    throwing, the consumer fails BEFORE the handler runs — every HEALTHY message
+    in the batch is left for SQS redrive (never acked, never processed), so SQS
+    redelivers each until ``maxReceiveCount`` moves it to the per-subscription
+    DLQ. The failure mode is 'DLQ by attrition': nothing is dropped, nothing is
+    processed-without-dedupe, and the queue drains into the DLQ for as long as
+    Valkey is down. Named and asserted here, not folklore."""
+    messages = [_message(str(uuid.uuid4()), handle=f"down{i}") for i in range(3)]
+    calls: list[str] = []
+
+    async def handler(event: dict) -> None:
+        calls.append(event["event_id"])  # would succeed if Valkey were up
+
+    sqs = FakeSqs(messages)
+    consumer = _consumer(sqs, DeadValkey(), handler)
+
+    first = await consumer.poll_once()
+    second = await consumer.poll_once()  # the outage persists: the next pass fails cleanly too
+
+    assert calls == []  # fail closed BEFORE the handler — never process-without-dedupe
+    assert first == 0
+    assert second == 0
+    assert sqs.deleted == []  # nothing acked → every message redrives → DLQ by attrition

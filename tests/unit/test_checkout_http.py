@@ -10,6 +10,7 @@ breaks the SPA fails here, not in review.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import sys
@@ -232,6 +233,70 @@ async def test_checkout_happy_path_shape_and_replay(app_ctx, rsa_key):
             json={"payment_token": "tok_visa"},
         )
         assert oversized.status_code == 422
+
+
+async def test_concurrent_same_key_double_checkout_yields_exactly_one_order(app_ctx, rsa_key):
+    """The DB-arbiter story under real concurrency : two HTTP tasks,
+    the same ``Idempotency-Key``, the same instant → exactly one order.
+
+    The ``UNIQUE(user_id, idempotency_key)`` constraint decides the create race —
+    the loser rolls back and resumes the winner's pending row — and the guarded
+    ``pending → paid`` flip serializes the two drives. Both racers get ``201``
+    with the SAME order (a replay of the winner's stored response, or a resume of
+    the winner's row); the stock is decremented and the payment recorded exactly
+    once. A third sequential request replays the stored response.
+    """
+    app, sessionmaker = app_ctx
+    consumer, product_id, _merchant = await _setup_cart(app, sessionmaker, rsa_key)
+    key = "race-key-1"
+
+    async def submit() -> httpx.Response:
+        async with _client(app) as client:  # each racer is its own HTTP client/request
+            return await client.post(
+                "/v1/checkout",
+                headers={**_auth(consumer), "Idempotency-Key": key},
+                json={"payment_token": "tok_visa"},
+            )
+
+    first, second = await asyncio.gather(submit(), submit())
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+    assert first.json()["id"] == second.json()["id"], "both racers must see the same order"
+    assert first.json()["status"] == "paid"
+
+    # Exactly one order row under (user_id, key) — the UNIQUE constraint decided.
+    async with sessionmaker() as session:
+        count = (
+            await session.execute(text("SELECT count(*) FROM orders.orders WHERE idempotency_key = :k"), {"k": key})
+        ).scalar_one()
+        stock = (
+            await session.execute(
+                text("SELECT on_hand, reserved FROM inventory.inventory WHERE sku = :sku"), {"sku": product_id}
+            )
+        ).one()
+        payments = (
+            await session.execute(
+                text("SELECT count(*) FROM payments.payments WHERE order_id = :oid"), {"oid": first.json()["id"]}
+            )
+        ).scalar_one()
+        reserved_events = (
+            await session.execute(text("SELECT count(*) FROM inventory.outbox WHERE event_type = 'StockReserved'"))
+        ).scalar_one()
+    assert count == 1
+    assert (stock.on_hand, stock.reserved) == (4, 0)  # one unit sold, hold committed — never twice
+    assert payments == 1  # the gateway's idempotency key deduped the double charge
+    assert reserved_events == 1  # the loser's reserve is idempotent: no duplicate hold
+
+    # A third sequential request replays the stored response (the fast path).
+    async with _client(app) as client:
+        replay = await client.post(
+            "/v1/checkout",
+            headers={**_auth(consumer), "Idempotency-Key": key},
+            json={"payment_token": "tok_visa"},
+        )
+    assert replay.status_code == 201
+    assert replay.json()["id"] == first.json()["id"]
 
 
 async def test_checkout_stock_failure_is_409(app_ctx, rsa_key):

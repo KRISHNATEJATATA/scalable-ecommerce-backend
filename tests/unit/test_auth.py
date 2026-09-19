@@ -74,13 +74,15 @@ class _FakeJWKClient:
         return _FakeSigningKey(self._public_key)
 
 
-def _make_token(rsa_key, *, roles=(), email="user@test.io", sub=None, exp_delta=300, key=None, alg="RS256") -> str:
+def _make_token(
+    rsa_key, *, roles=(), email="user@test.io", sub=None, exp_delta=300, key=None, alg="RS256", iss=None, aud=None
+) -> str:
     now = int(time.time())
     claims = {
         "sub": sub or str(uuid.uuid4()),
         "email": email,
-        "iss": ISSUER,
-        "aud": AUDIENCE,
+        "iss": iss or ISSUER,
+        "aud": aud or AUDIENCE,
         "iat": now,
         "exp": now + exp_delta,
         "realm_access": {"roles": list(roles)},
@@ -247,6 +249,28 @@ async def test_tampered_signature_is_401(app_ctx):
 
 async def test_expired_token_is_401(app_ctx, rsa_key):
     token = _make_token(rsa_key, roles=["consumer"], exp_delta=-10)
+    async with _client(app_ctx) as client:
+        resp = await client.get("/v1/me", headers=_auth(token))
+    assert resp.status_code == 401
+
+
+async def test_wrong_issuer_is_401(app_ctx, rsa_key):
+    """A structurally-valid token from ANOTHER issuer must be rejected: the app
+    validates ``iss`` against the configured Keycloak realm. A token
+    minted by a different realm (same key shape, same ``aud``) is a cross-tenant
+    forgery, not a caller of ours — skipping issuer validation would accept it."""
+    token = _make_token(rsa_key, roles=["consumer"], iss="https://evil.test/realms/other-realm")
+    async with _client(app_ctx) as client:
+        resp = await client.get("/v1/me", headers=_auth(token))
+    assert resp.status_code == 401
+
+
+async def test_wrong_audience_is_401(app_ctx, rsa_key):
+    """A token minted for ANOTHER audience must be rejected: the app validates
+    ``aud`` against the configured API audience. A token issued by our realm but
+    for a different client (e.g. another service's token replayed here) must not
+    authenticate — skipping audience validation would accept it."""
+    token = _make_token(rsa_key, roles=["consumer"], aud="other-api")
     async with _client(app_ctx) as client:
         resp = await client.get("/v1/me", headers=_auth(token))
     assert resp.status_code == 401

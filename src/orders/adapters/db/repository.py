@@ -136,7 +136,19 @@ class OrdersRepository:
             total=total,
         )
         self._session.add(order)
-        await self._session.flush()  # assign the id for the lines below
+        try:
+            # The flush INSERT is where the immediate UNIQUE(user_id,
+            # idempotency_key) is decided: the loser's INSERT blocks on the
+            # winner's uncommitted row, the winner commits, and the loser's
+            # flush raises 23505 right here — long before commit. Catching it
+            # at the flush (not only at commit) is what keeps the race from
+            # escaping as an unhandled 500.
+            await self._session.flush()  # assign the id for the lines below
+        except IntegrityError as exc:
+            await self._session.rollback()
+            if _sqlstate(exc) != _UNIQUE_VIOLATION:
+                raise
+            return await self._loser_reads_winner(user_id, idempotency_key, exc)
         for product_id, product_name, unit_price, quantity in lines:
             self._session.add(
                 OrderItem(
@@ -148,20 +160,40 @@ class OrdersRepository:
                 )
             )
         self._session.add(SagaLog(order_id=order.id, step="create", status="completed"))
+        # Snapshot the id BEFORE the commit: reading ``order.id`` afterwards is
+        # safe only because every sessionmaker sets ``expire_on_commit=False`` —
+        # a default sessionmaker would expire the instance and turn the read
+        # into a synchronous lazy-load (MissingGreenlet on asyncpg).
+        order_id = order.id
         try:
             await self._session.commit()
         except IntegrityError as exc:
+            # Belt-and-braces: with the constraint immediate, the flush above
+            # already owns this decision — this catch only covers a UNIQUE
+            # surfacing at commit time (e.g. a deferred variant later).
             await self._session.rollback()
             if _sqlstate(exc) != _UNIQUE_VIOLATION:
                 raise
-            existing = await self.get_by_idempotency(user_id, idempotency_key)
-            if existing is None:  # defensive: conflict reported but the winner isn't visible
-                raise RuntimeError(f"idempotency conflict for {idempotency_key!r} but no order found") from exc
-            return existing, False
-        row = await self.get_order(order.id)
+            return await self._loser_reads_winner(user_id, idempotency_key, exc)
+        row = await self.get_order(order_id)
         if row is None:  # defensive: the order we just inserted must be re-readable
-            raise RuntimeError(f"inserted order {order.id} not found after commit")
+            raise RuntimeError(f"inserted order {order_id} not found after commit")
         return row, True
+
+    async def _loser_reads_winner(
+        self, user_id: uuid.UUID, idempotency_key: str, exc: IntegrityError
+    ) -> tuple[Order, bool]:
+        """Translate a lost idempotency race into the winner's row.
+
+        Runs after the rollback: a fresh transaction re-reads the committed
+        winner. ``RuntimeError`` only if the DB reported the conflict but the
+        winner is somehow invisible — never mistranslate a real failure into
+        a replay answer.
+        """
+        existing = await self.get_by_idempotency(user_id, idempotency_key)
+        if existing is None:  # defensive: conflict reported but the winner isn't visible
+            raise RuntimeError(f"idempotency conflict for {idempotency_key!r} but no order found") from exc
+        return existing, False
 
     async def transition_status(
         self,

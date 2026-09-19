@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help install run lint typecheck test loadtest migrate compose-up compose-down seed seed-reset hooks gen-alembic-env relay bus-setup s3-setup image-worker cache-worker cart-consumer notification-consumer reaper prune
+.PHONY: help install run lint typecheck test loadtest multi-loadtest migrate compose-up compose-up-multi compose-down seed seed-reset hooks gen-alembic-env relay bus-setup s3-setup image-worker cache-worker cart-consumer notification-consumer reaper prune
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS=":.*?## "}; {printf "%-14s %s\n", $$1, $$2}'
@@ -27,6 +27,9 @@ test: ## Run the unit test suite (coverage reported, not gated)
 
 loadtest: ## Run the k6 checkout load test against a running stack (fails when checkout p95 >= 300 ms)
 	k6 run loadtest/checkout.js
+
+multi-loadtest: ## Run the k6 multi-replica concurrency proof (shared-cart, same-key double checkout — fails when proof_failures > 0)
+	k6 run loadtest/multi_replica.js
 
 migrate: ## Run every module's independent Alembic chain to head (portable: one line per module)
 	python -m alembic -c src/identity/alembic.ini upgrade head
@@ -68,6 +71,9 @@ gen-alembic-env: ## Regenerate each module's env.py from scripts/alembic_env.py.
 
 compose-up: ## Start local backing services (Postgres, Valkey, LocalStack S3/SNS/SQS) + app + workers
 	docker compose up -d
+
+compose-up-multi: ## Start the stack with 2 replicas each of app, relay and notification-consumer (the multi-replica concurrency proof — one documented command)
+	docker compose up -d --scale app=2 --scale relay=2 --scale notification-consumer=2
 
 seed: ## Seed the demo state into the running stack (idempotent: 5 users — incl. the suspended demo, 11 products, images, stock)
 	docker compose run --rm catalog-seed

@@ -117,11 +117,20 @@ class PaymentsRepository:
             .execution_options(synchronize_session=False)
         )
         row = (await self._session.execute(stmt)).mappings().first()
-        if row is not None and outbox_factory is not None:
+        if row is None:
+            # Lost the guarded flip — the payment was already final (a concurrent
+            # webhook/charge landed first). Roll back while the transaction is
+            # still open, mirroring the orders repo's ``transition_status``: the
+            # rollback expires the identity map, so the caller's re-read
+            # (``_apply`` after a lost charge race) sees the *committed* state —
+            # a stale pre-UPDATE instance (the raw statement bypassed the ORM
+            # unit of work) would otherwise answer "payment outcome unknown"
+            # for a payment that actually succeeded.
+            await self._session.rollback()
+            return None
+        if outbox_factory is not None:
             self._session.add(self._outbox_row(outbox_factory(row)))
         await self._session.commit()
-        if row is None:
-            return None
         # Re-read, then refresh: ``get`` may hand back the identity-map instance
         # holding pre-UPDATE attribute values (the raw statement bypassed the ORM
         # unit of work), so the caller must see the committed state.
