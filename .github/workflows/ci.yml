@@ -148,6 +148,17 @@ jobs:
             -e KEYCLOAK_URL=http://localhost:8080 \
             grafana/k6:0.54.0 run /scripts/checkout.js
 
+      # The sad paths (declined payment, last-unit contention, idempotent
+      # replay) are correctness, not latency — shared-runner noise doesn't move
+      # them, so they are a real gate on every scheduled run, not a canary.
+      - name: Run k6 sad-path scenarios
+        run: |
+          docker run --rm --network host \
+            -v "$PWD/loadtest:/scripts" \
+            -e BASE_URL=http://localhost:8000 \
+            -e KEYCLOAK_URL=http://localhost:8080 \
+            grafana/k6:0.54.0 run /scripts/sad_paths.js
+
       - name: Dump stack logs on failure
         if: failure()
         run: docker compose logs --tail 200

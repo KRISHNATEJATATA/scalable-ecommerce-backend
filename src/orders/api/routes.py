@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 
 from src.orders.api.schemas import CheckoutRequest, OrderExecutionResponse, OrderResponse
 from src.orders.application.checkout_saga import CheckoutSaga
@@ -27,6 +27,14 @@ from src.shared.ratelimit import BUCKET_CHECKOUT, rate_limited
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 checkout_router = APIRouter(prefix="/checkout", tags=["checkout"])
+
+#: Response header marking a replayed checkout: present only when this response is
+#: the stored one for an ``Idempotency-Key`` we already drove. Additive to the
+#: documented ``201`` — the status stays ``201`` either way, so a client that
+#: ignores the header sees exactly the previous contract, while the SPA can tell a
+#: replay from a fresh order without a second round-trip. Exposed to browsers in
+#: ``src/app.py``'s CORS config (custom headers are invisible to page JS without it).
+IDEMPOTENT_REPLAY_HEADER = "Idempotent-Replay"
 
 OrdersServiceDep = Annotated[OrdersService, Depends(get_orders_service)]
 CheckoutSagaDep = Annotated[CheckoutSaga, Depends(get_checkout_saga)]
@@ -65,19 +73,26 @@ async def checkout(
     saga: CheckoutSagaDep,
     caller: CurrentUserDep,
     idempotency_key: IdempotencyKeyDep,
+    response: Response,
 ) -> OrderResponse:
     """Run the cart through the checkout saga (reserve → charge → commit → paid).
 
-    Same key + same body replays the stored ``201``; same key + different body
-    → ``409``; stock failure → ``409`` with the order already cancelled and
-    compensation run (show "out of stock", not a retry loop); replaying an
-    already-cancelled checkout re-raises its ``409`` — a retry needs a new
-    key. Generate a new key when the cart changes — the key pins the first
-    request it was sent with.
+    Same key + same body replays the stored ``201`` — with an
+    ``Idempotent-Replay: true`` header, so a client can tell the replay from a
+    fresh order; same key + different body → ``409``; stock failure → ``409`` with
+    the order already cancelled and compensation run (show "out of stock", not a
+    retry loop); replaying an already-cancelled checkout re-raises its ``409`` — a
+    retry needs a new key. Generate a new key when the cart changes — the key pins
+    the first request it was sent with.
     """
-    order, _created = await saga.checkout(
+    order, created = await saga.checkout(
         user_id=caller.id, idempotency_key=idempotency_key, payment_token=body.payment_token
     )
+    if not created:
+        # The saga's second return value used to be discarded here: the response
+        # was byte-identical to a fresh one, so "did my retry place a new order?"
+        # was unanswerable from the contract. One header answers it.
+        response.headers[IDEMPOTENT_REPLAY_HEADER] = "true"
     return order
 
 

@@ -1,7 +1,6 @@
 """Structured JSON logging configuration with ECS (Elastic Common Schema).
 
-Configures all log output as ECS-compliant JSON via ``ecs-logging`` and
-``python-json-logger``.
+Configures all log output as ECS-compliant JSON via ``ecs-logging``.
 Per-request context is propagated via :mod:`contextvars` and injected
 into every :class:`logging.LogRecord` by :class:`ContextFilter`.
 

@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help install run lint typecheck test loadtest multi-loadtest migrate compose-up compose-up-multi compose-down seed seed-reset hooks gen-alembic-env relay bus-setup s3-setup image-worker cache-worker cart-consumer notification-consumer reaper prune
+.PHONY: help install run lint typecheck test loadtest multi-loadtest sad-loadtest migrate compose-up compose-up-multi compose-down seed seed-reset hooks gen-alembic-env relay bus-setup s3-setup image-worker cache-worker cart-consumer notification-consumer reaper prune dlq-replay
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS=":.*?## "}; {printf "%-14s %s\n", $$1, $$2}'
@@ -30,6 +30,9 @@ loadtest: ## Run the k6 checkout load test against a running stack (fails when c
 
 multi-loadtest: ## Run the k6 multi-replica concurrency proof (shared-cart, same-key double checkout — fails when proof_failures > 0)
 	k6 run loadtest/multi_replica.js
+
+sad-loadtest: ## Run the k6 sad-path scenarios (declined payment, last-unit contention, replay — the run fails when an expected outcome doesn't happen)
+	k6 run loadtest/sad_paths.js
 
 migrate: ## Run every module's independent Alembic chain to head (portable: one line per module)
 	python -m alembic -c src/identity/alembic.ini upgrade head
@@ -65,6 +68,9 @@ reaper: ## Run the reservation reaper (service role; releases expired stock hold
 
 prune: ## Run the retention prune (published outbox / terminal reservations / settled saga_log; --once for scheduled mode)
 	python -m scripts.retention_prune
+
+dlq-replay: ## Replay dead-lettered messages back onto their source queues (--list inspects depths first; see RUNBOOK §4)
+	python -m scripts.dlq_replay
 
 gen-alembic-env: ## Regenerate each module's env.py from scripts/alembic_env.py.tmpl
 	python scripts/generate_alembic_env.py

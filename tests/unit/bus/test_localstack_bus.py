@@ -33,6 +33,7 @@ from sqlalchemy import text
 from testcontainers.core.container import DockerContainer
 from valkey.asyncio import Valkey
 
+from scripts.dlq_replay import dlq_depth, replay_all
 from src.events import REGISTRY
 from src.inventory.adapters.db.repository import InventoryRepository
 from src.inventory.application.service import InventoryService
@@ -40,7 +41,7 @@ from src.shared.bus.constants import topic_name
 from src.shared.bus.consumer import SqsConsumer
 from src.shared.bus.publisher import SnsPublisher
 from src.shared.bus.relay import OutboxRelay
-from src.shared.bus.tracecontext import TRACEPARENT_ATTR, parse_trace_id
+from src.shared.bus.tracecontext import TRACEPARENT_ATTR, format_traceparent, parse_trace_id
 
 _REGION = "us-east-1"
 _TOPIC_PREFIX = "ecommerce-"
@@ -270,3 +271,61 @@ async def test_outbox_state_write_ships_on_the_relay_next_pass(aws, valkey, sess
     assert event["type"] == "StockReserved"
     assert event["data"]["sku"] == sku and event["data"]["order_id"] == str(order_id)
     assert event["data"]["quantity"] == 2
+
+
+async def test_dlq_replay_one_shot_moves_dead_letters_back_onto_the_source_queue(aws, valkey):
+    """The operator replay tool (``scripts/dlq_replay``) against a real bus.
+
+    The DLQ is loaded directly instead of through five redrive cycles: the
+    redrive mechanics are pinned by the poison test above, and this test is about
+    what the *tool* does to a DLQ that already holds messages — re-send the body
+    with its attributes onto the source queue, then delete the dead copy, so the
+    message becomes a normal message again (a duplicate in the crash window is
+    safe because consumers are idempotent; a lost message would not be).
+    """
+    event = _registered_order_placed()
+    body = event.model_dump_json()
+    queue_name = "replay-queue"
+    # maxReceiveCount=5, as the real bootstrap wires it: the attribute inspection
+    # below is itself a receive, and with the poison test's tighter budget of 1 the
+    # message would be *moved to the DLQ* by that read instead of staying visible.
+    queue_url = await _wire_queue(aws, event_type="OrderPlaced", queue_name=queue_name, max_receive_count=5)
+
+    dead_url = (await aws.sqs.list_queues(QueueNamePrefix=f"{queue_name}-dlq"))["QueueUrls"][0]
+    await aws.sqs.send_message(
+        QueueUrl=dead_url,
+        MessageBody=body,
+        MessageAttributes={TRACEPARENT_ATTR: {"DataType": "String", "StringValue": format_traceparent(event.trace_id)}},
+    )
+    assert await dlq_depth(aws.sqs, queue_name) == 1  # what `--list` reports
+
+    moved = await replay_all(aws.sqs, queues=[queue_name], limit=10)
+    assert moved == {queue_name: 1}
+    assert await dlq_depth(aws.sqs, queue_name) == 0, "the dead copy is deleted only after the re-send"
+
+    # The re-send is verbatim, attributes included: the consumer's log context
+    # (traceparent) rides along, and the message is handleable again.
+    inspected = await aws.sqs.receive_message(
+        QueueUrl=queue_url, WaitTimeSeconds=5, MessageAttributeNames=["All"], VisibilityTimeout=0
+    )
+    (on_source,) = inspected["Messages"]
+    assert on_source["Body"] == body
+    assert parse_trace_id(on_source["MessageAttributes"][TRACEPARENT_ATTR]["StringValue"]) == event.trace_id
+
+    handled: list[dict] = []
+    consumer = _consumer(aws, valkey, queue_url, handled.append, wait=1)
+    assert await consumer.poll_once() == 1
+    (replayed,) = handled
+    assert replayed["type"] == "OrderPlaced"
+    assert replayed["data"]["order_id"] == json.loads(body)["data"]["order_id"]
+
+
+async def test_dlq_replay_treats_a_missing_queue_as_a_no_op(aws):
+    """A queue the bus doesn't have yet is skipped, never an exception.
+
+    The tool must be safe against a partially bootstrapped bus (local `make
+    compose-up` before `bus-setup`, or a prod stack whose consumer hasn't shipped):
+    a queue with no DLQ has nothing to replay, and reporting depth 0 is the truth.
+    """
+    assert await dlq_depth(aws.sqs, "never-bootstrapped") == 0
+    assert await replay_all(aws.sqs, queues=["never-bootstrapped"]) == {"never-bootstrapped": 0}

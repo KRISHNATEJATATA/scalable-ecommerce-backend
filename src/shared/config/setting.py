@@ -2,8 +2,8 @@
 
 Single, typed, fail-fast configuration surface built on ``pydantic-settings``.
 Every setting is a field on :class:`AppSettings`; **no code reads ``os.environ``
-directly** (see ``.github/copilot-instructions.md``). Adding an env var means
-adding a field here *and* an entry in ``.env.example``.
+directly** — a value is either declared here or it doesn't exist. Adding an env
+var means adding a field here *and* an entry in ``.env.example``.
 
 Resolved once on first access (``settings`` / ``get_settings()``) so a missing
 required var fails the process at startup rather than at mere import time — the

@@ -198,6 +198,7 @@ async def test_checkout_happy_path_shape_and_replay(app_ctx, rsa_key):
             json={"payment_token": "tok_visa"},
         )
     assert resp.status_code == 201, resp.text
+    assert "Idempotent-Replay" not in resp.headers, "a fresh checkout is not a replay"
     body = resp.json()
     assert set(body) == {"id", "user_id", "status", "total", "items", "created_at", "updated_at"}
     assert body["status"] == "paid"
@@ -208,7 +209,8 @@ async def test_checkout_happy_path_shape_and_replay(app_ctx, rsa_key):
 
     async with _client(app) as client:
         # Same key + same body replays the stored 201 (cart was cleared; the
-        # replay must not need it).
+        # replay must not need it) — and says so, so a client can tell "my retry
+        # re-sent the original" from "my retry placed a second order".
         replay = await client.post(
             "/v1/checkout",
             headers={**_auth(consumer), "Idempotency-Key": "http-key-1"},
@@ -216,6 +218,7 @@ async def test_checkout_happy_path_shape_and_replay(app_ctx, rsa_key):
         )
         assert replay.status_code == 201
         assert replay.json()["id"] == body["id"]
+        assert replay.headers["Idempotent-Replay"] == "true"
         # Same key + different body is 409.
         clash = await client.post(
             "/v1/checkout",

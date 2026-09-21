@@ -73,7 +73,23 @@ A consumer queue routes a message to its per-subscription DLQ after `maxReceiveC
 receives. Consumers are idempotent, so replay is safe once the underlying fault is fixed.
 
 ```bash
-# Move messages from the DLQ back to the source queue (SQS-native redrive)
+# The in-repo one-shot (compose stack or prod — it uses BUS_ENDPOINT_URL)
+make dlq-replay                              # every known queue's DLQ → its source queue
+python -m scripts.dlq_replay --list          # depths only, moves nothing: look first
+python -m scripts.dlq_replay --queue notifications --limit 100   # one queue, bounded
+```
+
+It re-sends each body **with its message attributes** (so the `traceparent` keeps correlating
+the consumer's log lines with the original request) onto the source queue, and only then
+deletes the DLQ copy: a crash in between leaves the message on both queues, which is safe —
+every consumer is idempotent, so the duplicate is a no-op, while a lost message would be a
+hole. Bounded on purpose: `--limit` (default 1000) per DLQ per run, so a deep DLQ is drained
+in deliberate steps. With `METRICS_PUSHGATEWAY_URL` set the run reports
+`dlq_replayed_total{queue}`.
+
+The AWS-native alternative (no repo access, e.g. from the console):
+
+```bash
 aws sqs start-message-move-task \
   --source-arn arn:aws:sqs:<region>:<acct>:<consumer>-dlq \
   --destination-arn arn:aws:sqs:<region>:<acct>:<consumer>
@@ -81,7 +97,8 @@ aws sqs start-message-move-task \
 
 Watch the CloudWatch alarm on the DLQ's `ApproximateNumberOfMessagesVisible` return to 0.
 If a message is genuinely un-processable, inspect the payload, fix the consumer/data, then
-redrive — never delete blindly.
+redrive — never delete blindly. A replayed poison message simply redrives again after
+`maxReceiveCount` receives.
 
 **Special case: a DLQ that filled with valid events after a deploy.** If the DLQ'd bodies
 carry a `schema_version` the running consumers don't register, the producers were deployed
@@ -481,6 +498,20 @@ capacity suspicion before/after changes. Tune arrivals with `K6_RATE`
 CI or a jumpbox against a staging service rather than from a laptop: the SLO is
 a service-level claim, not a client-network claim.
 
+**Sad paths — `make sad-loadtest`** (`loadtest/sad_paths.js`). The SLO run measures only the
+happy path; this one drives the paths support tickets come from, each with its own product
+and user so the scenarios don't contaminate each other, and every check asserts an
+**expected** outcome (including the expected `409`s), so `checks: rate==1` is the gate:
+
+| Scenario | What it proves |
+|---|---|
+| `decline` | a declined payment answers `409` (order cancelled, holds released, **cart kept**), and the same cart checks out `201` with a fresh key — the failure is recoverable, not a dead end |
+| `contention` | five buyers on the **last unit**: exactly one `201`, four out-of-stock `409`s, `available` at `0` afterwards — the oversell assertion as an observation |
+| `replay` | the same `Idempotency-Key` twice: the second response is the stored `201` for the same order with `Idempotent-Replay: true` |
+
+Run one at a time with `K6_CASE=contention`. The nightly CI job runs it next to `checkout.js`;
+it makes no latency claim, so runner noise doesn't invalidate it.
+
 ### 14. Retention prune (terminal history nobody reads)
 
 Four growth paths are written forever and read never once their settlement window
@@ -530,4 +561,6 @@ what ran; the backlog says what it failed to.
 ## Post-incident
 - Re-enable automated backups on the promoted instance.
 - Rotate any exposed secrets (JWT keys, DB creds) via Secrets Manager.
-- Note the incident in `.github/memory.md` (Recent zone) if it yields a lesson.
+- Note the incident in this runbook (the affected §) if it yields a durable lesson — and open
+  an ADR when the lesson is a decision, not a procedure. Operator memory is how the next
+  person starts from your conclusion instead of rediscovering it.

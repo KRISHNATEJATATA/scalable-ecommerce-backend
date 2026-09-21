@@ -32,7 +32,6 @@ dependencies = [
     "botocore",
     "pillow",
     "python-magic",
-    "python-json-logger",
     "ecs-logging",
     "prometheus-client",
 ]

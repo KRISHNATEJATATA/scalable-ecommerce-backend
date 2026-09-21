@@ -338,6 +338,11 @@ paths:
         an already-cancelled checkout re-raises its `409` — a retry needs a
         new key. Generate a new key whenever the cart changes — the key pins
         the first request it was sent with.
+
+        A replayed response is marked with the `Idempotent-Replay: true`
+        response header (absent on a fresh checkout), so a client can tell a
+        retry that re-sent the original from a retry that placed a second
+        order. The status stays `201` either way.
       security:
         - bearerAuth: []
       parameters:
@@ -355,6 +360,14 @@ paths:
       responses:
         "201":
           description: The checkout settled — the order (usually `paid`; `pending` only from crash recovery).
+          headers:
+            Idempotent-Replay:
+              schema: { type: string, enum: ["true"] }
+              description: >-
+                Present (`true`) only when this response replayed a stored
+                checkout for this `Idempotency-Key`: the body is the same order
+                the first request returned. Absent on a fresh checkout. Exposed
+                to browsers via `Access-Control-Expose-Headers`.
           content:
             application/json:
               schema:

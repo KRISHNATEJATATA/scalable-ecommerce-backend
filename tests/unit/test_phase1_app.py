@@ -36,7 +36,8 @@ async def test_health_is_200():
 
 
 async def test_cors_exposes_request_id_to_the_browser():
-    """Allowed-origin responses must list X-Request-ID and X-Cache in Access-Control-Expose-Headers.
+    """Allowed-origin responses must list X-Request-ID, X-Cache and Idempotent-Replay in
+    Access-Control-Expose-Headers.
 
     Browsers only hand CORS-safelisted response headers to page JavaScript;
     custom headers are hidden without the CORS listing — the SPA would read
@@ -49,7 +50,7 @@ async def test_cors_exposes_request_id_to_the_browser():
         resp = await client.get("/v1/health", headers={"Origin": "http://test"})
     assert resp.headers["access-control-allow-origin"] == "http://test"
     exposed = {header.strip() for header in resp.headers["access-control-expose-headers"].split(",")}
-    assert exposed == {"X-Request-ID", "X-Cache"}
+    assert exposed == {"X-Request-ID", "X-Cache", "Idempotent-Replay"}
     assert resp.headers["X-Request-ID"]  # ...and the headers being exposed are actually sent
 
 

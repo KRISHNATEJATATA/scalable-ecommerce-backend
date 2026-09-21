@@ -45,7 +45,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the full picture.
 | Storage | S3 via `aioboto3` (LocalStack S3 locally) — presigned uploads + S3-event image worker |
 | Event bus | Transactional outbox → SNS/SQS relay + idempotent consumers + DLQs (LocalStack locally) |
 | Async worker | SNS/SQS consumers (LocalStack locally); `service`-role workers — outbox relay, image worker (S3 ObjectCreated), catalog cache-invalidation consumer, cart product-event consumer, reservation reaper, payment reconciler, saga recovery poller, notification consumer (order-confirmation email) |
-| Observability | `ecs-logging` + `python-json-logger`, Prometheus `/metrics` |
+| Observability | `ecs-logging` (ECS JSON to stdout), Prometheus `/metrics` |
 | Testing | pytest + pytest-asyncio, `httpx.AsyncClient`, Testcontainers-Postgres |
 | Lint | Ruff (line-length 120) + Ruff-format; Spectral for OpenAPI |
 | Deploy | Multi-stage Docker image → ECR; ECS Fargate target documented in [DEPLOYMENT.md](docs/DEPLOYMENT.md) (IaC not yet authored) |
@@ -87,6 +87,29 @@ iteration lands on the happy path. Its pass/fail line is the ticket-16 SLO —
 `KEYCLOAK_URL`. Requires `k6` on PATH (`winget install k6 --source winget` /
 `brew install k6`).
 
+### Sad-path scenarios (`make sad-loadtest`)
+
+[`loadtest/sad_paths.js`](loadtest/sad_paths.js) is the counterpart to the SLO run:
+the same k6 harness driving the paths a happy-path test never reaches. Each
+scenario gets its own seeded product and its own user, so they can run together
+without contaminating each other (the contention product is restocked to exactly
+**one** unit for the run). `make sad-loadtest` runs all three; `K6_CASE=contention
+k6 run loadtest/sad_paths.js` runs one.
+
+- **decline** — a declined payment (`tok_declined`) must answer `409` with the
+  order cancelled, the holds released, and the **cart kept** (nothing was sold);
+  the same cart with a fresh key and a good token must then check out `201`.
+- **contention** — five buyers, one unit in stock: exactly one `201` and four
+  out-of-stock `409`s, with the `available` read at teardown at `0` — never an
+  oversell.
+- **replay** — the same `Idempotency-Key` twice: the second response is the stored
+  `201` for the same order, marked `Idempotent-Replay: true`.
+
+Every check asserts an *expected* outcome (including the expected `409`s), so the
+gate is `checks: rate==1`: a passing run means the sad paths behaved, not that
+nothing went wrong. It is deliberately not a latency test — no p95 threshold, no
+SLO claim — and the nightly CI job runs it next to `checkout.js`.
+
 ### Multi-replica proof (concurrency under real scale-out)
 
 `make compose-up-multi` runs the **same compose file** with `--scale app=2
@@ -102,9 +125,10 @@ winner inserts, the loser rolls back and replays the winner's stored response �
 and the run **fails when `proof_failures > 0`** (any non-201 racer or mismatched
 order ids). This is "exactly one order per idempotency key" as an observation,
 not an architecture-diagram claim. The nightly CI loadtest job brings the stack
-up with 2 app replicas too, but it runs `checkout.js` (the latency SLO), **not**
-this correctness proof — run `make multi-loadtest` to exercise it. See
-`.github/workflows/ci.yml` for the shared-runner limitation the p95 gate carries.
+up with 2 app replicas too, but it runs `checkout.js` (the latency SLO) and the
+sad-path scenarios, **not** this correctness proof — run `make multi-loadtest` to
+exercise it. See `.github/workflows/ci.yml` for the shared-runner limitation the
+p95 gate carries.
 
 ## Environment variables
 

@@ -1,7 +1,7 @@
 """Cart domain — pure Python, imports nothing outward.
 
-A cart is pre-checkout, ephemeral state: it lives in Valkey, never Postgres
-(see ``src/cart/CONTEXT.md``). These types are the shared vocabulary between
+A cart is pre-checkout, ephemeral state: it lives in Valkey, never Postgres.
+These types are the shared vocabulary between
 the application service, the Valkey adapter (whose Lua scripts mirror
 :func:`should_apply_update`), and the product-event consumer.
 """
