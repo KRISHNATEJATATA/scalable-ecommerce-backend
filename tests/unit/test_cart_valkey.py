@@ -110,6 +110,68 @@ async def test_set_remove_clear(repo, client):
     assert await client.smembers(_index_key(pid)) == []
 
 
+async def test_consume_subtracts_purchases_and_leaves_other_lines_alone(repo, client):
+    """Checkout's consume: the purchased line goes (with its index entry),
+    lines added after checkout's snapshot survive — deleting the hash instead
+    would be the data-loss bug. Survivors' index TTLs refresh too."""
+    user, a, b = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _add(repo, user, a)
+    await _add(repo, user, b, qty=2)
+    await client.expire(_index_key(b), 5)  # simulate an index near expiry
+    await repo.consume_lines(user, lines=[(a, 1)])
+    cart = await repo.get_cart(user)
+    assert cart is not None
+    assert [(line.product_id, line.quantity) for line in cart.items] == [(str(b), 2)]
+    assert await client.smembers(_index_key(a)) == []
+    assert [m.decode() if isinstance(m, bytes) else m for m in await client.smembers(_index_key(b))] == [str(user)]
+    assert await client.ttl(_index_key(b)) > 5  # the survivor keeps receiving events
+
+
+async def test_consume_partial_quantity_keeps_the_line(repo):
+    user, pid = uuid.uuid4(), uuid.uuid4()
+    await _add(repo, user, pid, qty=2)
+    await repo.consume_lines(user, lines=[(pid, 1)])
+    cart = await repo.get_cart(user)
+    assert cart is not None and cart.items[0].quantity == 1
+
+
+async def test_consume_emptied_cart_drops_key_and_index(repo, client):
+    user, pid = uuid.uuid4(), uuid.uuid4()
+    await _add(repo, user, pid)
+    await repo.consume_lines(user, lines=[(pid, 1)])
+    assert await repo.get_cart(user) is None
+    assert not await client.exists(_cart_key(user))  # emptied by consume, like set-to-zero
+    assert await client.smembers(_index_key(pid)) == []
+
+
+async def test_consume_absent_lines_are_a_noop(repo):
+    user, pid = uuid.uuid4(), uuid.uuid4()
+    await repo.consume_lines(user, lines=[(pid, 1)])  # no cart at all
+    await _add(repo, user, pid)
+    await repo.consume_lines(user, lines=[(uuid.uuid4(), 1)])  # cart exists, line doesn't
+    cart = await repo.get_cart(user)
+    assert cart is not None and cart.items[0].quantity == 1
+
+
+async def test_consume_duplicate_pairs_are_additive(repo, client):
+    user, pid = uuid.uuid4(), uuid.uuid4()
+    await _add(repo, user, pid, qty=2)
+    await repo.consume_lines(user, lines=[(pid, 1), (pid, 1)])
+    assert await repo.get_cart(user) is None
+    assert not await client.exists(_cart_key(user))
+    assert await client.smembers(_index_key(pid)) == []
+
+
+async def test_consume_skips_non_positive_quantities(repo):
+    """Defense-in-depth guard: no caller can produce one (order lines are
+    persisted positive), but a non-positive qty must never inflate a line."""
+    user, pid = uuid.uuid4(), uuid.uuid4()
+    await _add(repo, user, pid)
+    await repo.consume_lines(user, lines=[(pid, 0)])
+    cart = await repo.get_cart(user)
+    assert cart is not None and cart.items[0].quantity == 1
+
+
 async def test_consumer_gates_tombstone_and_self_heal(repo, client):
     user, pid = uuid.uuid4(), uuid.uuid4()
     await _add(repo, user, pid)

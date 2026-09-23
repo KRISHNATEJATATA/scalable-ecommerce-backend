@@ -193,8 +193,12 @@ class OrderBaskets(BasketPort):
         ]
 
     async def clear(self, user_id: uuid.UUID) -> None:
-        """Empty the basket after a successful checkout."""
+        """Empty the basket wholesale (the replay mop-up's exact-match clear)."""
         await self._cart.clear_cart(user_id)
+
+    async def consume(self, user_id: uuid.UUID, lines: list[CheckoutLine]) -> None:
+        """Subtract the purchased quantities; concurrent adds always survive."""
+        await self._cart.consume_purchased(user_id, lines=[(line.product_id, line.quantity) for line in lines])
 
 
 class OrderStockHolds(StockHoldsPort):

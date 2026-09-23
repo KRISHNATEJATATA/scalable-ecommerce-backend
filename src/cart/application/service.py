@@ -120,3 +120,8 @@ class CartService:
     async def clear_cart(self, user_id: uuid.UUID) -> None:
         """Empty the whole cart."""
         await self._repo.clear_cart(user_id)
+
+    async def consume_purchased(self, user_id: uuid.UUID, *, lines: list[tuple[uuid.UUID, int]]) -> None:
+        """Subtract the purchased quantities (checkout success) — never lines
+        added after checkout's snapshot; those must survive the clear."""
+        await self._repo.consume_lines(user_id, lines=lines)

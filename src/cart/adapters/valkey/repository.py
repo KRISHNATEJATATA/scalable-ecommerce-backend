@@ -202,6 +202,51 @@ return 1
 """
 )
 
+# Checkout consumption: subtract exactly the purchased quantities, atomically.
+# A zeroed line is dropped (with its index entry); a cart left holding only
+# meta is deleted — but lines added while the checkout ran survive (deleting
+# the whole hash would eat them). Survivors' index TTLs refresh too (a live
+# cart must keep receiving product events), mirroring get_cart's read touch.
+# Non-positive purchased quantities are skipped: no caller can produce one
+# (order lines are persisted positive), the guard is defense-in-depth.
+# ARGV: 1=user, 2=index prefix, 3=ttl, 4=now, then alternating
+# product_id/quantity pairs.
+_CONSUME_LUA = (
+    _META_DECL
+    + """
+local i = 5
+while ARGV[i] do
+  local qty = tonumber(ARGV[i + 1])
+  if qty and qty > 0 then
+    local cur = redis.call('hget', KEYS[1], ARGV[i])
+    if cur then
+      local line = cjson.decode(cur)
+      line.quantity = line.quantity - qty
+      if line.quantity <= 0 then
+        redis.call('hdel', KEYS[1], ARGV[i])
+        redis.call('srem', ARGV[2] .. ARGV[i], ARGV[1])
+      else
+        redis.call('hset', KEYS[1], ARGV[i], cjson.encode(line))
+      end
+    end
+  end
+  i = i + 2
+end
+if redis.call('hlen', KEYS[1]) <= 1 then
+  redis.call('del', KEYS[1])
+  return 0
+end
+redis.call('hset', KEYS[1], META, ARGV[4])
+redis.call('expire', KEYS[1], tonumber(ARGV[3]))
+for _, f in ipairs(redis.call('hkeys', KEYS[1])) do
+  if f ~= META then
+    redis.call('expire', ARGV[2] .. f, tonumber(ARGV[3]))
+  end
+end
+return 1
+"""
+)
+
 
 class ValkeyCartRepository:
     """Implements :class:`src.cart.ports.repository.CartRepositoryPort` over Valkey."""
@@ -351,6 +396,14 @@ class ValkeyCartRepository:
     async def clear_cart(self, user_id: uuid.UUID) -> None:
         """Empty the whole cart and drop its product-index entries."""
         await self._valkey.eval(_CLEAR_LUA, 1, _cart_key(user_id), str(user_id), _INDEX_PREFIX)
+
+    async def consume_lines(self, user_id: uuid.UUID, *, lines: list[tuple[uuid.UUID, int]]) -> None:
+        """Subtract the purchased quantities, atomically; a zeroed line (and an
+        emptied cart) is removed, while lines added after the snapshot survive."""
+        args: list[Any] = [str(user_id), _INDEX_PREFIX, self._ttl, _now_iso()]
+        for product_id, quantity in lines:
+            args.extend([str(product_id), quantity])
+        await self._valkey.eval(_CONSUME_LUA, 1, _cart_key(user_id), *args)
 
     async def refresh_product(
         self, product_id: uuid.UUID, *, name: str, unit_price: str, product_version: int | None

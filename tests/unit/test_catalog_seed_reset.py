@@ -54,7 +54,7 @@ def _install_fakes(monkeypatch: Any, events: list[str]) -> None:
         return len(seed.PRODUCTS)
 
     async def _fake_ensure_anchor(sessionmaker: Any, sub: str, email: str, *, provision_disabled: bool = False) -> str:
-        # Recorded per sub: the BCR-005 wiring passes is_active=False ONLY for the
+        # Recorded per sub: the wiring passes is_active=False ONLY for the
         # suspended demo account — every other anchor is a normal JIT-provision row.
         events.append(f"anchor:{sub}:{int(provision_disabled)}")
         return f"anchor-{sub}"  # distinct per sub; satisfies the same-anchor guard
@@ -128,7 +128,7 @@ def _anchor_flags(events: list[str]) -> dict[str, int]:
 
 
 async def test_suspended_demo_anchor_is_provisioned_disabled(monkeypatch: Any) -> None:
-    """BCR-005: only demo.suspended's mirror lands already disabled (is_active=False,
+    """ only demo.suspended's mirror lands already disabled (is_active=False,
     the admin-disable shape); every other demo anchor is a normal active row."""
     events: list[str] = []
     _install_fakes(monkeypatch, events)

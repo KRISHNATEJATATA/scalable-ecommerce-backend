@@ -50,8 +50,21 @@ class BasketPort(Protocol):
         """The user's current buyable lines (cart snapshots), or ``[]`` when empty."""
         ...
 
+    async def consume(self, user_id: uuid.UUID, lines: list[CheckoutLine]) -> None:
+        """Atomically subtract the purchased quantities after a successful checkout.
+
+        Only the sold amounts are removed: lines the user added while the saga
+        ran must survive — an unconditional clear turned that concurrency into
+        data loss. A line that reaches zero (and a basket left empty) is dropped.
+        """
+        ...
+
     async def clear(self, user_id: uuid.UUID) -> None:
-        """Empty the basket after a successful checkout."""
+        """Empty the basket wholesale.
+
+        Only the replay mop-up still clears outright — and only after proving
+        the basket still matches the order's lines exactly.
+        """
         ...
 
 

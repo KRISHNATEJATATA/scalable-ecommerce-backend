@@ -146,7 +146,7 @@ has a local default. See [`.env.example`](.env.example) for the full list.
 `.env.example` ships `1`). Demo accounts (usernames `demo.consumer`,
 `demo.merchant`, `demo.merchant2`, `demo.admin`) are created via the Keycloak
 Admin API with known passwords — dev/local only. A fifth account,
-`demo.suspended` (BCR-005), is **enabled in Keycloak but disabled in the local
+`demo.suspended`, is **enabled in Keycloak but disabled in the local
 mirror** — the same state an admin disable leaves — so it signs in and is then
 refused `403` on `/v1/me`: the suspended-account edge case, reachable with no
 manual intervention.

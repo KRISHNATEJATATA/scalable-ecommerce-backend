@@ -118,8 +118,9 @@ class CheckoutSaga:
     ) -> tuple[OrderResponse, bool]:
         """Run the saga; returns ``(order, created)`` (``created=False`` = exact replay).
 
-        Idempotency is consulted *before* the cart: a completed checkout clears
-        the basket, so a retry arrives with an empty cart and must still replay
+        Idempotency is consulted *before* the cart: a completed checkout
+        consumes the basket's purchased lines (concurrent adds survive), so a
+        retry usually arrives with an empty cart and must still replay
         (only the token pins the key). A replay of a stored 201 clears the
         basket only when it still matches the order's lines (mop-up for a crash
         between the drive's clear and the replay record); a basket rebuilt
@@ -407,7 +408,7 @@ class CheckoutSaga:
                 await self._log(order_id, "mark_paid", "completed")
             response = _response(paid)
             if paid.status == OrderStatus.PAID:
-                await self._clear_basket(user_id)
+                await self._consume_basket(user_id, lines)
                 await self._remember(user_id, idempotency_key, body_hash, 201, response)
             return response, True
         except (OrderStateConflictError, CheckoutIdempotencyConflictError):
@@ -531,7 +532,7 @@ class CheckoutSaga:
             )
             if paid is not None and paid.status == OrderStatus.PAID:
                 await self._orders.log_saga_step(order.id, "mark_paid", "completed")
-                await self._clear_basket(order.user_id)
+                await self._consume_basket(order.user_id, _lines_of(order))
             return "completed"
         if payment is None or payment.failed:
             await self._compensate(order.id, "crashed")
@@ -583,6 +584,23 @@ class CheckoutSaga:
             await self._basket.clear(user_id)
         except Exception:  # boundary: cleanup, not correctness
             log.warning("basket clear failed after terminal checkout; cart survives", exc_info=True)
+
+    async def _consume_basket(self, user_id: uuid.UUID, lines: list[CheckoutLine]) -> None:
+        """Best-effort purchased-quantity removal on success — never a wholesale clear.
+
+        Between the saga's cart snapshot and the payment landing, the user can
+        keep mutating the cart from another device; clearing the whole basket
+        would silently eat those lines (data loss). Only the purchased amounts
+        are subtracted — a line that reaches zero is dropped, a basket left
+        empty is deleted, and anything added in the window survives. Same
+        boundary as ``_clear_basket``: the order is already terminal, so a
+        Valkey outage must not fail the checkout (the next replay's mop-up
+        clears what still matches).
+        """
+        try:
+            await self._basket.consume(user_id, lines)
+        except Exception:  # boundary: cleanup, not correctness
+            log.warning("basket consume failed after terminal checkout; cart survives", exc_info=True)
 
     async def _clear_basket_if_replay_mop_up(self, user_id: uuid.UUID, order_items: Any) -> None:
         """Replay-side basket mop-up: clear ONLY a basket that still matches the order.

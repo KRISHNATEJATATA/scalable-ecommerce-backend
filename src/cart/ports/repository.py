@@ -68,6 +68,16 @@ class CartRepositoryPort(Protocol):
         """Empty the whole cart (drops the key and its product index entries)."""
         ...
 
+    async def consume_lines(self, user_id: uuid.UUID, *, lines: list[tuple[uuid.UUID, int]]) -> None:
+        """Subtract purchased ``(product_id, quantity)`` pairs, atomically.
+
+        Checkout's success path: decrement each purchased line (a line that
+        reaches zero is dropped with its index entry; a cart left holding only
+        meta is deleted) — but lines added or changed while the checkout ran
+        survive untouched, and absent lines are a no-op.
+        """
+        ...
+
     async def refresh_product(
         self,
         product_id: uuid.UUID,

@@ -12,9 +12,11 @@ Uses the shared Testcontainers-Postgres fixtures from ``conftest.py``.
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import sys
 import uuid
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -23,6 +25,7 @@ from typing import Any
 from prometheus_client import REGISTRY
 from sqlalchemy import text
 
+from src.cart.adapters.valkey.repository import ValkeyCartRepository
 from src.inventory.adapters.db.repository import InventoryRepository
 from src.inventory.application.outbox import stock_released_outbox
 from src.inventory.application.service import InventoryService
@@ -30,7 +33,7 @@ from src.orders.adapters.db.repository import OrdersRepository
 from src.orders.application.checkout_saga import CheckoutSaga, payment_key_for
 from src.orders.application.service import OrdersService
 from src.orders.domain.order import OrderStatus
-from src.orders.ports.checkout import CheckoutLine
+from src.orders.ports.checkout import ChargeResult, CheckoutLine
 from src.payments.adapters.db.repository import PaymentsRepository
 from src.payments.adapters.stub_gateway import DeferredChargeWindow, StubPaymentGateway
 from src.payments.application.service import PaymentsService
@@ -41,6 +44,7 @@ from src.shared.errors.exceptions import (
     InsufficientStockError,
     OrderStateConflictError,
 )
+from src.shared.saga_recovery import _WorkerBasket
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -54,6 +58,7 @@ class _Basket:
     def __init__(self) -> None:
         self.lines: dict[uuid.UUID, list[CheckoutLine]] = {}
         self.cleared: list[uuid.UUID] = []
+        self.consumed: list[tuple[uuid.UUID, tuple[tuple[uuid.UUID, int], ...]]] = []
 
     def stock(self, user_id: uuid.UUID, *lines: CheckoutLine) -> None:
         self.lines[user_id] = list(lines)
@@ -64,6 +69,26 @@ class _Basket:
     async def clear(self, user_id: uuid.UUID) -> None:
         self.lines.pop(user_id, None)
         self.cleared.append(user_id)
+
+    async def consume(self, user_id: uuid.UUID, lines: list[CheckoutLine]) -> None:
+        """Subtract the purchased quantities (mirrors the Valkey consume script)."""
+        purchased = Counter()
+        for line in lines:
+            purchased[line.product_id] += line.quantity
+        remaining: list[CheckoutLine] = []
+        for line in self.lines.get(user_id, []):
+            sold = purchased.pop(line.product_id, 0)
+            if line.quantity - sold > 0:
+                remaining.append(
+                    CheckoutLine(
+                        product_id=line.product_id,
+                        name=line.name,
+                        unit_price=line.unit_price,
+                        quantity=line.quantity - sold,
+                    )
+                )
+        self.lines[user_id] = remaining
+        self.consumed.append((user_id, tuple((line.product_id, line.quantity) for line in lines)))
 
 
 class _Idempotency:
@@ -86,6 +111,24 @@ class _Idempotency:
             "status": status,
             "response": response.model_dump(mode="json"),
         }
+
+
+class _GatedCharges:
+    """The saga's ChargePort with an intentionally delayed payment: ``charge``
+    parks until the test releases it, holding the saga mid-drive while the test
+    mutates the basket — the two-client race, deterministically."""
+
+    def __init__(self) -> None:
+        self.in_flight = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def charge(self, **kwargs: Any) -> ChargeResult:
+        self.in_flight.set()
+        await self.release.wait()
+        return ChargeResult(status="succeeded")
+
+    async def find_by_idempotency_key(self, idempotency_key: str) -> ChargeResult | None:
+        return None
 
 
 def _line(product_no: int = 1, qty: int = 1, price: str = "19.99") -> CheckoutLine:
@@ -286,9 +329,97 @@ async def test_checkout_pays_the_order_and_consumes_stock(session):
     assert order.items[0].unit_price == Decimal("19.99")
     assert await _stock(session, str(line.product_id)) == (4, 0)  # committed sale, no hold left
     assert await _orders_outbox(session) == ["OrderPlaced"]
-    assert USER_A in basket.cleared  # basket emptied only on success
+    assert basket.consumed == [(USER_A, ((line.product_id, 1),))]  # purchased lines removed only on success
     steps = await _saga_steps(session, order.id)
     assert {"create", "reserve", "charge", "commit", "mark_paid"} <= set(steps)  # journal is complete
+
+
+async def test_concurrent_add_survives_a_successful_checkout(session):
+    """Two clients, one delayed payment: while the saga's charge is parked
+    mid-drive, a second device adds B to the cart — the paid checkout must
+    consume only the purchased A and leave B. (The old unconditional clear
+    deleted B: actual data loss, audit P1.)"""
+    a, b = _line(product_no=1), _line(product_no=2)
+    await _seed(session, str(a.product_id), 5)
+    await _seed(session, str(b.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, a)
+    charges = _GatedCharges()
+    inventory = InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)
+    saga = CheckoutSaga(
+        OrdersRepository(session),
+        basket,
+        OrderStockHolds(inventory),
+        charges,
+        _Idempotency(),
+        step_timeout_seconds=60,
+    )
+
+    checkout = asyncio.create_task(
+        saga.checkout(user_id=USER_A, idempotency_key="key-race-add", payment_token="tok_visa")
+    )
+    await charges.in_flight.wait()  # payment deliberately parked mid-saga
+    basket.lines[USER_A].append(b)  # the second client's add lands now
+    charges.release.set()
+    order, created = await checkout
+
+    assert created is True
+    assert order.status == OrderStatus.PAID
+    assert basket.lines[USER_A] == [b]  # B survived the checkout that never saw it
+    assert await _stock(session, str(a.product_id)) == (4, 0)
+
+
+async def test_concurrent_add_survives_checkout_over_the_real_cart(session, real_valkey):
+    """The same race through the real Valkey cart repository: the consume
+    script subtracts the purchased line and keeps the line a second client
+    added mid-checkout — deleting the whole hash instead would eat it."""
+    a, b = _line(product_no=1), _line(product_no=2)
+    await _seed(session, str(a.product_id), 5)
+    await _seed(session, str(b.product_id), 5)
+    cart = ValkeyCartRepository(real_valkey, ttl_seconds=300)
+    await cart.add_item(
+        USER_A,
+        product_id=a.product_id,
+        name=a.name,
+        unit_price=str(a.unit_price),
+        image_url=None,
+        quantity=1,
+        max_items=10,
+        max_per_line=10,
+    )
+    charges = _GatedCharges()
+    inventory = InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)
+    saga = CheckoutSaga(
+        OrdersRepository(session),
+        _WorkerBasket(real_valkey, ttl_seconds=300),
+        OrderStockHolds(inventory),
+        charges,
+        _Idempotency(),
+        step_timeout_seconds=60,
+    )
+
+    checkout = asyncio.create_task(
+        saga.checkout(user_id=USER_A, idempotency_key="key-race-real", payment_token="tok_visa")
+    )
+    await charges.in_flight.wait()
+    await cart.add_item(  # the second client's add, mid-checkout
+        USER_A,
+        product_id=b.product_id,
+        name=b.name,
+        unit_price=str(b.unit_price),
+        image_url=None,
+        quantity=2,
+        max_items=10,
+        max_per_line=10,
+    )
+    charges.release.set()
+    order, created = await checkout
+
+    assert created is True
+    assert order.status == OrderStatus.PAID
+    surviving = await cart.get_cart(USER_A)
+    assert surviving is not None
+    assert [(line.product_id, line.quantity) for line in surviving.items] == [(str(b.product_id), 2)]
 
 
 # --- idempotency ----------------------------------------------------------
@@ -417,7 +548,7 @@ async def test_fast_path_replay_leaves_a_rebuilt_basket_alone(session):
     basket.stock(USER_A, line)
     saga = _saga(session, basket)
     order, _ = await saga.checkout(user_id=USER_A, idempotency_key="key-rebuilt", payment_token="tok_visa")
-    assert len(basket.cleared) == 1  # the drive's own clear
+    assert basket.lines.get(USER_A) == []  # the drive consumed the purchased line
 
     rebuilt = _line(product_no=2)
     basket.stock(USER_A, rebuilt)
@@ -426,7 +557,7 @@ async def test_fast_path_replay_leaves_a_rebuilt_basket_alone(session):
     assert created is False
     assert replayed.id == order.id
     assert basket.lines[USER_A] == [rebuilt]  # the rebuilt basket survived
-    assert len(basket.cleared) == 1  # no clear from the replay
+    assert basket.cleared == []  # the replay cleared nothing
 
 
 async def test_fast_path_replay_clears_a_basket_still_matching_the_order(session):
@@ -451,7 +582,7 @@ async def test_fast_path_replay_clears_a_basket_still_matching_the_order(session
 
     assert created is False
     assert replayed.id == order.id
-    assert len(basket.cleared) == 2  # drive's clear + the replay's mop-up
+    assert basket.cleared == [USER_A]  # the replay's mop-up clear — the drive consumes, it never clears
     assert basket.lines.get(USER_A) is None
 
 
@@ -465,7 +596,7 @@ async def test_db_backstop_replay_leaves_a_rebuilt_basket_alone(session):
     order, _ = await _saga(session, basket).checkout(
         user_id=USER_A, idempotency_key="key-backstop-rebuilt", payment_token="tok_visa"
     )
-    assert len(basket.cleared) == 1
+    assert basket.lines.get(USER_A) == []  # the drive consumed the purchased line
 
     rebuilt = _line(product_no=2)
     basket.stock(USER_A, rebuilt)
@@ -476,7 +607,7 @@ async def test_db_backstop_replay_leaves_a_rebuilt_basket_alone(session):
     assert created is False
     assert replayed.id == order.id
     assert basket.lines[USER_A] == [rebuilt]  # the rebuilt basket survived
-    assert len(basket.cleared) == 1  # only the drive's clear, never the backstop's
+    assert basket.cleared == []  # the backstop cleared nothing
 
 
 # --- compensation ----------------------------------------------------------
@@ -501,7 +632,7 @@ async def test_declined_payment_cancels_and_releases_stock(session):
     order_id = (await session.execute(text("SELECT id FROM orders.orders"))).scalar_one()
     assert await _order_status(session, order_id) == "cancelled"
     assert await _stock(session, str(line.product_id)) == (5, 0)  # hold released, sale not consumed
-    assert USER_A not in basket.cleared  # a cancelled checkout keeps its cart
+    assert not basket.cleared and not basket.consumed  # a cancelled checkout keeps its cart
 
 
 async def test_stock_shortage_cancels_without_charging(session):
@@ -1224,7 +1355,7 @@ async def test_bcr_002_deferred_charge_settles_to_paid_via_the_workers(session, 
     assert await _order_status(session, order_id) == "paid"
     assert await _stock(session, str(line.product_id)) == (4, 0)
     assert await _orders_outbox(session) == ["OrderPlaced"]
-    assert basket.cleared == [USER_A]  # the demo basket cleared like a live checkout
+    assert basket.consumed and basket.lines.get(USER_A) == []  # the demo basket consumed like a live checkout
 
 
 async def test_bcr_002_retry_with_the_same_key_settles_the_deferred_charge(session, real_valkey):
@@ -1260,7 +1391,7 @@ async def test_bcr_002_retry_with_the_same_key_settles_the_deferred_charge(sessi
     assert await _order_status(session, order_id) == "paid"
     assert await _stock(session, str(line.product_id)) == (4, 0)  # one hold, committed once
     assert await _orders_outbox(session) == ["OrderPlaced"]
-    assert basket.cleared == [USER_A]
+    assert basket.consumed and basket.lines.get(USER_A) == []  # the resumed drive consumed the cart
 
 
 # --- ownership (orders half) ------------------------------------------
