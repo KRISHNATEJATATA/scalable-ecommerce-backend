@@ -32,7 +32,7 @@ class CheckoutLine:
 class ChargeResult:
     """The saga-relevant outcome of one payment attempt."""
 
-    status: str  # "succeeded" | "failed" | "pending"
+    status: str  # "succeeded" | "failed" | "pending" | "refunded"
 
     @property
     def succeeded(self) -> bool:
@@ -43,6 +43,11 @@ class ChargeResult:
     def failed(self) -> bool:
         """The attempt reached a terminal non-success (declined, abandoned)."""
         return self.status == "failed"
+
+    @property
+    def refunded(self) -> bool:
+        """The money was returned after a succeeded charge (the saga's undo)."""
+        return self.status == "refunded"
 
 
 class BasketPort(Protocol):
@@ -96,6 +101,15 @@ class ChargePort(Protocol):
 
     async def find_by_idempotency_key(self, idempotency_key: str) -> ChargeResult | None:
         """The recorded outcome for ``idempotency_key``, or ``None`` if never charged."""
+        ...
+
+    async def refund(self, *, idempotency_key: str, reason: str) -> bool:
+        """Return the money of the succeeded charge under ``idempotency_key``.
+
+        The saga's reverse leg for an orphaned paid payment (the order died
+        after the charge landed). ``True`` means the money is confirmed
+        returned; ``False`` leaves the orphan pair for manual reconciliation.
+        Idempotent: refunding an already-refunded charge reports success."""
         ...
 
 

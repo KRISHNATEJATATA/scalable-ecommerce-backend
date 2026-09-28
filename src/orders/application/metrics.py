@@ -20,9 +20,10 @@ incremented in the recovery-poller process — same pattern as
     bug, never a second order);
   - ``conflict`` — any other controlled 409: empty cart, declined payment,
     cancelled replay, step timeout, reservation line conflicts — **and** the
-    post-payment failures converts to "it will be settled
-    automatically" (the order stays pending; unwinding is forbidden once money
-    moved);
+    post-payment failures convert to "it will be settled automatically" (the
+    order stays pending; unwinding is forbidden once money moved) and both
+    orphan-arm "it will be reconciled" answers (the order is already
+    cancelled, so the stranded pair is reconciled by hand);
   - ``error`` — anything unhandled (the 500-shaped residue).
 
   Checkout success rate = ``rate(paid + replayed) / rate(sum)``.
@@ -37,20 +38,24 @@ incremented in the recovery-poller process — same pattern as
   ``compensated`` rate means checkouts are crashing mid-flight upstream; a
   ``deferred`` rate means the payment reconciler owns those orders, not this
   poller.
-* ``checkout_orphaned_paid_payments_total`` — the guarded ``mark_paid`` flip
-  lost to a concurrent cancel **after** the charge succeeded: money taken, the
-  order cancelled, and nothing reconciles that pair automatically (the payment
-  reconciler only scans ``pending`` charges). The log line and the 409 the
-  caller sees are transient, so this counter is the alertable signal: any
-  increment means a human must reconcile the payment against the cancelled
-  order by hand — the auto-heal scan is a reserved decision, not built.
+* ``checkout_orphaned_paid_payments_total`` — an orphaned paid payment the
+  saga could **not** automatically refund: the charge succeeded but the order
+  died (a concurrent cancel won the guarded flip, or the recovery poller
+  compensated a paid-without-consume shortfall) and the refund leg failed or
+  was refused. Successful refunds emit ``PaymentRefunded`` and are the
+  routine race resolution; any increment here means money is still taken on a
+  cancelled order and a human must reconcile it (the payment reconciler only
+  scans ``pending`` charges, so nothing else owns the pair). The log line and
+  the 409 the caller sees are transient, so this counter is the alertable
+  signal — the auto-refund makes increments rare instead of routine.
 * ``checkout_paid_without_consume_total`` — a succeeded payment whose order
   could not consume its full stock because the reservation reaper released the
   holds before the payment confirmed (the paid-without-consume window). The
   saga compensates the order instead of paying it — the stock was already back
-  in the pool — so the succeeded payment lands on a cancelled order: same
-  manual-reconciliation shape as the orphaned pair above, found by the same
-  RUNBOOK §9 query. Any increment is alertable.
+  in the pool — and refunds the charge through the payments service's refund
+  leg (the payment must not stand: the goods were never delivered). If the
+  automatic refund fails, the succeeded payment lands on the cancelled order
+  and the orphan counter above counts it; the RUNBOOK §9 query finds the pair.
 """
 
 from __future__ import annotations
@@ -77,11 +82,13 @@ checkout_recovery_total = Counter(
 
 checkout_orphaned_paid_payments_total = Counter(
     "checkout_orphaned_paid_payments_total",
-    "Succeeded payments on a cancelled order (the cancel won the guarded flip) — manual reconciliation required.",
+    "Succeeded payments on a cancelled order that the automatic refund could not return "
+    "(refund failed or was refused) — manual reconciliation required.",
 )
 
 checkout_paid_without_consume_total = Counter(
     "checkout_paid_without_consume_total",
     "Succeeded payments whose order could not consume its full stock (holds reaped before the payment "
-    "confirmed) — the order is compensated instead of paid; manual refund reconciliation required.",
+    "confirmed) — the order is compensated and the charge refunded; only a failed refund needs manual "
+    "reconciliation.",
 )

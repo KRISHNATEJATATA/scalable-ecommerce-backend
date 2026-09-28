@@ -22,6 +22,7 @@ from src.events.models import (
     DomainEvent,
     OrderPlaced,
     PaymentFailed,
+    PaymentRefunded,
     PaymentSucceeded,
     ProductCreated,
     ProductCreatedV2,
@@ -52,6 +53,7 @@ EVENT_MODELS: tuple[type[DomainEvent], ...] = (
     OrderPlaced,
     PaymentSucceeded,
     PaymentFailed,
+    PaymentRefunded,
 )
 
 
@@ -75,6 +77,7 @@ PRODUCED_VERSIONS: dict[str, int] = {
     "OrderPlaced": 1,
     "PaymentSucceeded": 1,
     "PaymentFailed": 1,
+    "PaymentRefunded": 1,
 }
 
 

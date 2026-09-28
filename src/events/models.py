@@ -256,3 +256,20 @@ class PaymentFailed(DomainEvent):
     type: Literal["PaymentFailed"] = "PaymentFailed"
     schema_version: Literal[1] = 1
     data: PaymentFailedData
+
+
+class PaymentRefundedData(_Strict):
+    """A refund landed: ``payment_id`` identifies the *charge* being reversed."""
+
+    payment_id: uuid.UUID
+    order_id: uuid.UUID
+    amount: Decimal
+    #: The *original charge's* provider reference (the refund preserves it on
+    #: the row), so the announcement and the provider's ledger agree.
+    gateway_ref: str | None = None
+
+
+class PaymentRefunded(DomainEvent):
+    type: Literal["PaymentRefunded"] = "PaymentRefunded"
+    schema_version: Literal[1] = 1
+    data: PaymentRefundedData

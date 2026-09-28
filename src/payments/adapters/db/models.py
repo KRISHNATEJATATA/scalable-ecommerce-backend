@@ -38,14 +38,16 @@ class Payment(Base, TimestampMixin):
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
     gateway_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
-    # pending → succeeded | failed; transitions are terminal (guarded UPDATE on
-    # ``status='pending'``), so a duplicate/out-of-order webhook is a no-op.
+    # pending → succeeded | failed, plus one reverse leg: succeeded → refunded
+    # (the saga's compensation when the order died after the charge landed).
+    # Transitions are terminal (a guarded UPDATE on the expected status), so a
+    # duplicate/out-of-order webhook is a no-op and a refund applies once.
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     failure_reason: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
 
 class Outbox(Base, OutboxMixin):
-    """Transactional outbox for payments-originated events (``PaymentSucceeded/Failed``)."""
+    """Transactional outbox for payments-originated events (``PaymentSucceeded/Failed/Refunded``)."""
 
     __tablename__ = "outbox"
     __table_args__ = (outbox_unpublished_index("payments"), {"schema": SCHEMA})

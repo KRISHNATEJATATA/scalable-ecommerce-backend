@@ -88,8 +88,10 @@ class SagaLog(Base, TimestampMixin):
 
     One row per step attempt (``reserve``/``charge``/``commit``/``mark_paid``).
     ``status`` vocabulary: ``started`` → ``completed``, ``failed`` →
-    ``compensated``, or ``unknown`` (a charge timeout with no recorded outcome —
-    left pending for the reconciler/recovery poller, never compensated). The
+    ``compensated``, ``unknown`` (a charge timeout with no recorded outcome —
+    left pending for the reconciler/recovery poller, never compensated), or
+    ``refunded`` (the charge under this key had already been returned, so the
+    drive ended terminally instead of waiting for an outcome that cannot come). The
     recovery poller claims stuck ``started`` rows (order still ``pending`` past
     the step timeout) with ``FOR UPDATE SKIP LOCKED`` — the row lock is the
     lease, so concurrent poller replicas split the batch instead of

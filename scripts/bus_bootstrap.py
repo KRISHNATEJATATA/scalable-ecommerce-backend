@@ -39,7 +39,16 @@ CONSUMERS: dict[str, list[str]] = {
     # the payment row), so no SQS consumer drains this queue yet — the
     # subscriptions exist so the topology (queues + DLQs + fan-out) is created
     # and future choreography consumers have a queue to attach to.
-    "saga-events": ["StockReserved", "StockReleased", "PaymentSucceeded", "PaymentFailed"],
+    "saga-events": [
+        "StockReserved",
+        "StockReleased",
+        "PaymentSucceeded",
+        "PaymentFailed",
+        # The saga's own reverse leg belongs with the other payment
+        # outcomes: any future consumer of "what happened to this charge"
+        # needs the refund beside the charge's terminal outcomes.
+        "PaymentRefunded",
+    ],
 }
 MAX_RECEIVE_COUNT = 5
 

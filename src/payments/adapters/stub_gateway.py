@@ -45,7 +45,7 @@ from typing import Any
 
 from valkey.asyncio import Valkey
 
-from src.payments.ports.gateway import GatewayCharge, GatewayOutcome
+from src.payments.ports.gateway import GatewayCharge, GatewayOutcome, GatewayRefund
 
 
 def _decode(value: Any) -> str:
@@ -116,6 +116,12 @@ class StubPaymentGateway:
         self._deferred = deferred_window
         # idempotency_key -> the one outcome that key will ever produce.
         self._charges: dict[str, GatewayCharge] = {}
+        # idempotency_key -> the one refund outcome that key will ever produce.
+        # Process-local on purpose, like the charge map: it *simulates* a
+        # provider's refund-idempotency window; the durable no-double-refund
+        # guarantee is the guarded ``succeeded → refunded`` row flip plus the
+        # refund's own once-only guard in the payments service.
+        self._refunds: dict[str, GatewayRefund] = {}
 
     async def charge(self, *, amount: Decimal, idempotency_key: str, payment_method_token: str) -> GatewayCharge:
         existing = self._charges.get(idempotency_key)
@@ -155,6 +161,36 @@ class StubPaymentGateway:
         if self._deferred is not None:
             return await self._deferred.state(idempotency_key)  # pending → succeeded at settle_at
         return None
+
+    async def refund(self, *, amount: Decimal, idempotency_key: str, gateway_ref: str | None) -> GatewayRefund:
+        """Reverse the referenced charge; idempotent per key.
+
+        The stub answers ``failed`` only through the test hook (the key's fail
+        substring — mirroring the charge-side decline injection) or when the
+        caller supplies no charge reference at all (nothing to point the
+        provider at). Everything else refunds: like a real provider, the stub
+        honors a refund for a charge reference it issued **in another process**
+        — the stub's charge map is deliberately process-local, and the recovery
+        worker (which owns the paid-without-consume refunds) never shares it
+        with the API process that took the charge. The first call decides the
+        outcome; replays return it unchanged (provider-side dedup)."""
+        existing = self._refunds.get(idempotency_key)
+        if existing is not None:
+            return existing  # provider-side dedup: same key → same answer, no second refund
+        if gateway_ref is None:
+            refund = GatewayRefund(
+                ref=f"stub_{uuid.uuid4().hex}", outcome=GatewayOutcome.FAILED, reason="no_charge_reference"
+            )
+        elif self._fail_substring and self._fail_substring in idempotency_key.lower():
+            # Test hook, mirroring the charge-side decline injection: a key
+            # carrying the fail substring refuses the refund leg.
+            refund = GatewayRefund(
+                ref=f"stub_{uuid.uuid4().hex}", outcome=GatewayOutcome.FAILED, reason="declined_by_stub"
+            )
+        else:
+            refund = GatewayRefund(ref=f"stub_{uuid.uuid4().hex}", outcome=GatewayOutcome.SUCCEEDED, reason=None)
+        self._refunds[idempotency_key] = refund
+        return refund
 
 
 def stub_gateway_from_settings(settings: Any, valkey: Valkey | None = None) -> StubPaymentGateway:

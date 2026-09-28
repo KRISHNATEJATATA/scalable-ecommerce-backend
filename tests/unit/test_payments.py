@@ -489,6 +489,124 @@ async def test_bounded_sweep_resolves_fresh_rows_while_abandoning_stale_ones(ses
     assert sorted(await _outbox_types(session)) == ["PaymentFailed", "PaymentSucceeded"]
 
 
+# --- refunds (the saga's reverse leg) -------------------------------------------------
+# ADR 0021: a charge that lands on an already-dead order is reversed by the saga
+# (live drive or recovery poller) through ``PaymentsService.refund``: provider
+# refund first, then the guarded ``succeeded → refunded`` flip with the
+# ``PaymentRefunded`` outbox row in the same transaction.
+
+
+async def test_refund_reverses_a_succeeded_charge_and_announces_it(session):
+    """The happy path: provider refunded → row ``refunded``, charge ref kept,
+    ``PaymentRefunded`` announced (after the charge's ``PaymentSucceeded``)."""
+    kwargs = _charge_kwargs()
+    service = _service(session)
+    charged = await service.charge(**kwargs)
+
+    assert (
+        await service.refund(idempotency_key=kwargs["idempotency_key"], reason="order_cancelled_after_charge") is True
+    )
+
+    status, _ = await _status_of(session, kwargs["idempotency_key"])
+    assert status == "refunded"
+    kept_ref = (
+        await session.execute(
+            text("SELECT gateway_ref FROM payments.payments WHERE idempotency_key = :k"),
+            {"k": kwargs["idempotency_key"]},
+        )
+    ).scalar_one()
+    assert kept_ref == charged.gateway_ref  # the refund is a leg, not a new row
+    assert await _outbox_types(session) == ["PaymentSucceeded", "PaymentRefunded"]
+    raw_payload = (
+        await session.execute(text("SELECT payload FROM payments.outbox WHERE event_type = 'PaymentRefunded'"))
+    ).scalar_one()
+    # asyncpg returns the JSONB column decoded: re-encode for the wire-shaped validator.
+    wire_payload = raw_payload if isinstance(raw_payload, str | bytes) else json.dumps(raw_payload)
+    assert validate_event(wire_payload)["data"]["gateway_ref"] == charged.gateway_ref
+
+
+async def test_refund_of_a_pending_or_failed_charge_touches_nothing(session):
+    """A payment that is not ``succeeded`` refunds nothing: still-``pending``
+    belongs to the reconciler, ``failed`` never moved money — both answer
+    ``False`` (only an already-``refunded`` charge answers ``True``)."""
+    pending_kwargs, failed_kwargs = _charge_kwargs(), _charge_kwargs(token="tok-declined-card")
+    service = _service(session)
+    await PaymentsRepository(session).create_pending(
+        order_id=pending_kwargs["order_id"],
+        idempotency_key=pending_kwargs["idempotency_key"],
+        amount=pending_kwargs["amount"],
+    )
+    await service.charge(**failed_kwargs)
+
+    assert await service.refund(idempotency_key=pending_kwargs["idempotency_key"], reason="r") is False
+    assert await service.refund(idempotency_key=failed_kwargs["idempotency_key"], reason="r") is False
+
+    pending_status, _ = await _status_of(session, pending_kwargs["idempotency_key"])
+    failed_status, _ = await _status_of(session, failed_kwargs["idempotency_key"])
+    assert pending_status == "pending"
+    assert failed_status == "failed"
+    assert await _outbox_types(session) == ["PaymentFailed"]  # no PaymentRefunded announced
+
+
+async def test_refund_for_an_unknown_key_is_a_loud_no(session):
+    """No charge row under the key: nothing we recorded to refund. The saga can
+    only have raced an unseen state — the not-refundable answer, never success."""
+    assert await _service(session).refund(idempotency_key="never-seen-key", reason="r") is False
+    assert await _outbox_types(session) == []
+
+
+async def test_a_refused_refund_keeps_the_row_succeeded_for_the_orphan_query(session):
+    """A provider refusal is a definitive no: the charge landed and the money is
+    still out, so the row stays ``succeeded`` (falsifying it would break the
+    RUNBOOK §9 orphan query) and ``False`` is answered — the saga counts it."""
+    kwargs = _charge_kwargs()
+    service = _service(session, gateway=StubPaymentGateway(fail_token_substring="checkout-"))
+    await service.charge(**kwargs)  # same key hits the stub's refund fail-substring hook
+
+    assert await service.refund(idempotency_key=kwargs["idempotency_key"], reason="r") is False
+
+    status, _ = await _status_of(session, kwargs["idempotency_key"])
+    assert status == "succeeded"  # the orphan pair: money taken, for the query to find
+    assert await _outbox_types(session) == ["PaymentSucceeded"]  # no announcement without the flip
+
+
+async def test_a_replayed_refund_cannot_return_the_money_twice(session):
+    """The crash window (provider refunded, flip never committed) is safe only
+    because the *provider* de-dupes: the same key replays the first answer —
+    the stub's ``_refunds`` map, a real provider's refund-idempotency window —
+    so the second call still answers ``True`` with exactly one announcement."""
+    kwargs = _charge_kwargs()
+    gateway = StubPaymentGateway()
+    service = _service(session, gateway=gateway)
+    await service.charge(**kwargs)
+
+    first = await service.refund(idempotency_key=kwargs["idempotency_key"], reason="r1")
+    second = await service.refund(idempotency_key=kwargs["idempotency_key"], reason="r2")
+
+    assert first is True and second is True
+    assert len(gateway._refunds) == 1  # the provider itself saw ONE refund
+    status, _ = await _status_of(session, kwargs["idempotency_key"])
+    assert status == "refunded"
+    assert await _outbox_types(session) == ["PaymentSucceeded", "PaymentRefunded"]
+
+
+async def test_a_late_webhook_cannot_touch_a_refunded_charge(session):
+    """A ``PaymentSucceeded`` webhook arriving after the refund is a no-op (the
+    flip guard defaults to ``pending``): the money-out answer stands, no second
+    event ships."""
+    kwargs = _charge_kwargs()
+    service = _service(session)
+    await service.charge(**kwargs)
+    assert await service.refund(idempotency_key=kwargs["idempotency_key"], reason="r") is True
+
+    body = _webhook_body(kwargs["idempotency_key"])
+    assert await service.handle_webhook(body, *_signed(body)) is False
+
+    status, _ = await _status_of(session, kwargs["idempotency_key"])
+    assert status == "refunded"
+    assert await _outbox_types(session) == ["PaymentSucceeded", "PaymentRefunded"]
+
+
 # --- deferred settlement (dev/demo pending trigger) ---------------------------------
 
 

@@ -228,7 +228,14 @@ the inventory service, charges through the payments service, commits the holds,
 then marks the order `paid` — journaling every step to the persisted
 **`saga_log`** as it goes. Each step has a compensating action (release holds +
 cancel order); only unpaid sagas compensate — a `paid` order unwinds via the
-future returns/refunds reverse saga, never via cancel.
+future returns/refunds reverse saga, never via cancel. A charge that landed on an
+order that died anyway (a cancel won the guarded flip, or the reaper had released
+the holds) is reversed by the saga's own **refund compensation** (ADR 0021):
+provider refund under the charge's idempotency key, then a guarded
+`succeeded → refunded` flip with a `PaymentRefunded` outbox row in the same
+transaction. A refused refund keeps the payment row `succeeded` and is counted
+(`checkout_orphaned_paid_payments_total`, RUNBOOK §9) — manual reconciliation is
+the exceptional path, not the routine race outcome.
 
 - **Idempotency rides two layers.** The Valkey fast path
   (`idempotency:{user_id}:{key}`, holding `{body_hash, status, response}`)
@@ -245,7 +252,10 @@ future returns/refunds reverse saga, never via cancel.
   (`src/shared/saga_recovery.py`) claims `pending` orders older than the saga
   step timeout (`FOR UPDATE SKIP LOCKED`, so N replicas split the batch) and
   settles each from its **payment row's terminal state** — commit + mark paid
-  when the charge succeeded, release + cancel otherwise. It never re-presents
+  when the charge succeeded, release + cancel otherwise (a `succeeded` charge whose
+  holds can't be fully committed is refunded first, and an already-`refunded`
+  payment settles like any other unpaid crash — release + cancel — because both
+  steps are idempotent). It never re-presents
   the payment token (which is never stored); still-`pending` payments are left
   for the payment reconciler. It lives in `shared` deliberately: settling
   composes four modules, and only shared code may do that.
@@ -253,9 +263,10 @@ future returns/refunds reverse saga, never via cancel.
   `commit_for_order`'s answer — the order's committed hold total, retry-safe —
   against the order's line count before marking `paid`. A shortfall means the
   reaper released the holds before the payment confirmed (ADR 0019's
-  paid-without-consume window): the order is compensated instead of paid and
-  the succeeded payment waits on manual reconciliation (`checkout_paid_without_consume_total`,
-  RUNBOOK §9).
+  paid-without-consume window): the order is compensated instead of paid and the
+  charge is refunded— the refund's own failure is the alertable case
+  (`checkout_paid_without_consume_total` beside
+  `checkout_orphaned_paid_payments_total`, RUNBOOK §9).
 - **Timeouts are relationships, enforced at startup**: the per-step saga
   timeout (`CHECKOUT_SAGA_STEP_TIMEOUT_SECONDS`) must stay below
   `RESERVATION_TTL_SECONDS`, so a live checkout can't lose its stock to the

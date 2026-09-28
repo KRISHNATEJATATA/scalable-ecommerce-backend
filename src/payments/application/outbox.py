@@ -18,7 +18,14 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
-from src.events.models import PaymentFailed, PaymentFailedData, PaymentSucceeded, PaymentSucceededData
+from src.events.models import (
+    PaymentFailed,
+    PaymentFailedData,
+    PaymentRefunded,
+    PaymentRefundedData,
+    PaymentSucceeded,
+    PaymentSucceededData,
+)
 from src.shared.config.logging import current_trace_id
 from src.shared.db.outbox import OutboxMessage
 
@@ -43,6 +50,22 @@ def payment_failed_outbox(row: Any) -> OutboxMessage:
             order_id=row["order_id"],
             amount=_amount(row),
             reason=row["failure_reason"] or "unknown",
+        ),
+    )
+    return OutboxMessage(event.type, event.model_dump_json())
+
+
+def payment_refunded_outbox(row: Any) -> OutboxMessage:
+    """Build the ``PaymentRefunded`` message from the applied transition's row.
+
+    Fed the ``succeeded → refunded`` flip's own RETURNING values: the amount and
+    the (preserved) gateway_ref travel so the announcement and the provider's
+    ledger agree. Emitted inside the transition's transaction — "the money was
+    returned" and "the bus will announce it" are one atomic fact."""
+    event = PaymentRefunded.new(
+        trace_id=current_trace_id(),
+        data=PaymentRefundedData(
+            payment_id=row["id"], order_id=row["order_id"], amount=_amount(row), gateway_ref=row["gateway_ref"]
         ),
     )
     return OutboxMessage(event.type, event.model_dump_json())

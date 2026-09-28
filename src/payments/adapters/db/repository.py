@@ -98,17 +98,21 @@ class PaymentsRepository:
         gateway_ref: str | None = None,
         failure_reason: str | None = None,
         outbox_factory: PaymentOutboxFactory | None = None,
+        expect: str | None = None,
     ) -> Payment | None:
-        """Apply an outcome once; ``None`` when the payment was already final.
+        """Apply an outcome once; ``None`` when the payment was no longer in ``expect``.
 
-        Raw guarded UPDATE (not the ORM unit-of-work) so a concurrent webhook and
-        reconciliation racing the same row serialize in the DB — the loser matches
-        zero rows and returns ``None`` instead of clobbering. The outbox factory is
-        fed the update's own RETURNING values and its message is written before the
-        commit, so the event can never announce a state that didn't land."""
+        Raw guarded UPDATE (not the ORM unit-of-work) so a concurrent webhook,
+        refund and reconciliation racing the same row serialize in the DB — the
+        loser matches zero rows and returns ``None`` instead of clobbering. The
+        guard is ``pending`` by default (charge outcomes are decided exactly
+        once); the saga's refund leg passes ``succeeded`` so only a real refund
+        wins. The outbox factory is fed the update's own RETURNING values and
+        its message is written before the commit, so the event can never
+        announce a state that didn't land."""
         stmt = (
             update(Payment)
-            .where(Payment.id == payment_id, Payment.status == PaymentStatus.PENDING.value)
+            .where(Payment.id == payment_id, Payment.status == (expect or PaymentStatus.PENDING.value))
             .values(status=to_status, gateway_ref=gateway_ref, failure_reason=failure_reason)
             .returning(Payment.id, Payment.order_id, Payment.amount, Payment.gateway_ref, Payment.failure_reason)
             # The caller re-reads the row explicitly after the commit; in-session

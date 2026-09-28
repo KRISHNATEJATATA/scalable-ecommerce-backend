@@ -24,7 +24,7 @@ from collections.abc import Awaitable, Callable
 from decimal import Decimal
 from typing import TypeVar
 
-from src.payments.ports.gateway import GatewayCharge, PaymentGatewayPort
+from src.payments.ports.gateway import GatewayCharge, GatewayRefund, PaymentGatewayPort
 from src.shared.errors.exceptions import DependencyUnavailableError
 from src.shared.resilience import CircuitBreaker, CircuitOpenError, is_transient_exception, retry_transient
 
@@ -72,6 +72,15 @@ class ResilientPaymentGateway:
     async def lookup(self, idempotency_key: str) -> GatewayCharge | None:
         """Look up one charge's outcome under the same resilience shell (read-only)."""
         return await self._resilient(lambda: self._inner.lookup(idempotency_key), context=f"lookup {idempotency_key}")
+
+    async def refund(self, *, amount: Decimal, idempotency_key: str, gateway_ref: str | None) -> GatewayRefund:
+        """Refund one charge under resilience: the idempotency key makes bounded
+        retries safe (the provider de-duplicates the refund leg); an open breaker
+        fails fast (503), leaving the refund for a retry."""
+        return await self._resilient(
+            lambda: self._inner.refund(amount=amount, idempotency_key=idempotency_key, gateway_ref=gateway_ref),
+            context=f"refund {idempotency_key}",
+        )
 
     async def _resilient(self, operation: Callable[[], Awaitable[_T]], *, context: str) -> _T:
         """One logical gateway call: breaker gate → bounded retry → outcome record.

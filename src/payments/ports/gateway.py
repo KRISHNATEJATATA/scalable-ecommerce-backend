@@ -27,6 +27,19 @@ class GatewayCharge:
     reason: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class GatewayRefund:
+    """One provider-side refund result for a previously-succeeded charge.
+
+    ``ref`` is the provider's reference for the refund leg (the stub mints a
+    distinct ledger entry); ``reason`` carries a decline/unknown-charge detail
+    when the provider would not refund."""
+
+    ref: str
+    outcome: str  # ``GatewayOutcome.succeeded`` | ``GatewayOutcome.failed``
+    reason: str | None = None
+
+
 class GatewayOutcome:
     """The outcome vocabulary of :class:`GatewayCharge` (plain constants: wire-shaped).
 
@@ -51,4 +64,17 @@ class PaymentGatewayPort(Protocol):
     async def lookup(self, idempotency_key: str) -> GatewayCharge | None:
         """The recorded outcome for ``idempotency_key``, or ``None`` if the gateway
         has never seen it (the reconciliation poller's question)."""
+        ...
+
+    async def refund(self, *, amount: Decimal, idempotency_key: str, gateway_ref: str | None) -> GatewayRefund:
+        """Return the money of the charge ``gateway_ref``/``idempotency_key`` name.
+
+        The caller passes the *stored charge's* provider reference (from the
+        ``payments`` row) — the refund leg must work from any process, including
+        one that never issued the charge (the recovery worker refunds a charge
+        the API process took). De-duplicated by the same key discipline as
+        :meth:`charge` — a retried refund cannot return the money twice (a real
+        provider's refund-idempotency window guarantees this). Refunding a
+        charge the provider cannot find is a definitive ``failed`` answer, not
+        a fault."""
         ...

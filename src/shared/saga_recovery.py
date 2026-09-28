@@ -44,9 +44,9 @@ from src.orders.adapters.idempotency import ValkeyIdempotencyStore
 from src.orders.application.checkout_saga import CheckoutSaga
 from src.orders.ports.checkout import BasketPort, ChargePort, ChargeResult, CheckoutLine
 from src.payments.adapters.db.repository import PaymentsRepository
-from src.payments.adapters.stub_gateway import StubPaymentGateway
 from src.payments.application.service import PaymentsService
 from src.shared.config.setting import AppSettings, get_settings
+from src.shared.payment_gateway import make_payment_gateway
 
 log = logging.getLogger(__name__)
 
@@ -85,7 +85,12 @@ class _WorkerBasket(BasketPort):
 
 
 class _WorkerCharges(ChargePort):
-    """The saga's charges over the payments service (read-only for recovery)."""
+    """The saga's charges over the payments service.
+
+    Recovery is read-lookup plus the refund leg only: it never charges (the
+    payment token is never stored), but it *does* refund — the refund needs
+    only the idempotency key, so a crashed checkout whose order was cancelled
+    concurrently can still unwind its money automatically."""
 
     def __init__(self, payments: PaymentsService) -> None:
         self._payments = payments
@@ -100,6 +105,9 @@ class _WorkerCharges(ChargePort):
         if payment is None:
             return None
         return ChargeResult(status=payment.status)
+
+    async def refund(self, *, idempotency_key: str, reason: str) -> bool:
+        return await self._payments.refund(idempotency_key=idempotency_key, reason=reason)
 
 
 class _WorkerHolds:
@@ -137,7 +145,11 @@ class SagaRecovery:
         )
         payments = PaymentsService(
             PaymentsRepository(session),
-            StubPaymentGateway(self._settings.payment_stub_fail_token_substring),
+            # The same factory the API builds from: this worker refunds charges it
+            # never took, so a provider swap must reach it too — a
+            # worker stuck on the stub would flip a row to `refunded` while no
+            # money moved and nothing alerted.
+            make_payment_gateway(self._settings, self._valkey),
             webhook_secret=self._settings.payment_webhook_secret,
             webhook_tolerance_seconds=self._settings.payment_webhook_tolerance_seconds,
             reconciliation_grace_seconds=self._settings.payment_reconciliation_grace_seconds,

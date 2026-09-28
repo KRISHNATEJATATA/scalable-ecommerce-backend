@@ -34,7 +34,7 @@ from typing import Any
 
 from src.payments.application.dto import PaymentResponse
 from src.payments.application.mappers import to_domain
-from src.payments.application.outbox import payment_failed_outbox, payment_succeeded_outbox
+from src.payments.application.outbox import payment_failed_outbox, payment_refunded_outbox, payment_succeeded_outbox
 from src.payments.domain.payment import PaymentStatus
 from src.payments.ports.gateway import GatewayCharge, GatewayOutcome, PaymentGatewayPort
 from src.payments.ports.repository import PaymentsRepositoryPort
@@ -137,6 +137,91 @@ class PaymentsService:
         if row is None:
             return None
         return _response(row)
+
+    async def refund(self, *, idempotency_key: str, reason: str) -> bool:
+        """Return the money of the succeeded charge under ``idempotency_key``.
+
+        The saga's reverse leg for an orphaned paid payment (a cancel or a
+        stock-shortfall compensation won while the charge was landing): the provider
+        call raises or answers (idempotent on the same key discipline as the
+        charge — a retry cannot double-refund), then the guarded
+        ``succeeded → refunded`` flip, which preserves the original ``gateway_ref``
+        and writes the ``PaymentRefunded`` outbox row in the same transaction.
+
+        Returns ``True`` when the money is confirmed returned (the flip landed
+        this call or a previous one). A payment that is not ``succeeded``
+        refunds nothing: still-``pending`` belongs to the reconciler,
+        ``refunded`` is already done — and the row stays ``succeeded`` on any
+        failure, the truthful state (money taken, not yet returned), which keeps
+        the RUNBOOK §9 orphan query finding it. Raises (a dead provider behind
+        the resilient shell) escape to the saga, whose arms own the pair: the
+        drive arm contains the raise, counts it and answers "reconciled" (its
+        order is already terminal); the poller arm lets the pass roll back so
+        the next pass retries instead of counting a transient."""
+        gateway = self._require_gateway()
+        row = await self._repo.get_by_idempotency_key(idempotency_key)
+        if row is None:
+            # No charge row under this key: nothing we recorded to refund. The
+            # caller (the saga) can only have raced an unseen state — surface
+            # it as the not-refundable answer, never as success.
+            log.error("refund (%s) requested for unknown charge key %s", reason, idempotency_key)
+            return False
+        if row.status != PaymentStatus.SUCCEEDED.value:
+            log.info("refund (%s) skipped for a %s payment under %s", reason, row.status, idempotency_key)
+            return row.status == PaymentStatus.REFUNDED.value
+        # Hoist the row's fields up front: ``transition`` commits, which expires
+        # the identity-map instance — a later attribute touch would be a *sync*
+        # lazy load (MissingGreenlet on asyncpg).
+        payment_id, order_id, gateway_ref = row.id, row.order_id, row.gateway_ref
+        result = await gateway.refund(amount=_amount(row), idempotency_key=idempotency_key, gateway_ref=gateway_ref)
+        if result.outcome != GatewayOutcome.SUCCEEDED:
+            # The row deliberately stays `succeeded`: the charge landed and the
+            # money is still out — falsifying it to `failed` would break the
+            # §9 orphan query and misstate the ledger. The saga's orphan
+            # counter + this line are the alertable signal.
+            log.error(
+                "refund (%s) failed for payment %s (order %s): %s — payment stays succeeded; "
+                "manual reconciliation required",
+                reason,
+                payment_id,
+                order_id,
+                result.reason or "unknown",
+            )
+            return False
+        updated = await self._repo.transition(
+            payment_id,
+            to_status=PaymentStatus.REFUNDED.value,
+            gateway_ref=gateway_ref,
+            failure_reason=None,
+            outbox_factory=payment_refunded_outbox,
+            expect=PaymentStatus.SUCCEEDED.value,
+        )
+        if updated is None:
+            # Already final in a way this read did not see. The only way a
+            # ``succeeded`` read loses the ``succeeded → refunded`` flip is a
+            # concurrent refund winning — which is the success answer. Re-read
+            # to confirm rather than assuming.
+            current = await self._repo.get(payment_id)
+            if current is None or current.status != PaymentStatus.REFUNDED.value:
+                log.error(
+                    "refund (%s) flip for payment %s (order %s) lost unexpectedly — manual reconciliation required",
+                    reason,
+                    payment_id,
+                    order_id,
+                )
+                return False
+        # The row keeps the *charge's* provider reference — the refund is a leg,
+        # not a new row, so the ledger still reads "this charge, now returned".
+        # The provider's own refund reference is informational: it goes to the log
+        # (that is what ties our record to theirs) rather than into the row.
+        log.info(
+            "payment %s (order %s) refunded (%s); provider refund %s",
+            payment_id,
+            order_id,
+            reason,
+            result.ref,
+        )
+        return True
 
     # --- the saga's Payment step --------------------------------------------------
 

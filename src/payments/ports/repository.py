@@ -55,13 +55,15 @@ class PaymentsRepositoryPort(Protocol):
         gateway_ref: str | None = None,
         failure_reason: str | None = None,
         outbox_factory: PaymentOutboxFactory | None = None,
+        expect: str | None = None,
     ) -> Any | None:
-        """Apply one outcome to a still-``pending`` payment; ``None`` if it was
-        already final (duplicate/out-of-order webhook → no-op).
+        """Apply one outcome to a payment still in ``expect`` (default: ``pending``); ``None`` if it moved on.
 
-        The UPDATE is guarded on ``status = 'pending'`` and RETURNs the updated
-        row; when it lands, ``outbox_factory(row)`` supplies the
-        ``PaymentSucceeded``/``PaymentFailed`` message written **in the same
+        The UPDATE is guarded on the expected status — ``pending`` for a charge
+        outcome (duplicate/out-of-order webhook → no-op), ``succeeded`` for the
+        saga's refund leg — and RETURNs the updated row; when it lands,
+        ``outbox_factory(row)`` supplies the ``PaymentSucceeded`` /
+        ``PaymentFailed`` / ``PaymentRefunded`` message written **in the same
         transaction** — state change and announcement are atomic."""
         ...
 

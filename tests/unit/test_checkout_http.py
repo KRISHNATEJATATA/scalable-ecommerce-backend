@@ -364,7 +364,8 @@ async def test_order_history_detail_cancel_and_ownership(app_ctx, rsa_key):
         as_admin = await client.get(f"/v1/orders/{order_id}", headers=_auth(admin))
         assert as_admin.status_code == 200  # admin bypasses ownership
 
-        # A paid order never cancels (refunds are future scope).
+        # A paid order never cancels (automatic refunds only unwind a race whose
+        # charge landed on a dead order — never a paid one).
         cancel_paid = await client.post(f"/v1/orders/{order_id}/cancel", headers=_auth(consumer))
         assert cancel_paid.status_code == 409
         cancel_other = await client.post(f"/v1/orders/{order_id}/cancel", headers=_auth(other))

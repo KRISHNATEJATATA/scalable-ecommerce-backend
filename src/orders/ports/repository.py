@@ -22,6 +22,15 @@ class OrdersRepositoryPort(Protocol):
 
     async def get_order(self, order_id: uuid.UUID) -> Any | None: ...
 
+    async def get_order_status(self, order_id: uuid.UUID) -> Any | None:
+        """The order's committed status, bypassing the session's identity map.
+
+        Callers ask this *after* a concurrent actor may have flipped the row on
+        its own session (a cancel racing the drive): a ``select(Order)`` re-read
+        would answer from the identity map's older copy.
+        """
+        ...
+
     async def get_by_idempotency(self, user_id: uuid.UUID, idempotency_key: str) -> Any | None:
         """The order already placed under ``(user_id, key)``, with lines, or ``None``."""
         ...

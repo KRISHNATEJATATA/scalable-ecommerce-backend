@@ -7,7 +7,11 @@ then marks the order ``paid`` — journaling every step to ``saga_log`` as it
 goes. Each step has a compensating action (release holds + cancel order), and a
 crash between steps leaves a ``pending`` order the recovery poller settles from
 the payment row's terminal state — never by re-presenting the payment token,
-which is never stored.
+which is never stored. When a succeeded charge lands on an order that died
+anyway (a concurrent cancel, or holds the reaper released), the saga reverses
+the money itself through the payments service's durable, idempotent refund leg
+— manual reconciliation is the exceptional refund-failed path, not the routine
+race-resolution mechanism.
 
 Idempotency rides two layers: the Valkey fast path answers exact replays
 without touching the DB, and ``UNIQUE(user_id, idempotency_key)`` plus the
@@ -315,6 +319,21 @@ class CheckoutSaga:
                 await self._log(order_id, "charge", "failed")
                 await self._compensate(order_id, "charge")
                 raise OrderStateConflictError("checkout payment timed out; the order was cancelled") from None
+            if charge.refunded:
+                # The charge under this key was already returned (a previous
+                # pass's refund — the poller's paid-without-consume leg, or this
+                # drive's own orphan arm before a client retry). No money stands
+                # behind the order, so it must not be driven further: settle it
+                # as the charge failure it functionally is (release + cancel) and
+                # answer terminally. Falling through to the "still processing"
+                # arm below would loop the client forever — every retry re-drives,
+                # journals, and (via has_recent_saga_activity) starves the very
+                # poller that would settle the order (ADR 0021).
+                await self._log(order_id, "charge", "refunded")
+                await self._compensate(order_id, "charge")
+                raise OrderStateConflictError(
+                    "the payment for this checkout was refunded; start a new checkout with a new Idempotency-Key"
+                )
             if not charge.succeeded:
                 if not charge.failed:
                     # Still processing (the provider accepted the charge but
@@ -352,15 +371,30 @@ class CheckoutSaga:
             # The paid-without-consume guard: commit_for_order reports how many
             # of the order's holds it actually consumed (counted as the order's
             # committed total, so a timed-out-but-landed first attempt is not a
-            # false shortfall). Fewer than the order has lines means the
-            # reaper released stock this payment never owned — paying would
-            # take money for units already sellable to someone else. Compensate
-            # is forbidden here (money moved): journal the shortfall, count it,
-            # and leave the order pending for the recovery poller, which
-            # cancels it and leaves the succeeded payment row for the manual
-            # reconciliation the RUNBOOK §9 query finds.
+            # false shortfall). Fewer than the order has lines means the stock
+            # left this payment's ownership — the reaper released it, or a cancel
+            # did. Paying would take money for units the order no longer owns.
+            # Compensate is forbidden here (money moved): journal the shortfall
+            # and hand the order to whoever can still settle it — the recovery
+            # poller for a still-pending order (it refunds + cancels, ADR 0021),
+            # or this frame's own refund when a cancel already ended the order,
+            # because the poller never claims a terminal one.
             if not await self._commit_holds(order_id, expected=len(lines)):
                 await self._log(order_id, "commit", "shortfall")
+                # A cancel that won the F3 guard's check-then-act window left
+                # this order already terminal (its release is what emptied the
+                # holds). The recovery poller only claims ``pending`` orders, so
+                # nothing else will ever settle this one — the money must come
+                # back here, not in a later pass (ADR 0021). Ask the row, not
+                # the identity map: the flip happened on the canceller's session.
+                if await self._orders.get_order_status(order_id) == OrderStatus.CANCELLED:
+                    refunded = await self._refund_orphaned_charge(
+                        order_id, user_id, idempotency_key, reason="order_cancelled_after_charge"
+                    )
+                    raise OrderStateConflictError(
+                        "the order was cancelled while the payment was completing; "
+                        + ("the payment was refunded" if refunded else "it will be reconciled")
+                    ) from None
                 raise OrderStateConflictError(
                     "checkout stock could not be committed; the order will be settled automatically"
                 ) from None
@@ -383,26 +417,35 @@ class CheckoutSaga:
             if paid is None:
                 # Lost the guarded flip — the recovery poller or a cancel
                 # settled the order concurrently. A poller settle is benign
-                # (read the truth); a cancel after the payment succeeded is
-                # money taken without an order: never return it as a created
-                # order, surface it loudly for reconciliation.
+                # (read the truth); a cancel after the payment succeeded took
+                # money for an order that no longer exists: never return it as
+                # a created order, and never leave the money out there —
+                # reverse the charge (durable + idempotent refund, ADR 0021).
                 paid = await self._orders.get_order(order_id)
                 if paid is None:  # defensive: settled means present
                     raise RuntimeError(f"checkout order {order_id} vanished mid-saga")
                 if paid.status == OrderStatus.PAID:
                     log.info("checkout order %s settled concurrently; reading final state", order_id)
                 else:
-                    # No auto-heal owns this state — the payment reconciler only
-                    # scans `pending` charges — so count it loudly and leave
-                    # reconciliation to a human (docs/RUNBOOK.md §9).
-                    checkout_orphaned_paid_payments_total.inc()
-                    log.error(
-                        "checkout order %s was cancelled while the payment was completing; "
-                        "reconciliation required (paid payment row attached)",
+                    # The money-moved-but-order-died undo: the refund needs only
+                    # the idempotency key (no token), so it works here and from
+                    # recovery. A failed refund keeps the orphan pair (counted
+                    # inside) — manual reconciliation stays the exceptional path,
+                    # not the routine race-resolution mechanism.
+                    refunded = await self._refund_orphaned_charge(
+                        order_id, user_id, idempotency_key, reason="order_cancelled_after_charge"
+                    )
+                    if not refunded:
+                        raise OrderStateConflictError(
+                            "the order was cancelled while the payment was completing; it will be reconciled"
+                        )
+                    log.info(
+                        "checkout order %s was cancelled while the payment was completing; the charge was "
+                        "refunded automatically",
                         order_id,
                     )
                     raise OrderStateConflictError(
-                        "the order was cancelled while the payment was completing; it will be reconciled"
+                        "the order was cancelled while the payment was completing; the payment was refunded"
                     )
             else:
                 await self._log(order_id, "mark_paid", "completed")
@@ -429,6 +472,48 @@ class CheckoutSaga:
             # cancelled, and the original error keeps its shape.
             await self._compensate(order_id, "reserve")
             raise
+
+    async def _refund_orphaned_charge(
+        self, order_id: uuid.UUID, user_id: uuid.UUID, idempotency_key: str, *, reason: str
+    ) -> bool:
+        """Reverse a succeeded charge whose order died; ``False`` leaves the alertable orphan.
+
+        The money-side undo for the one ordering that must never keep cash: a
+        charge that landed after the order it was paying was already dead (a
+        cancel won the guard race, or the reaper had freed the holds — ADR 0021).
+        Keyed on the payment's own idempotency key, so a retry cannot
+        double-refund. ``False`` means the money did **not** come back — refused
+        or the provider call raised — and the orphan pair (money out, order dead)
+        survives, counted here for alerting: it is exactly what the RUNBOOK §9
+        query finds, so manual reconciliation stays the exceptional path, never
+        the routine race-resolution mechanism.
+        """
+        try:
+            refunded = await self._charges.refund(
+                idempotency_key=payment_key_for(user_id, idempotency_key), reason=reason
+            )
+        except Exception:
+            # A *raised* refund leaves the same money-out state as a refusal, and
+            # it is the realistic provider-down answer (retries exhausted →
+            # DependencyUnavailableError, or an open breaker → CircuitOpenError).
+            # Containing it here matters twice over: the counter below must still
+            # fire — every caller's order is already terminal, so this frame is
+            # the only actor that will ever see the pair — and the caller's 409
+            # must say the truth ("it will be reconciled") instead of escaping
+            # into _drive's generic handler, which would promise a recovery
+            # poller that never comes for a terminal order.
+            log.exception("checkout order %s: the automatic refund (%s) raised", order_id, reason)
+            refunded = False
+        if refunded:
+            return True
+        checkout_orphaned_paid_payments_total.inc()
+        log.error(
+            "checkout order %s: the automatic refund (%s) did not return the money; "
+            "reconciliation required (succeeded payment row attached)",
+            order_id,
+            reason,
+        )
+        return False
 
     async def _compensate(self, order_id: uuid.UUID, failed_step: str) -> None:
         """Release every hold taken for the order, then cancel it (reverse order of the drive).
@@ -507,17 +592,40 @@ class CheckoutSaga:
             # spans days against a 15-minute reservation TTL). Committing
             # fewer holds than the order has lines means the units were
             # already sold back into the pool — marking the order PAID would
-            # take money for stock it no longer owns. Compensate instead:
-            # release whatever remains, cancel the order, count it loudly.
-            # The succeeded payment on the cancelled order is the orphan pair
-            # the RUNBOOK §9 query finds for a manual refund — the same
-            # accepted stance as the cancel-won race (no auto-repair).
+            # take money for stock it no longer owns. Reverse the money first
+            # (durable + idempotent refund, ADR 0021 — the customer never got
+            # the goods, so the charge must not stand), *then* compensate.
+            # Refund-before-cancel is the crash-safe order: a crash after the
+            # refund leaves the order still `pending` and claimable, and the
+            # next pass settles a refunded payment through the compensation
+            # arm below — whereas cancel-first could strand the refund on an
+            # order no poller claims again. A failed refund keeps the orphan
+            # pair for the RUNBOOK §9 query, counted below — manual
+            # reconciliation stays the exceptional path.
             if not await self._commit_holds(order.id, expected=len(order.items)):
                 log.error(
                     "checkout order %s: payment succeeded after its stock holds expired; "
-                    "compensating instead of paying — manual refund reconciliation required",
+                    "refunding and compensating instead of paying",
                     order.id,
                 )
+                # A *raised* refund is deliberately left to the caller's boundary:
+                # the order stays `pending`, the pass rolls back and counts
+                # `deferred`, and the next pass retries the refund — a transient
+                # provider fault must not be counted as an orphan. A returned
+                # `False` is the provider's definitive answer, so the pair is
+                # counted and the order compensated: the money is stranded and a
+                # human owns it (the drive's orphan arm counts a raise too — its
+                # order is already terminal, so no later pass exists to retry).
+                if not await self._charges.refund(
+                    idempotency_key=payment_key_for(order.user_id, order.idempotency_key),
+                    reason="paid_without_consume",
+                ):
+                    checkout_orphaned_paid_payments_total.inc()
+                    log.error(
+                        "checkout order %s: automatic refund of the succeeded payment failed; "
+                        "reconciliation required (paid payment row attached)",
+                        order.id,
+                    )
                 await self._compensate(order.id, "paid-without-consume")
                 return "compensated"
             await self._orders.log_saga_step(order.id, "commit", "completed")
@@ -534,6 +642,14 @@ class CheckoutSaga:
                 await self._orders.log_saga_step(order.id, "mark_paid", "completed")
                 await self._consume_basket(order.user_id, _lines_of(order))
             return "completed"
+        if payment is not None and payment.refunded:
+            # The charge was already reversed (a previous pass's refund, or the
+            # live drive's orphan arm): there is no money standing behind this
+            # order, so settle it as any unpaid crash — release + cancel. Both
+            # steps are idempotent, so a refund that raced the compensation is
+            # safely re-run here.
+            await self._compensate(order.id, "crashed")
+            return "compensated"
         if payment is None or payment.failed:
             await self._compensate(order.id, "crashed")
             return "compensated"
@@ -544,10 +660,11 @@ class CheckoutSaga:
 
         Returns ``True`` when every one of the order's lines was consumed
         (``commit_for_order`` reports the order's committed total, so this is
-        retry-idempotent). On shortfall — holds the reaper released before the
-        payment confirmed — bumps ``checkout_paid_without_consume_total`` and
-        returns ``False``; the caller decides the terminal move (the drive
-        raises and leaves the order pending, the poller compensates).
+        retry-idempotent). On shortfall — stock released before the payment
+        confirmed — bumps ``checkout_paid_without_consume_total`` and returns
+        ``False``; the caller decides the terminal move (the drive refunds a
+        cancelled order or leaves a pending one for the poller, which refunds +
+        compensates).
         """
         committed = await self._holds.commit_for_order(order_id)
         if committed >= expected:

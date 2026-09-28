@@ -128,7 +128,7 @@ def _anchor_flags(events: list[str]) -> dict[str, int]:
 
 
 async def test_suspended_demo_anchor_is_provisioned_disabled(monkeypatch: Any) -> None:
-    """ only demo.suspended's mirror lands already disabled (is_active=False,
+    """only demo.suspended's mirror lands already disabled (is_active=False,
     the admin-disable shape); every other demo anchor is a normal active row."""
     events: list[str] = []
     _install_fakes(monkeypatch, events)

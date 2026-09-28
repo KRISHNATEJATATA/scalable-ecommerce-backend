@@ -100,6 +100,18 @@ class OrdersRepository:
         stmt = select(Order).where(Order.id == order_id).options(selectinload(Order.items))
         return (await self._session.execute(stmt)).scalar_one_or_none()
 
+    async def get_order_status(self, order_id: uuid.UUID) -> OrderStatus | None:
+        """The order's **committed** status, straight from the row — or ``None`` if it never existed.
+
+        A Core column select, deliberately not ``select(Order)``: the ORM answers
+        an attribute read from the identity map, so a caller asking *after*
+        another actor flipped the row on its own session (a cancel racing the
+        drive) would be handed the stale status. That answer decides whether a
+        refunded shortfall still has a poller to settle it, so it must be the DB's.
+        """
+        stmt = select(Order.__table__.c.status).where(Order.__table__.c.id == order_id)
+        return (await self._session.execute(stmt)).scalar_one_or_none()
+
     async def get_by_idempotency(self, user_id: uuid.UUID, idempotency_key: str) -> Order | None:
         """The order already placed under ``(user_id, key)``, with lines, or ``None``."""
         stmt = (

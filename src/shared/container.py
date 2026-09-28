@@ -49,8 +49,6 @@ from src.orders.ports.checkout import (
 )
 from src.orders.ports.repository import OrdersRepositoryPort
 from src.payments.adapters.db.repository import PaymentsRepository
-from src.payments.adapters.resilient_gateway import ResilientPaymentGateway
-from src.payments.adapters.stub_gateway import stub_gateway_from_settings
 from src.payments.application.service import PaymentsService
 from src.payments.ports.gateway import PaymentGatewayPort
 from src.payments.ports.repository import PaymentsRepositoryPort
@@ -61,6 +59,7 @@ from src.shared.errors.exceptions import (
     AuthorizationError,
     DependencyUnavailableError,
 )
+from src.shared.payment_gateway import make_payment_gateway
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
@@ -259,6 +258,10 @@ class OrderCharges(ChargePort):
             return None
         return ChargeResult(status=payment.status)
 
+    async def refund(self, *, idempotency_key: str, reason: str) -> bool:
+        """Reverse the charge through the payments service (idempotent per key)."""
+        return await self._payments.refund(idempotency_key=idempotency_key, reason=reason)
+
 
 # The saga's provider functions live at the bottom of this file (after the
 # cart/payments providers they depend on); the port-adapter classes above are
@@ -385,18 +388,10 @@ def get_payment_gateway(request: Request) -> PaymentGatewayPort:
     gateway = getattr(request.app.state, "payment_gateway", None)
     if gateway is None:
         settings = request.app.state.settings
-        # The resilience shell (bounded retry + circuit breaker) wraps whatever
-        # concrete gateway is configured, so a real provider drops in behind
-        # the same protection. The shared Valkey client backs the stub's
-        # deferred-charge window when the dev/demo pending trigger is enabled.
-        gateway = ResilientPaymentGateway(
-            stub_gateway_from_settings(settings, getattr(request.app.state, "valkey", None)),
-            max_attempts=settings.resilience_max_attempts,
-            base_delay_seconds=settings.resilience_retry_base_delay_seconds,
-            max_delay_seconds=settings.resilience_retry_max_delay_seconds,
-            failure_threshold=settings.resilience_breaker_failure_threshold,
-            reset_timeout_seconds=settings.resilience_breaker_reset_seconds,
-        )
+        # The shared factory owns the concrete gateway and its resilience shell,
+        # so the worker processes build the identical one (src/shared/payment_gateway
+        # — the recovery worker refunds charges now, so a provider swap must reach it).
+        gateway = make_payment_gateway(settings, getattr(request.app.state, "valkey", None))
         request.app.state.payment_gateway = gateway
     return gateway
 

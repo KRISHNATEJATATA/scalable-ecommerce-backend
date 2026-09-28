@@ -49,6 +49,7 @@ _EXPECTED = {
     "OrderPlaced",
     "PaymentSucceeded",
     "PaymentFailed",
+    "PaymentRefunded",
 }
 
 _ENVELOPE = {"event_id", "schema_version", "trace_id", "occurred_at"}
@@ -252,6 +253,12 @@ _EVENT_SAMPLES: dict[tuple[str, int], Callable[..., dict[str, Any]]] = {
         "order_id": merchant_id,
         "amount": "9.99",
         "reason": "card_declined",
+    },
+    ("PaymentRefunded", 1): lambda user_id, merchant_id: {
+        "payment_id": user_id,
+        "order_id": merchant_id,
+        "amount": "9.99",
+        "gateway_ref": "stub_refund_ledger_entry",
     },
 }
 

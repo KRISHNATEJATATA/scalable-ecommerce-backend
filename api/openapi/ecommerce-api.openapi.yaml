@@ -337,7 +337,11 @@ paths:
         compensation run (show "out of stock", not a retry loop); replaying
         an already-cancelled checkout re-raises its `409` — a retry needs a
         new key. Generate a new key whenever the cart changes — the key pins
-        the first request it was sent with.
+        the first request it was sent with. A cancel that wins while the
+        charge is landing → `409` with the charge refunded automatically (if
+        the automatic refund failed or was refused, the `409` says it will be
+        reconciled instead — the payment row stays `succeeded`, which is what
+        the RUNBOOK §9 orphan query looks for).
 
         A replayed response is marked with the `Idempotent-Replay: true`
         response header (absent on a fresh checkout), so a client can tell a
@@ -393,13 +397,19 @@ paths:
             "payment was declined; the order was cancelled", "checkout payment
             timed out; the order was cancelled", "the order was cancelled
             while checking out; start a new checkout", "cart is empty; nothing
-            to check out", "checkout reservation timed out". **Settling —
-            retry with the SAME key**: "payment outcome unknown; retry with
-            the same Idempotency-Key to settle", "checkout commit timed out;
-            it will be settled automatically", "checkout could not complete
-            after payment; it will be settled automatically", "the order was
-            cancelled while the payment was completing; it will be
-            reconciled". Reservation conflicts/contention from the reserve
+            to check out", "checkout reservation timed out", "the order was
+            cancelled while the payment was completing; the payment was
+            refunded" (the charge was returned automatically — do not retry
+            with this key; a same-key retry answers "the payment for this
+            checkout was refunded" instead), "the order was cancelled while
+            the payment was completing; it will be reconciled" (the automatic
+            refund failed or was refused, so the succeeded payment is
+            reconciled by hand).
+            **Settling — retry with the SAME key**: "payment outcome unknown;
+            retry with the same Idempotency-Key to settle", "checkout commit
+            timed out; it will be settled automatically", "checkout could not
+            complete after payment; it will be settled automatically".
+            Reservation conflicts/contention from the reserve
             step also surface as 409 (titles "Reservation Conflict" /
             "Reservation Contention").
           content:
