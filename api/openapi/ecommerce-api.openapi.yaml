@@ -331,7 +331,12 @@ paths:
       summary: Run the cart through the checkout saga
       description: >-
         Drives the caller's cart to a terminal order (reserve stock → charge
-        → commit → `paid`). Requires an `Idempotency-Key` header: same key +
+        → commit → `paid`). Cart prices are snapshots refreshed asynchronously,
+        so before the order exists every line is revalidated against the
+        catalog's current price — a price that moved (or a product now gone)
+        is a `409` "Cart Changed": refetch the cart and retry with the SAME
+        key (no order row was created, so the key is still unspent). Requires
+        an `Idempotency-Key` header: same key +
         same body replays the stored `201`; same key + different body →
         `409`; stock failure → `409` with the order already cancelled and
         compensation run (show "out of stock", not a retry loop); replaying
@@ -409,6 +414,11 @@ paths:
             retry with the same Idempotency-Key to settle", "checkout commit
             timed out; it will be settled automatically", "checkout could not
             complete after payment; it will be settled automatically".
+            **Cart moved under the snapshot — refetch the cart, retry with the
+            SAME key** (title "Cart Changed"; rejected before any order row
+            exists, so the key is unspent): "a price in the cart changed;
+            review the updated cart and retry", "a product in the cart is no
+            longer available; review the cart and retry".
             Reservation conflicts/contention from the reserve
             step also surface as 409 (titles "Reservation Conflict" /
             "Reservation Contention").

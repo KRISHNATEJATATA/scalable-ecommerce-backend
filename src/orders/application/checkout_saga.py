@@ -23,6 +23,12 @@ than returning the cancelled order as a fresh ``201``.
 Cross-module calls go through the saga's own ports
 (:mod:`src.orders.ports.checkout`), implemented at the composition root over
 the inventory/payments/cart services — this module never imports a sibling.
+
+The basket's prices are snapshots refreshed asynchronously, so the saga
+revalidates every line against the catalog's authoritative current price
+(:class:`~src.orders.ports.checkout.PriceTruthPort`) before creating the
+pending order — a stale or gone product is a ``CartChangedError`` (409), never
+an order at the old price.
 """
 
 from __future__ import annotations
@@ -53,10 +59,12 @@ from src.orders.ports.checkout import (
     ChargePort,
     CheckoutLine,
     IdempotencyPort,
+    PriceTruthPort,
     StockHoldsPort,
 )
 from src.orders.ports.repository import OrdersRepositoryPort
 from src.shared.errors.exceptions import (
+    CartChangedError,
     CheckoutIdempotencyConflictError,
     InsufficientStockError,
     OrderStateConflictError,
@@ -106,6 +114,7 @@ class CheckoutSaga:
         charges: ChargePort,
         idempotency: IdempotencyPort | None,
         *,
+        prices: PriceTruthPort,
         step_timeout_seconds: int,
     ) -> None:
         self._orders = orders
@@ -113,6 +122,7 @@ class CheckoutSaga:
         self._holds = holds
         self._charges = charges
         self._idempotency = idempotency
+        self._prices = prices
         self._step_timeout = step_timeout_seconds
 
     # --- the checkout entry point -------------------------------------
@@ -133,7 +143,10 @@ class CheckoutSaga:
         (outcome unknown — the reconciler/recovery poller settle it), a
         timed-out reservation, or a replay of an already-cancelled checkout,
         ``CheckoutIdempotencyConflictError`` (409) for same key + different
-        body, and ``InsufficientStockError`` (409) when the shelves refuse.
+        body, ``CartChangedError`` (409) when the catalog's current prices no
+        longer match the cart's snapshots (or a product is gone) — raised
+        before any order row exists, so the same-key retry works — and
+        ``InsufficientStockError`` (409) when the shelves refuse.
         Every failure path compensates before raising — no half-state escapes
         except through a process crash, which is the recovery poller's job.
         """
@@ -172,6 +185,7 @@ class CheckoutSaga:
                 lines = await self._basket.get_lines(user_id)
                 if not lines:
                     raise OrderStateConflictError("cart is empty; nothing to check out")
+                await self._revalidate_prices(lines)
                 total = _total(lines)
                 order, created = await self._orders.create_pending_order(
                     user_id=user_id,
@@ -202,12 +216,37 @@ class CheckoutSaga:
         except CheckoutIdempotencyConflictError:
             checkout_attempts_total.labels("idempotency_conflict").inc()
             raise
+        except CartChangedError:
+            checkout_attempts_total.labels("cart_changed").inc()
+            raise
         except OrderStateConflictError:
             checkout_attempts_total.labels("conflict").inc()
             raise
         except Exception:
             checkout_attempts_total.labels("error").inc()
             raise
+
+    async def _revalidate_prices(self, lines: list[CheckoutLine]) -> None:
+        """Refuse to order at a snapshot the catalog no longer stands behind.
+
+        The basket's prices are materialized snapshots refreshed by an
+        asynchronous ``ProductUpdated`` projection — a merchant edit can commit
+        while its event is still in flight. So before the pending order is
+        created, every line's snapshot price is checked against the catalog's
+        authoritative (uncached) read: unchanged → continue; changed or gone →
+        :class:`CartChangedError` (409), raised *before* any order row exists,
+        so the Idempotency-Key is still unspent and the same-key retry works
+        once the cart converges. Only this fresh path revalidates: a resumed
+        pending order keeps the prices it was created with (they were accepted
+        here), or it could never complete past a merchant edit.
+        """
+        current = await self._prices.current_prices([line.product_id for line in lines])
+        for line in lines:
+            price = current.get(line.product_id)
+            if price is None:
+                raise CartChangedError("a product in the cart is no longer available; review the cart and retry")
+            if price != line.unit_price:
+                raise CartChangedError("a price in the cart changed; review the updated cart and retry")
 
     async def _replay_or_resume(
         self,

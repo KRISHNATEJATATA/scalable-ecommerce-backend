@@ -144,6 +144,13 @@ class CatalogRepository:
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def get_products_by_ids(self, product_ids: list[uuid.UUID]) -> list[Product]:
+        if not product_ids:
+            return []
+        stmt = select(Product).where(Product.id.in_(product_ids), Product.deleted_at.is_(None))
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
+
     # --- writes: state change + outbox row committed in ONE transaction -------
 
     async def _commit_versioned(self, *, product: Product | None = None) -> None:

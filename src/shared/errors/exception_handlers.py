@@ -23,6 +23,7 @@ from src.shared.errors.error_builder import PROBLEM_CONTENT_TYPE, build_problem
 from src.shared.errors.exceptions import (
     AuthenticationError,
     AuthorizationError,
+    CartChangedError,
     CheckoutIdempotencyConflictError,
     ConcurrentUpdateError,
     DependencyUnavailableError,
@@ -137,6 +138,14 @@ async def _checkout_idempotency_conflict_handler(_: Request, exc: CheckoutIdempo
     # 409: the Idempotency-Key pins the first checkout body — same key with a
     # different body is a caller bug, never a second order.
     return _problem_response(409, title="Idempotency Conflict", detail=exc.detail)
+
+
+async def _cart_changed_handler(_: Request, exc: CartChangedError) -> JSONResponse:
+    # 409, its own title: the catalog moved under the cart's snapshot (price
+    # edit or deletion whose event hasn't been projected yet). Caller-fixable —
+    # refetch the cart and retry with the SAME Idempotency-Key (no order row
+    # was ever created, so the key is still unspent).
+    return _problem_response(409, title="Cart Changed", detail=exc.detail)
 
 
 async def _order_state_conflict_handler(_: Request, exc: OrderStateConflictError) -> JSONResponse:
@@ -283,6 +292,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     _register(app, StockBelowReservedError, _stock_below_reserved_handler)
     _register(app, PaymentIdempotencyConflictError, _payment_idempotency_conflict_handler)
     _register(app, CheckoutIdempotencyConflictError, _checkout_idempotency_conflict_handler)
+    _register(app, CartChangedError, _cart_changed_handler)
     _register(app, OrderStateConflictError, _order_state_conflict_handler)
     _register(app, UnknownPaymentRefError, _unknown_payment_ref_handler)
     _register(app, ConcurrentUpdateError, _concurrent_update_handler)

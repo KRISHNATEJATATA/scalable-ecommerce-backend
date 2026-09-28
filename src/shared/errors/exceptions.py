@@ -88,6 +88,22 @@ class CheckoutIdempotencyConflictError(Exception):
         self.detail = detail
 
 
+class CartChangedError(Exception):
+    """The cart's snapshot no longer matches the catalog → 409.
+
+    Raised at checkout when a line's snapshotted price differs from the
+    catalog's current price, or the product is gone — the asynchronous
+    ``ProductUpdated``/``ProductDeleted`` projection hasn't caught up with the
+    merchant's edit yet. Raised before any order row exists, so the
+    Idempotency-Key is still unused: refetch the cart and retry, same key.
+    Distinct from :class:`OrderStateConflictError` so the client can tell
+    "refetch your cart" apart from a lifecycle refusal."""
+
+    def __init__(self, detail: str = "the cart changed; review the updated cart and retry") -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
 class OrderStateConflictError(Exception):
     """The order's state refuses the transition → 409.
 

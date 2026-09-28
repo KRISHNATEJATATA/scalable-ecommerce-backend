@@ -41,6 +41,7 @@ from src.payments.application.service import PaymentsService
 from src.shared.container import OrderCharges, OrderStockHolds
 from src.shared.errors.exceptions import (
     AuthorizationError,
+    CartChangedError,
     CheckoutIdempotencyConflictError,
     InsufficientStockError,
     OrderStateConflictError,
@@ -114,6 +115,34 @@ class _Idempotency:
         }
 
 
+class _BasketTruth:
+    """PriceTruthPort mirroring a ``_Basket``'s live lines — the catalog that
+    always stands behind the snapshots, so existing drives pass revalidation."""
+
+    def __init__(self, basket: _Basket) -> None:
+        self._basket = basket
+
+    async def current_prices(self, product_ids: list[uuid.UUID]) -> dict[uuid.UUID, Decimal]:
+        wanted = set(product_ids)
+        return {
+            line.product_id: line.unit_price
+            for lines in self._basket.lines.values()
+            for line in lines
+            if line.product_id in wanted
+        }
+
+
+class _FixedTruth:
+    """PriceTruthPort over an explicit map — a catalog the test edits at will
+    (diverge it from the basket to exercise the cart-changed guard)."""
+
+    def __init__(self, prices: dict[uuid.UUID, Decimal]) -> None:
+        self.prices = prices
+
+    async def current_prices(self, product_ids: list[uuid.UUID]) -> dict[uuid.UUID, Decimal]:
+        return {pid: self.prices[pid] for pid in product_ids if pid in self.prices}
+
+
 class _GatedCharges:
     """The saga's ChargePort with an intentionally delayed payment: ``charge``
     parks until the test releases it, holding the saga mid-drive while the test
@@ -141,7 +170,13 @@ def _line(product_no: int = 1, qty: int = 1, price: str = "19.99") -> CheckoutLi
     )
 
 
-def _saga(session, basket: _Basket, *, gateway: StubPaymentGateway | None = None) -> CheckoutSaga:
+def _saga(
+    session,
+    basket: _Basket,
+    *,
+    gateway: StubPaymentGateway | None = None,
+    prices: _BasketTruth | _FixedTruth | None = None,
+) -> CheckoutSaga:
     inventory = InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)
     payments = PaymentsService(
         PaymentsRepository(session),
@@ -156,6 +191,7 @@ def _saga(session, basket: _Basket, *, gateway: StubPaymentGateway | None = None
         OrderStockHolds(inventory),
         OrderCharges(payments),
         _Idempotency(),
+        prices=prices or _BasketTruth(basket),
         step_timeout_seconds=60,
     )
 
@@ -285,6 +321,89 @@ async def test_stock_refusal_counts_as_out_of_stock_not_conflict(session):
     assert _counter("checkout_compensation_total", step="reserve") == comp_before + 1
 
 
+# --- price revalidation -----------------------------------------
+
+
+async def test_checkout_rejects_a_price_the_catalog_no_longer_stands_behind(session):
+    """The cart snapshot says 19.99 but the merchant already committed 25.00 —
+    the ``ProductUpdated`` event is still in flight. The checkout must refuse
+    (``CartChangedError`` → 409), never order at the stale price. Raised before
+    any order row exists, so the same Idempotency-Key retries cleanly once the
+    cart converges."""
+    line = _line(price="19.99")
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    truth = _FixedTruth({line.product_id: Decimal("25.00")})  # the edit landed; the event hasn't
+    saga = _saga(session, basket, prices=truth)
+
+    before = _counter("checkout_attempts_total", outcome="cart_changed")
+    try:
+        await saga.checkout(user_id=USER_A, idempotency_key="key-stale-price", payment_token="tok_visa")
+    except CartChangedError:
+        pass
+    else:
+        raise AssertionError("expected CartChangedError")
+
+    assert _counter("checkout_attempts_total", outcome="cart_changed") == before + 1
+    assert await _orders_count(session) == 0  # no order at the stale price
+    assert await _stock(session, str(line.product_id)) == (5, 0)  # nothing reserved
+
+    # The projection catches up (cart + truth agree on 25.00) — the SAME key succeeds.
+    converged = CheckoutLine(product_id=line.product_id, name=line.name, unit_price=Decimal("25.00"), quantity=1)
+    basket.stock(USER_A, converged)
+    order, created = await saga.checkout(user_id=USER_A, idempotency_key="key-stale-price", payment_token="tok_visa")
+    assert created is True
+    assert order.status == OrderStatus.PAID
+    assert order.items[0].unit_price == Decimal("25.00")  # the price the catalog stood behind
+
+
+async def test_checkout_rejects_a_product_gone_since_the_snapshot(session):
+    """``ProductDeleted`` is still in flight: the line's product is already
+    soft-deleted in the catalog — absent from the truth map — so the checkout
+    refuses instead of ordering a product that no longer exists."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    saga = _saga(session, basket, prices=_FixedTruth({}))  # the catalog: gone
+
+    try:
+        await saga.checkout(user_id=USER_A, idempotency_key="key-gone", payment_token="tok_visa")
+    except CartChangedError:
+        pass
+    else:
+        raise AssertionError("expected CartChangedError")
+    assert await _orders_count(session) == 0
+    assert await _stock(session, str(line.product_id)) == (5, 0)
+
+
+async def test_resumed_checkout_keeps_the_prices_it_was_created_with(session):
+    """Revalidation guards order *creation* only: a crashed checkout resumed
+    under the same key drives the order's stored lines home even though the
+    catalog price moved in between — the price was accepted when the pending
+    order was created, and re-checking now would trap the order forever."""
+    from src.orders.application.checkout_saga import body_hash_for
+
+    line = _line(price="19.99")
+    await _seed(session, str(line.product_id), 5)
+    await OrdersRepository(session).create_pending_order(
+        user_id=USER_A,
+        idempotency_key="key-resume-moved",
+        body_hash=body_hash_for("tok_visa"),
+        total=Decimal("19.99"),
+        lines=[(line.product_id, line.name, line.unit_price, line.quantity)],
+    )
+    truth = _FixedTruth({line.product_id: Decimal("25.00")})  # the merchant edited after the crash
+    order, created = await _saga(session, _Basket(), prices=truth).checkout(
+        user_id=USER_A, idempotency_key="key-resume-moved", payment_token="tok_visa"
+    )
+
+    assert created is False  # the row pre-existed: a replay, driven home
+    assert order.status == OrderStatus.PAID
+    assert order.items[0].unit_price == Decimal("19.99")  # the accepted price stands
+
+
 async def test_recovery_settlements_are_counted_with_their_compensation(session):
     """The poller's process counts its own settlements; its compensation run is
     labeled ``crashed``, distinct from a live drive's ``reserve``/``charge``."""
@@ -358,6 +477,7 @@ async def test_concurrent_add_survives_a_successful_checkout(session):
         OrderStockHolds(inventory),
         charges,
         _Idempotency(),
+        prices=_BasketTruth(basket),
         step_timeout_seconds=60,
     )
 
@@ -401,6 +521,7 @@ async def test_concurrent_add_survives_checkout_over_the_real_cart(session, real
         OrderStockHolds(inventory),
         charges,
         _Idempotency(),
+        prices=_FixedTruth({a.product_id: a.unit_price, b.product_id: b.unit_price}),
         step_timeout_seconds=60,
     )
 
@@ -701,6 +822,7 @@ async def test_charge_timeout_with_unknown_outcome_leaves_pending_for_recovery(s
         OrderStockHolds(inventory),
         _HangingCharges(),
         _Idempotency(),
+        prices=_BasketTruth(basket),
         # One timeout for every step — including the reserve step's own DB
         # commits. 50 ms raced them on slow CI runners: cancelling an in-flight
         # asyncpg statement poisoned the session and the drive died with
@@ -762,6 +884,7 @@ async def test_charge_timeout_with_pending_payment_leaves_pending_not_cancelled(
         OrderStockHolds(inventory),
         _HangingAfterRowCharges("key-hang-pending"),
         _Idempotency(),
+        prices=_BasketTruth(basket),
         # Same margin as the unknown-outcome test above: the timeout covers the
         # reserve step's and the payment row's own DB commits too — 50 ms raced
         # them on slow CI runners and poisoned the session mid-statement.
@@ -828,6 +951,7 @@ async def test_failure_after_payment_never_compensates(session):
         _BreakingCommitHolds(inventory),
         OrderCharges(payments),
         _Idempotency(),
+        prices=_BasketTruth(basket),
         step_timeout_seconds=60,
     )
     try:
@@ -877,6 +1001,7 @@ async def test_cancel_wins_after_payment_refunds_automatically(session):
         OrderStockHolds(inventory),
         OrderCharges(payments),
         _Idempotency(),
+        prices=_BasketTruth(basket),
         step_timeout_seconds=60,
     )
 
@@ -938,6 +1063,7 @@ async def test_cancel_wins_after_payment_counts_an_orphan_when_the_refund_fails(
         OrderStockHolds(inventory),
         charges := _RefundRefusingCharges(payments),
         _Idempotency(),
+        prices=_BasketTruth(basket),
         step_timeout_seconds=60,
     )
 
@@ -1036,6 +1162,7 @@ async def test_cancel_racing_a_parked_payment_refunds_not_orphans(session, sessi
             OrderStockHolds(drive_inventory),
             _BarrierCharges(drive_payments),
             _Idempotency(),
+            prices=_BasketTruth(basket),
             step_timeout_seconds=60,
         )
         drive = asyncio.create_task(
@@ -1146,6 +1273,7 @@ async def test_poller_settling_concurrently_does_not_count_an_orphan(session):
         OrderStockHolds(inventory),
         OrderCharges(payments),
         _Idempotency(),
+        prices=_BasketTruth(basket),
         step_timeout_seconds=60,
     )
 
@@ -1219,6 +1347,7 @@ async def test_recovery_skips_an_order_with_fresh_journal_activity(session):
         OrderStockHolds(inventory),
         OrderCharges(PaymentsService(PaymentsRepository(session), StubPaymentGateway(), webhook_secret="test-secret")),
         _Idempotency(),
+        prices=_FixedTruth({}),
         step_timeout_seconds=60,
     ).recover_stuck(cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50)
 
@@ -1276,6 +1405,7 @@ async def test_recovery_rolls_back_a_poisoned_order_and_finishes_the_batch(sessi
         OrderStockHolds(inventory),
         OrderCharges(PaymentsService(PaymentsRepository(session), StubPaymentGateway(), webhook_secret="test-secret")),
         _Idempotency(),
+        prices=_FixedTruth({}),
         step_timeout_seconds=60,
     ).recover_stuck(cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50)
 
@@ -1486,6 +1616,7 @@ async def test_drive_commit_shortfall_leaves_pending_for_recovery(session):
         _VanishedHolds(inventory),
         OrderCharges(payments),
         _Idempotency(),
+        prices=_BasketTruth(basket),
         step_timeout_seconds=60,
     )
     before = _counter("checkout_paid_without_consume_total")

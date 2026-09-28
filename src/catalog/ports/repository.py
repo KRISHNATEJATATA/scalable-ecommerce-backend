@@ -8,7 +8,7 @@ land here with the product-CRUD feature, each persisting an outbox row in the sa
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, runtime_checkable
@@ -107,6 +107,17 @@ class CatalogRepositoryPort(Protocol):
     ) -> Page[Any]: ...
 
     async def get_product(self, product_id: uuid.UUID) -> ProductRecord | None: ...
+
+    async def get_products_by_ids(self, product_ids: list[uuid.UUID]) -> Sequence[ProductRecord]:
+        """Every live product in ``product_ids``, in no guaranteed order.
+
+        The authoritative (uncached) batch read — checkout's price revalidation
+        reads here precisely because the service's cache-aside can lag the DB.
+        Soft-deleted and unknown ids are simply absent from the result.
+        (``Sequence``, not ``list``: covariance lets the ORM row satisfy the
+        record protocol — ``list[Product]`` is not a ``list[ProductRecord]``.)
+        """
+        ...
 
     async def create_product(
         self,

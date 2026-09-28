@@ -6,6 +6,8 @@ inventory/payments/cart services — orders never names another module (the
 modules). Each port speaks the saga's language:
 
 * :class:`BasketPort` — the pre-checkout lines to buy, and clearing them after.
+* :class:`PriceTruthPort` — the catalog's authoritative current prices (the
+  revalidation the saga runs before it trusts the basket's snapshots).
 * :class:`StockHoldsPort` — hold/commit/release stock for one order.
 * :class:`ChargePort` — charge for one order, and look the attempt back up.
 """
@@ -48,6 +50,21 @@ class ChargeResult:
     def refunded(self) -> bool:
         """The money was returned after a succeeded charge (the saga's undo)."""
         return self.status == "refunded"
+
+
+class PriceTruthPort(Protocol):
+    """The catalog's authoritative word on what a product costs right now.
+
+    Implemented at the composition root straight over the catalog's database
+    read — deliberately never the cache-aside: product updates propagate to
+    caches and carts through the same asynchronous events, so a cached price
+    can lag the DB by exactly the window this port exists to close. An absent
+    id means the product is gone (soft-deleted or never existed) — unbuyable.
+    """
+
+    async def current_prices(self, product_ids: list[uuid.UUID]) -> dict[uuid.UUID, Decimal]:
+        """Live price per still-sellable id; gone products are absent from the map."""
+        ...
 
 
 class BasketPort(Protocol):

@@ -16,6 +16,10 @@ incremented in the recovery-poller process — same pattern as
   - ``out_of_stock`` — the shelves refused (``InsufficientStockError``): the
     oversell guard working, counted here per checkout and separately per
     reservation by ``inventory_oversell_blocked_total``;
+  - ``cart_changed`` — the catalog's current price no longer matched the
+    cart's snapshot (or a product was gone) at checkout
+    (``CartChangedError``): the async price projection losing its race, and
+    the revalidation guard catching it before an order exists;
   - ``idempotency_conflict`` — same Idempotency-Key, different body (caller
     bug, never a second order);
   - ``conflict`` — any other controlled 409: empty cart, declined payment,
@@ -64,7 +68,7 @@ from prometheus_client import Counter
 
 checkout_attempts_total = Counter(
     "checkout_attempts_total",
-    "Checkout calls by how they ended (paid, replayed, out_of_stock, idempotency_conflict, conflict, error).",
+    "Checkout calls by outcome (paid, replayed, out_of_stock, cart_changed, idempotency_conflict, conflict, error).",
     ["outcome"],
 )
 

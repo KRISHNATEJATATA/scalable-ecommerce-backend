@@ -45,6 +45,7 @@ from src.orders.ports.checkout import (
     ChargeResult,
     CheckoutLine,
     IdempotencyPort,
+    PriceTruthPort,
     StockHoldsPort,
 )
 from src.orders.ports.repository import OrdersRepositoryPort
@@ -263,6 +264,25 @@ class OrderCharges(ChargePort):
         return await self._payments.refund(idempotency_key=idempotency_key, reason=reason)
 
 
+class CatalogPriceTruth(PriceTruthPort):
+    """Orders' :class:`PriceTruthPort` built over the catalog repository.
+
+    Lives here — the one place allowed to touch every module — so orders never
+    names catalog. Deliberately the **repository**, not ``CatalogService``:
+    the service's cache-aside is invalidated by the same asynchronous events
+    whose propagation lag this guard exists to catch, so only the DB read is
+    authoritative enough to revalidate checkout prices against.
+    """
+
+    def __init__(self, catalog: CatalogRepositoryPort) -> None:
+        self._catalog = catalog
+
+    async def current_prices(self, product_ids: list[uuid.UUID]) -> dict[uuid.UUID, Decimal]:
+        """Live price per still-sellable id; gone products are absent."""
+        products = await self._catalog.get_products_by_ids(product_ids)
+        return {product.id: product.price for product in products}
+
+
 # The saga's provider functions live at the bottom of this file (after the
 # cart/payments providers they depend on); the port-adapter classes above are
 # import-only and safe anywhere.
@@ -437,6 +457,13 @@ def get_order_charges(
     return OrderCharges(payments)
 
 
+def get_price_truth(
+    catalog: Annotated[CatalogRepositoryPort, Depends(get_catalog_repository)],
+) -> PriceTruthPort:
+    """Provide the catalog-DB-backed price truth for checkout revalidation."""
+    return CatalogPriceTruth(catalog)
+
+
 def get_order_idempotency(request: Request) -> IdempotencyPort | None:
     """Provide the Valkey idempotency fast path, or ``None`` if Valkey is down/absent.
 
@@ -455,6 +482,7 @@ def get_checkout_saga(
     holds: Annotated[StockHoldsPort, Depends(get_order_stock_holds)],
     charges: Annotated[ChargePort, Depends(get_order_charges)],
     idempotency: Annotated[IdempotencyPort | None, Depends(get_order_idempotency)],
+    prices: Annotated[PriceTruthPort, Depends(get_price_truth)],
     request: Request,
 ) -> CheckoutSaga:
     """Provide the checkout saga orchestrator over its ports."""
@@ -464,6 +492,7 @@ def get_checkout_saga(
         holds,
         charges,
         idempotency,
+        prices=prices,
         step_timeout_seconds=request.app.state.settings.checkout_saga_step_timeout_seconds,
     )
 

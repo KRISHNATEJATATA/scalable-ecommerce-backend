@@ -19,7 +19,11 @@ that product:
 ``image_url`` is deliberately NOT refreshed here: the event payload is a
 notification plus the fields a consumer projects (name, price, category — see
 ``ProductWriteDataV2``), not a replica of the row. The snapshot re-aligns on
-the next add. Stale images in carts are tolerated; stale prices are not.
+the next add. Stale images in carts are tolerated; stale prices are not —
+and this projection is only eventually consistent, so the checkout saga is
+the backstop: it revalidates every line's snapshot price against the catalog
+DB before creating the order and refuses with 409 "Cart Changed" when they
+disagree.
 
 Idempotent twice over: ``SqsConsumer`` dedupes on ``event_id`` **within this
 subscription** (``event:cart-events:{event_id}``), and both projections are

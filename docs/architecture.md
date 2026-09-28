@@ -237,6 +237,16 @@ transaction. A refused refund keeps the payment row `succeeded` and is counted
 (`checkout_orphaned_paid_payments_total`, RUNBOOK §9) — manual reconciliation is
 the exceptional path, not the routine race outcome.
 
+- **Prices are revalidated against the catalog DB before the order exists**
+  . Cart lines carry *snapshot* prices refreshed asynchronously by
+  the cart consumer, so a merchant edit can be committed while its
+  `ProductUpdated` event is still in flight. Before creating the `pending`
+  order the saga re-reads the catalog's authoritative (uncached) prices via
+  its `PriceTruthPort`; a changed price or a gone product is a **409
+  "Cart Changed"**, raised before any order row exists so the same
+  `Idempotency-Key` retries cleanly once the cart converges. A *resumed*
+  pending order is deliberately not revalidated — its prices were accepted at
+  creation.
 - **Idempotency rides two layers.** The Valkey fast path
   (`idempotency:{user_id}:{key}`, holding `{body_hash, status, response}`)
   answers exact replays without touching Postgres; **`UNIQUE(user_id,

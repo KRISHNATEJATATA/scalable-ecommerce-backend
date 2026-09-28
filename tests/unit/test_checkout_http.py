@@ -330,6 +330,37 @@ async def test_checkout_stock_failure_is_409(app_ctx, rsa_key):
     assert replay.json()["status"] == 409
 
 
+async def test_checkout_stale_price_is_409_cart_changed(app_ctx, rsa_key):
+    """The merchant's price edit committed, but its ProductUpdated event never
+    reached the cart (no consumer in this harness — exactly the lag the guard
+    exists for): checkout revalidates against the catalog DB and refuses with
+    409 "Cart Changed" instead of ordering at the stale price. No
+    order row is created, so the Idempotency-Key stays unspent."""
+    app, sessionmaker = app_ctx
+    consumer, product_id, _merchant = await _setup_cart(app, sessionmaker, rsa_key)
+    async with sessionmaker() as session:
+        await session.execute(text("UPDATE catalog.products SET price = 12.99 WHERE id = :pid"), {"pid": product_id})
+        await session.commit()
+
+    async with _client(app) as client:
+        resp = await client.post(
+            "/v1/checkout",
+            headers={**_auth(consumer), "Idempotency-Key": "http-key-stale"},
+            json={"payment_token": "tok_visa"},
+        )
+    assert resp.status_code == 409
+    assert resp.headers["content-type"] == "application/problem+json"
+    assert resp.json()["title"] == "Cart Changed"
+
+    async with sessionmaker() as session:
+        count = (
+            await session.execute(
+                text("SELECT count(*) FROM orders.orders WHERE idempotency_key = :k"), {"k": "http-key-stale"}
+            )
+        ).scalar_one()
+    assert count == 0  # rejected before the pending order existed — same-key retry stays clean
+
+
 async def test_order_history_detail_cancel_and_ownership(app_ctx, rsa_key):
     app, sessionmaker = app_ctx
     consumer, _product_id, _merchant = await _setup_cart(app, sessionmaker, rsa_key)

@@ -42,7 +42,7 @@ from src.inventory.application.service import InventoryService
 from src.orders.adapters.db.repository import OrdersRepository
 from src.orders.adapters.idempotency import ValkeyIdempotencyStore
 from src.orders.application.checkout_saga import CheckoutSaga
-from src.orders.ports.checkout import BasketPort, ChargePort, ChargeResult, CheckoutLine
+from src.orders.ports.checkout import BasketPort, ChargePort, ChargeResult, CheckoutLine, PriceTruthPort
 from src.payments.adapters.db.repository import PaymentsRepository
 from src.payments.application.service import PaymentsService
 from src.shared.config.setting import AppSettings, get_settings
@@ -110,6 +110,19 @@ class _WorkerCharges(ChargePort):
         return await self._payments.refund(idempotency_key=idempotency_key, reason=reason)
 
 
+class _WorkerPrices(PriceTruthPort):
+    """The saga's price truth, unwired: recovery never creates orders.
+
+    Price revalidation guards the fresh-checkout path only (a pending order
+    keeps the prices it was created with), and this saga only ever runs
+    ``recover_stuck`` — so a call here is a bug, answered like
+    ``_WorkerCharges.charge``: loudly.
+    """
+
+    async def current_prices(self, product_ids: list[uuid.UUID]) -> dict[uuid.UUID, Decimal]:
+        raise RuntimeError("recovery must never revalidate prices: only fresh checkouts create orders")
+
+
 class _WorkerHolds:
     """The saga's holds over the inventory service (same calls as the live path)."""
 
@@ -161,6 +174,7 @@ class SagaRecovery:
             _WorkerHolds(inventory),
             _WorkerCharges(payments),
             ValkeyIdempotencyStore(self._valkey, ttl_seconds=self._settings.checkout_idempotency_ttl_seconds),
+            prices=_WorkerPrices(),
             step_timeout_seconds=self._settings.checkout_saga_step_timeout_seconds,
         )
 
