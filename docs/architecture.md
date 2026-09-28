@@ -230,10 +230,14 @@ then marks the order `paid` — journaling every step to the persisted
 cancel order); only unpaid sagas compensate — a `paid` order unwinds via the
 future returns/refunds reverse saga, never via cancel. A charge that landed on an
 order that died anyway (a cancel won the guarded flip, or the reaper had released
-the holds) is reversed by the saga's own **refund compensation** (ADR 0021):
+the holds) is reversed by the saga's own **refund compensation**:
 provider refund under the charge's idempotency key, then a guarded
 `succeeded → refunded` flip with a `PaymentRefunded` outbox row in the same
-transaction. A refused refund keeps the payment row `succeeded` and is counted
+transaction. On a terminal order the intent is journaled first
+(`refund: requested` in the `saga_log`), so a refund whose provider
+call *raises* is retried by the recovery poller's refund claim instead of
+stranded. Only a **refused** refund (or an unjournaled intent) keeps the
+payment row `succeeded` and is counted
 (`checkout_orphaned_paid_payments_total`, RUNBOOK §9) — manual reconciliation is
 the exceptional path, not the routine race outcome.
 
@@ -265,14 +269,17 @@ the exceptional path, not the routine race outcome.
   when the charge succeeded, release + cancel otherwise (a `succeeded` charge whose
   holds can't be fully committed is refunded first, and an already-`refunded`
   payment settles like any other unpaid crash — release + cancel — because both
-  steps are idempotent). It never re-presents
+  steps are idempotent). The same pass also retries **journaled refund intents**
+  on `cancelled` orders (`refund: requested` without a terminal marker
+  , so a refund-provider outage on a terminal order heals itself. It never
+  re-presents
   the payment token (which is never stored); still-`pending` payments are left
   for the payment reconciler. It lives in `shared` deliberately: settling
   composes four modules, and only shared code may do that.
 - **Paid-implies-consumed.** Every commit site (drive and poller alike) checks
   `commit_for_order`'s answer — the order's committed hold total, retry-safe —
   against the order's line count before marking `paid`. A shortfall means the
-  reaper released the holds before the payment confirmed (ADR 0019's
+  reaper released the holds before the payment confirmed (
   paid-without-consume window): the order is compensated instead of paid and the
   charge is refunded— the refund's own failure is the alertable case
   (`checkout_paid_without_consume_total` beside
@@ -288,7 +295,7 @@ the exceptional path, not the routine race outcome.
 
 ## Domain events
 
-Published through a **transactional outbox → SNS/SQS bus** (see ADR 0007), never
+Published through a **transactional outbox → SNS/SQS bus**, never
 `BackgroundTasks` and never a direct SNS publish from the request path. The domain writes state
 and an `outbox` row in **one transaction**; a `service`-role **relay** claims unpublished rows
 (`FOR UPDATE SKIP LOCKED`), publishes them to SNS (**topic per event type**, **standard**
@@ -367,7 +374,7 @@ prod, compose services locally — never `BackgroundTasks`:
 
 ## Correctness invariants (never simplify away)
 
-- **Atomic conditional decrement** on inventory (see ADR 0010) — the single
+- **Atomic conditional decrement** on inventory — the single
   `UPDATE ... WHERE on_hand - reserved >= :qty` *is* the oversell guard
   (`rowcount = 0` = rejected). The reservation row and its `StockReserved` outbox
   row commit in the **same transaction**. Never replace it with read-then-write,

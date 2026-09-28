@@ -71,6 +71,35 @@ _CLAIM_STUCK_SQL = text(
 )
 
 
+# The refund-retry claim: a terminal (``cancelled``) order whose
+# refund intent was journaled (``refund: requested``) but never closed
+# (``completed``/``refused``). The candidate set is driven from the journal
+# (a partial index covers the open markers — the cancelled-orders table grows
+# unboundedly, so scanning it every pass would too), and the claim takes the
+# same lease shape as the stuck-pending claim: the ``updated_at = now()``
+# touch *is* the lease (the row is reclaimable once the lease ages past the
+# cutoff, which is also the retry cadence) and ``SKIP LOCKED`` splits the
+# batch across poller replicas — so two replicas cannot both run the refusal
+# path and double-count the orphan. The marker's own age gates the claim, so
+# a drive frame whose provider call is still inside its retry budget is
+# normally left alone — and when it is not, the refund leg's idempotency (the
+# charge's own key + the guarded flip) makes the overlap harmless.
+_CLAIM_PENDING_REFUND_SQL = text(
+    "WITH candidates AS ("
+    f"SELECT DISTINCT s.order_id FROM {SCHEMA}.saga_log s "  # noqa: S608
+    "WHERE s.step = 'refund' AND s.status = 'requested' AND s.created_at < :cutoff"
+    "), claimed AS ("
+    f"SELECT o.id FROM {SCHEMA}.orders o "  # noqa: S608
+    "WHERE o.status = 'cancelled' AND o.updated_at < :cutoff "
+    "AND o.id IN (SELECT order_id FROM candidates) "
+    f"AND NOT EXISTS (SELECT 1 FROM {SCHEMA}.saga_log t "  # noqa: S608
+    "WHERE t.order_id = o.id AND t.step = 'refund' AND t.status IN ('completed', 'refused')) "
+    "ORDER BY o.updated_at FOR UPDATE SKIP LOCKED LIMIT :batch"
+    f") UPDATE {SCHEMA}.orders o SET updated_at = now() "  # noqa: S608
+    "FROM claimed WHERE o.id = claimed.id RETURNING o.id"
+)
+
+
 class OrdersRepository:
     """Implements :class:`src.orders.ports.repository.OrdersRepositoryPort`."""
 
@@ -311,6 +340,30 @@ class OrdersRepository:
         on :data:`_CLAIM_STUCK_SQL`). Returns the claimed orders with lines loaded.
         """
         ids = (await self._session.execute(_CLAIM_STUCK_SQL, {"cutoff": cutoff, "batch": batch_size})).scalars().all()
+        await self._session.commit()
+        claimed: list[Order] = []
+        for order_id in ids:
+            row = await self.get_order(order_id)
+            if row is not None:
+                claimed.append(row)
+        return claimed
+
+    async def claim_cancelled_with_pending_refund(self, *, cutoff: datetime, batch_size: int) -> list[Order]:
+        """Lease cancelled orders with an open refund intent in the journal (the poller's refund-retry claim).
+
+        Same lease shape as :meth:`claim_stuck_pending` — an ``updated_at``
+        touch under ``FOR UPDATE SKIP LOCKED`` — so concurrent poller replicas
+        split the batch instead of double-running the refusal path (the refund
+        itself is idempotent under the charge's own key either way; the lease
+        is what keeps the orphan count single). The touch also sets the retry
+        cadence: a claimed row is not reclaimable until its lease ages past
+        the cutoff.
+        """
+        ids = (
+            (await self._session.execute(_CLAIM_PENDING_REFUND_SQL, {"cutoff": cutoff, "batch": batch_size}))
+            .scalars()
+            .all()
+        )
         await self._session.commit()
         claimed: list[Order] = []
         for order_id in ids:

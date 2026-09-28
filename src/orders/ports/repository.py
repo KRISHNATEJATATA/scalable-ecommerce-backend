@@ -81,3 +81,14 @@ class OrdersRepositoryPort(Protocol):
     async def claim_stuck_pending(self, *, cutoff: datetime, batch_size: int) -> list[Any]:
         """Lease quiet ``pending`` orders older than ``cutoff`` (SKIP LOCKED, heartbeat-guarded)."""
         ...
+
+    async def claim_cancelled_with_pending_refund(self, *, cutoff: datetime, batch_size: int) -> list[Any]:
+        """Cancelled orders whose journaled refund intent has no terminal marker yet.
+
+        The recovery poller's refund-retry claim: a refund that raised on a
+        terminal order left ``refund: requested`` in the journal, and these rows
+        are re-claimed (under the same lease discipline as the pending claim)
+        until the money is confirmed back (``completed``) or the provider's
+        refusal is recorded (``refused``) — the re-claim *is* the retry.
+        """
+        ...

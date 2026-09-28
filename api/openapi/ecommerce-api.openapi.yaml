@@ -344,8 +344,10 @@ paths:
         new key. Generate a new key whenever the cart changes — the key pins
         the first request it was sent with. A cancel that wins while the
         charge is landing → `409` with the charge refunded automatically (if
-        the automatic refund failed or was refused, the `409` says it will be
-        reconciled instead — the payment row stays `succeeded`, which is what
+        the refund is still in progress the `409` says so — the recovery
+        poller retries it from the journaled intent; if the provider
+        definitively refused, the `409` says it will be reconciled instead —
+        the payment row stays `succeeded`, which is what
         the RUNBOOK §9 orphan query looks for).
 
         A replayed response is marked with the `Idempotent-Replay: true`
@@ -407,8 +409,12 @@ paths:
             refunded" (the charge was returned automatically — do not retry
             with this key; a same-key retry answers "the payment for this
             checkout was refunded" instead), "the order was cancelled while
-            the payment was completing; it will be reconciled" (the automatic
-            refund failed or was refused, so the succeeded payment is
+            the payment was completing; the refund is in progress and will
+            complete automatically" (the refund provider faulted transiently;
+            the recovery poller retries the journaled refund — do not retry
+            this key), "the order was cancelled while
+            the payment was completing; it will be reconciled" (the provider
+            definitively refused the refund, so the succeeded payment is
             reconciled by hand).
             **Settling — retry with the SAME key**: "payment outcome unknown;
             retry with the same Idempotency-Key to settle", "checkout commit

@@ -533,7 +533,7 @@ class AppSettings(BaseSettings):
         reads the ``saga_log`` journal. Pruning either before that window
         closes makes a replay under-count (a false shortfall) and compensate a
         fully-consumed order — re-opening the exact paid-without-consume class
-        ADR 0019 handles. The relationship is what makes pruning safe, so it is
+        handles. The relationship is what makes pruning safe, so it is
         enforced, not documented and hoped for. Published outbox rows are
         deliberately NOT coupled: the relay never re-reads them and the
         reconciler never reads the outbox, so their retention is pure storage

@@ -82,8 +82,10 @@ async def checkout(
     fresh order; same key + different body → ``409``; stock failure → ``409`` with
     the order already cancelled and compensation run (show "out of stock", not a
     retry loop); a cancel that won while the charge was landing → ``409`` with the
-    charge refunded automatically (if the automatic refund failed or was refused
-    the 409 says it will be reconciled instead — the payment row stays
+    charge refunded automatically (if the refund is still in progress the 409
+    says so — the recovery poller retries it from the journaled intent
+    ; if the provider definitively refused, the 409 says it will be
+    reconciled instead — the payment row stays
     ``succeeded``, which is what the RUNBOOK §9 orphan query looks for); replaying an already-cancelled
     checkout re-raises its ``409`` — a retry needs a new key. A same-key retry on a
     ``refunded`` checkout answers "the payment for this checkout was refunded"

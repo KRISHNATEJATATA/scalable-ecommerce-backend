@@ -16,7 +16,7 @@ works in both places beats two that don't).
 * A pass receives a batch, re-sends each body **with its message attributes**
   (the ``traceparent`` the consumer logs under), and only then deletes the DLQ
   copy. Send-then-delete is deliberate: a crash in between leaves the message on
-  both queues, and the consumers are idempotent (ADR 0007) — an at-least-once
+  both queues, and the consumers are idempotent — an at-least-once
   duplicate beats an at-most-once lost message.
 * Replay is a *second* delivery, so it is safe exactly because the handlers are
   idempotent: the Valkey dedupe marker is a fast path, and every effect is

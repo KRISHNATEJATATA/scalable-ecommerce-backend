@@ -309,7 +309,7 @@ stock from a slow-but-alive checkout and that checkout fails at payment confirma
 | Expired-hold backlog (query below) climbing fast | checkouts dying mid-saga upstream | investigate the saga/payment step — the reaper is treating a symptom |
 | `inventory_oversell_blocked_total` spiking | genuine contention on a hot SKU, or a saga retry storm | expected under contention; confirm stock levels before assuming a bug |
 | Paid orders' stock returns to the pool | `commit_reservation` not called on payment success | fix the saga's confirm step — the reaper is doing its job |
-| A payment confirmed on an order whose holds were reaped (`checkout_paid_without_consume_total`) | the paid-without-consume window: payment resolved past the reservation TTL (ADR 0019) | expected-by-design handling, not a reaper fault: the saga refunded the charge and compensated the order . Only a paired `checkout_orphaned_paid_payments_total` means the refund was refused — then refund per §9 |
+| A payment confirmed on an order whose holds were reaped (`checkout_paid_without_consume_total`) | the paid-without-consume window: payment resolved past the reservation TTL | expected-by-design handling, not a reaper fault: the saga refunded the charge and compensated the order . Only a paired `checkout_orphaned_paid_payments_total` means the refund was refused — then refund per §9 |
 
 ```bash
 # Manual one-shot sweep (same image, service role)
@@ -372,19 +372,21 @@ When a charge lands on an order that is already dead — a cancel won the guarde
 or recovery poller) calls the payments service's refund leg, which refunds at the
 provider under the **charge's own idempotency key** (a retry cannot double-refund)
 and then applies the same guarded terminal transition as above, `succeeded →
-refunded`, with the `PaymentRefunded` outbox row written in that transaction. A
-refund the provider **refuses** (a definitive no) — or **raises** (retries
-exhausted → `DependencyUnavailableError`, open breaker → `CircuitOpenError`) —
-deliberately leaves the row `succeeded`: the charge landed and the money is
-still out, so falsifying the row would break the orphan query below and misstate
-the ledger. That failed refund is not silent — the discovering frame (the drive's
-orphan arm on a terminal order, or the poller's shortfall arm on a still-pending
-one) counts it (`checkout_orphaned_paid_payments_total`) and logs ERROR — and it
-is an exceptional provider failure rather than the routine race outcome. On the
-live drive the terminal-order arm contains the raise and answers "it will be
-reconciled"; the poller deliberately lets a raise roll the pass back instead, so
-the next pass retries it — a transient fault must not be counted as an orphan.
-The reconciler never refunds: it only scans still-`pending` charges.
+refunded`, with the `PaymentRefunded` outbox row written in that transaction. On
+a terminal order the drive journals the refund **intent** (`refund: requested` in
+the order's `saga_log`) *before* the provider call, so a refund that
+**raises** (retries exhausted → `DependencyUnavailableError`, open breaker →
+`CircuitOpenError`) is retried automatically: the saga recovery poller claims
+cancelled orders with an open `requested` marker and re-runs the idempotent
+refund until it lands (`refund: completed`) or the provider definitively refuses
+(`refund: refused`). A refund the provider **refuses** deliberately leaves the row
+`succeeded`: the charge landed and the money is still out, so falsifying the row
+would break the orphan query below and misstate the ledger. That refusal is not
+silent — the discovering frame (the drive's orphan arm, the poller's shortfall
+arm, or the poller's refund-retry claim) counts it
+(`checkout_orphaned_paid_payments_total`) and logs ERROR — and it is an
+exceptional provider answer rather than the routine race outcome. The reconciler
+never refunds: it only scans still-`pending` charges.
 
 | Symptom | Likely cause | Action |
 |---|---|---|
@@ -393,7 +395,8 @@ The reconciler never refunds: it only scans still-`pending` charges.
 | 404s from `/v1/payments/webhook` | gateway pointed at the wrong environment/realm | fix the gateway config — do not widen acceptance |
 | `PaymentFailed` with reason `abandoned_by_reconciler` | checkout died between row-create and gateway charge, or the provider lost it | find the order's checkout logs; the charge never landed gateway-side, so retrying checkout with a NEW idempotency key is safe |
 | Sudden `PaymentFailed` spike | upstream decline event or fail-token misconfiguration in tests | compare against gateway-side decline metrics before assuming a code fault |
-| `checkout_orphaned_paid_payments_total` incremented | the saga's automatic refund of a charge that landed on a dead order **failed or was refused** by the provider — money taken, order cancelled, and (on the drive's terminal-order arm) nothing retries the pair automatically (this reconciler only scans `pending` charges) | manual reconciliation required (below); the increments should be rare — treat any as a refund-provider incident, not routine race fallout |
+| `checkout_orphaned_paid_payments_total` incremented | the saga's automatic refund of a charge that landed on a dead order was **refused** by the provider (or raised before the refund intent could even be journaled) — money taken, order cancelled, and no automatic owner left | manual reconciliation required (below); the increments should be rare — treat any as a refund-provider incident, not routine race fallout |
+| Open `refund: requested` markers older than a day (query below) | the refund provider is down or rejecting every retry — the poller is still retrying, nothing is lost yet | fix the provider/breaker; the poller closes the markers on its own once refunds land. If the provider's answer is a permanent no, reconcile by hand and the next pass records `refused` |
 | `checkout_paid_without_consume_total` incremented | payment confirmed after the reaper released the order's holds (paid-without-consume) — the saga refunded that charge and compensated the order, so nothing is owed | usually nothing to do; if it comes with `checkout_orphaned_paid_payments_total`, the refund failed — refund by hand (below). The customer was never given the goods, so refund, never fulfil |
 
 ```bash
@@ -411,18 +414,30 @@ SELECT count(*) FROM payments.payments WHERE status = 'failed' AND failure_reaso
 -- Outcome split over time (a healthy ledger is mostly `succeeded`):
 SELECT status, count(*) FROM payments.payments GROUP BY status;
 -- THE orphaned-payment alert (checkout_orphaned_paid_payments_total > 0):
--- money taken, order cancelled, and the saga's automatic refund 
--- failed or was refused — reconcile by hand. Healthy = 0 rows. The same query
--- finds a paid-without-consume pair whose drive-arm refund raised or whose
--- poller-arm refund returned False
+-- money taken, order cancelled, and the saga's automatic refund
+-- was refused (or its intent could not be journaled) — reconcile by hand.
+-- Healthy = 0 rows. The same query finds a paid-without-consume pair whose
+-- refund was refused
 -- (checkout_paid_without_consume_total > 0): refund it, the stock was never
 -- delivered (the same statement with o.status = 'paid' is the oversell case).
+-- Rows whose refund is merely retrying (open `refund: requested` marker) appear
+-- here too while the poller works — check the marker query below before
+-- acting on a fresh pair.
 SELECT p.id, p.order_id, p.amount FROM payments.payments p
   JOIN orders.orders o ON o.id = p.order_id
   WHERE p.status = 'succeeded' AND o.status = 'cancelled';
 -- Refunded charges — the saga's automatic undo landing.
 -- Informational: a refunded payment needs no action and never leaves this set.
 SELECT count(*) FROM payments.payments WHERE status = 'refunded' AND updated_at >= now() - interval '1 day';
+-- Open refund intents the recovery poller is still retrying:
+-- cancelled orders whose `refund: requested` marker has no terminal marker yet.
+-- Healthy = 0 rows (or only very fresh ones); rows older than a day mean the
+-- refund provider is failing every retry — fix the provider, not the rows.
+SELECT o.id, s.created_at AS refund_requested_at FROM orders.orders o
+  JOIN orders.saga_log s ON s.order_id = o.id AND s.step = 'refund' AND s.status = 'requested'
+  WHERE o.status = 'cancelled'
+    AND NOT EXISTS (SELECT 1 FROM orders.saga_log t
+                    WHERE t.order_id = o.id AND t.step = 'refund' AND t.status IN ('completed', 'refused'));
 ```
 
 **Monitoring.** The reconciler exports its own counters via `WORKER_METRICS_PORT`

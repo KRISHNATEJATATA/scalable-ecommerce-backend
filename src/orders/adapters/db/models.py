@@ -3,7 +3,7 @@
 import uuid
 from decimal import Decimal
 
-from sqlalchemy import Enum, ForeignKey, Index, Integer, Numeric, String, UniqueConstraint
+from sqlalchemy import Enum, ForeignKey, Index, Integer, Numeric, String, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -91,7 +91,12 @@ class SagaLog(Base, TimestampMixin):
     ``compensated``, ``unknown`` (a charge timeout with no recorded outcome —
     left pending for the reconciler/recovery poller, never compensated), or
     ``refunded`` (the charge under this key had already been returned, so the
-    drive ended terminally instead of waiting for an outcome that cannot come). The
+    drive ended terminally instead of waiting for an outcome that cannot come).
+    The ``refund`` step carries the refund lifecycle on a terminal order:
+    ``requested`` (the durable intent, journaled *before* the provider call) →
+    ``completed`` (money confirmed back) or ``refused`` (the provider's
+    definitive no — terminal, human-owned). An open ``requested`` is the
+    recovery poller's refund-retry claim. The
     recovery poller claims stuck ``started`` rows (order still ``pending`` past
     the step timeout) with ``FOR UPDATE SKIP LOCKED`` — the row lock is the
     lease, so concurrent poller replicas split the batch instead of
@@ -104,6 +109,14 @@ class SagaLog(Base, TimestampMixin):
         # claim, cancel's in-flight guard, the batch's re-check): without this
         # each is a full scan of the log.
         Index("ix_saga_log_order_id", "order_id"),
+        # The refund-retry claim finds candidate orders from the open
+        # refund markers — a partial index keeps that lookup off the
+        # ever-growing full log (terminal markers never re-enter it).
+        Index(
+            "ix_saga_log_open_refund",
+            "created_at",
+            postgresql_where=text("step = 'refund' AND status = 'requested'"),
+        ),
         {"schema": SCHEMA},
     )
 

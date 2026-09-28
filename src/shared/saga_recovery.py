@@ -6,7 +6,11 @@ order itself would sit `pending` forever. This poller closes that window: every
 pass claims `pending` orders older than the saga step timeout (``FOR UPDATE
 SKIP LOCKED``, so N replicas split the batch) and settles each from its
 payment row — commit + mark paid when the charge succeeded, release + cancel
-otherwise. Still-`pending` payments are left for the payment reconciler.
+otherwise. Still-`pending` payments are left for the payment reconciler. The
+same pass also retries journaled refund intents on already-`cancelled` orders
+(a refund that raised on the drive leaves `refund: requested` in the journal
+, so a transient refund-provider outage never becomes manual
+reconciliation.
 
 Safe to run continuously (as in docker-compose, mirroring the reaper) or as a
 scheduled one-shot in prod (EventBridge → ECS task with ``--once``).
@@ -197,7 +201,7 @@ class SagaRecovery:
                 settled = await self.sweep_once()
             except Exception:  # boundary: one bad pass must not kill recovery
                 log.exception("saga recovery pass failed; retrying after interval")
-                settled = {"completed": 0, "compensated": 0, "deferred": 0}
+                settled = {"completed": 0, "compensated": 0, "deferred": 0, "refunded": 0, "refund_failed": 0}
             if sum(settled.values()) == 0:
                 if stop is None:
                     await asyncio.sleep(poll_interval)
@@ -219,7 +223,7 @@ async def run_recovery(
     if once:
         return await recovery.sweep_once()
     await recovery.run(settings.checkout_saga_recovery_poll_interval_seconds, stop=stop)
-    return {"completed": 0, "compensated": 0, "deferred": 0}
+    return {"completed": 0, "compensated": 0, "deferred": 0, "refunded": 0, "refund_failed": 0}
 
 
 def main() -> None:  # pragma: no cover - process entrypoint

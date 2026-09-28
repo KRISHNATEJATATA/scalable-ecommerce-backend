@@ -157,7 +157,7 @@ async def test_recovery_defers_when_a_client_retry_drives_in_the_claim_settle_ga
 
     outcome = await asyncio.wait_for(SagaRecovery(maker, real_valkey, settings).sweep_once(), _BATCH_TIMEOUT)
 
-    assert outcome == {"completed": 0, "compensated": 0, "deferred": 1}
+    assert outcome == {"completed": 0, "compensated": 0, "deferred": 1, "refunded": 0, "refund_failed": 0}
     async with maker() as check:
         status = (
             await check.execute(text("SELECT status FROM orders.orders WHERE id = :id"), {"id": order_id})
@@ -183,7 +183,7 @@ async def test_the_lease_touch_expires_and_a_later_pass_retries_a_deferred_order
 
     outcome = await asyncio.wait_for(SagaRecovery(maker, real_valkey, settings).sweep_once(), _BATCH_TIMEOUT)
 
-    assert outcome == {"completed": 0, "compensated": 0, "deferred": 1}
+    assert outcome == {"completed": 0, "compensated": 0, "deferred": 1, "refunded": 0, "refund_failed": 0}
     async with maker() as check:
         status = (
             await check.execute(text("SELECT status FROM orders.orders WHERE id = :id"), {"id": order_id})

@@ -38,28 +38,36 @@ incremented in the recovery-poller process — same pattern as
   here. A sustained rate means checkouts are failing mid-flight with real
   state to unwind.
 * ``checkout_recovery_total`` — the recovery poller's settlements per
-  ``outcome``: ``completed``, ``compensated``, ``deferred``. A sustained
-  ``compensated`` rate means checkouts are crashing mid-flight upstream; a
-  ``deferred`` rate means the payment reconciler owns those orders, not this
-  poller.
+  ``outcome``: ``completed``, ``compensated``, ``deferred``, plus the
+  refund-retry claim's ``refunded`` (a journaled refund intent the retry
+  closed — money back) and ``refund_failed`` (the retry met a definitive
+  refusal — terminal, counted as an orphan). A sustained ``compensated``
+  rate means checkouts are crashing mid-flight upstream; a ``deferred``
+  rate means the payment reconciler owns those orders (or the refund
+  provider is down and retries are backing up), not this poller.
 * ``checkout_orphaned_paid_payments_total`` — an orphaned paid payment the
   saga could **not** automatically refund: the charge succeeded but the order
   died (a concurrent cancel won the guarded flip, or the recovery poller
-  compensated a paid-without-consume shortfall) and the refund leg failed or
-  was refused. Successful refunds emit ``PaymentRefunded`` and are the
-  routine race resolution; any increment here means money is still taken on a
-  cancelled order and a human must reconcile it (the payment reconciler only
-  scans ``pending`` charges, so nothing else owns the pair). The log line and
-  the 409 the caller sees are transient, so this counter is the alertable
-  signal — the auto-refund makes increments rare instead of routine.
+  compensated a paid-without-consume shortfall) and the refund leg was
+  **refused** by the provider — or raised when not even the refund intent
+  could be journaled, leaving nothing to retry it. Successful refunds emit
+  ``PaymentRefunded`` and are the routine race resolution; a raised refund
+  with the intent journaled is retried by the recovery poller's refund claim
+  , never counted here. Any increment therefore means money is
+  still taken on a cancelled order with no automatic owner left, and a human
+  must reconcile it (the payment reconciler only scans ``pending`` charges).
+  The log line and the 409 the caller sees are transient, so this counter is
+  the alertable signal — increments are refund-provider incidents, not race
+  bookkeeping.
 * ``checkout_paid_without_consume_total`` — a succeeded payment whose order
   could not consume its full stock because the reservation reaper released the
   holds before the payment confirmed (the paid-without-consume window). The
   saga compensates the order instead of paying it — the stock was already back
   in the pool — and refunds the charge through the payments service's refund
   leg (the payment must not stand: the goods were never delivered). If the
-  automatic refund fails, the succeeded payment lands on the cancelled order
-  and the orphan counter above counts it; the RUNBOOK §9 query finds the pair.
+  automatic refund is refused, the succeeded payment lands on the cancelled
+  order and the orphan counter above counts it; the RUNBOOK §9 query finds
+  the pair.
 """
 
 from __future__ import annotations
@@ -80,14 +88,14 @@ checkout_compensation_total = Counter(
 
 checkout_recovery_total = Counter(
     "checkout_recovery_total",
-    "Recovery-poller settlements of crashed checkouts by outcome (completed, compensated, deferred).",
+    "Recovery-poller settlements by outcome (completed, compensated, deferred, refunded, refund_failed).",
     ["outcome"],
 )
 
 checkout_orphaned_paid_payments_total = Counter(
     "checkout_orphaned_paid_payments_total",
-    "Succeeded payments on a cancelled order that the automatic refund could not return "
-    "(refund failed or was refused) — manual reconciliation required.",
+    "Succeeded payments on a cancelled order whose automatic refund was refused (or lost its journaled "
+    "intent) — no automatic owner remains; manual reconciliation required.",
 )
 
 checkout_paid_without_consume_total = Counter(

@@ -490,7 +490,7 @@ async def test_bounded_sweep_resolves_fresh_rows_while_abandoning_stale_ones(ses
 
 
 # --- refunds (the saga's reverse leg) -------------------------------------------------
-# ADR 0021: a charge that lands on an already-dead order is reversed by the saga
+# A charge that lands on an already-dead order is reversed by the saga
 # (live drive or recovery poller) through ``PaymentsService.refund``: provider
 # refund first, then the guarded ``succeeded → refunded`` flip with the
 # ``PaymentRefunded`` outbox row in the same transaction.

@@ -226,6 +226,23 @@ async def _order_status(session, order_id: uuid.UUID) -> str:
     ).scalar_one()
 
 
+async def _payment_status(session, order_id: uuid.UUID) -> str:
+    return (
+        await session.execute(text("SELECT status FROM payments.payments WHERE order_id = :id"), {"id": order_id})
+    ).scalar_one()
+
+
+async def _refund_markers(session, order_id: uuid.UUID) -> list[str]:
+    """The order's journaled refund markers, oldest first."""
+    rows = (
+        await session.execute(
+            text("SELECT status FROM orders.saga_log WHERE order_id = :id AND step = 'refund' ORDER BY created_at"),
+            {"id": order_id},
+        )
+    ).all()
+    return [row.status for row in rows]
+
+
 async def _saga_steps(session, order_id: uuid.UUID) -> list[str]:
     rows = (
         await session.execute(
@@ -429,7 +446,7 @@ async def test_recovery_settlements_are_counted_with_their_compensation(session)
         cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50
     )
 
-    assert outcome == {"completed": 0, "compensated": 1, "deferred": 0}
+    assert outcome == {"completed": 0, "compensated": 1, "deferred": 0, "refunded": 0, "refund_failed": 0}
     assert _counter("checkout_recovery_total", outcome="compensated") == before + 1
     assert _counter("checkout_compensation_total", step="crashed") == comp_before + 1
 
@@ -1098,8 +1115,8 @@ async def test_cancel_racing_a_parked_payment_refunds_not_orphans(session, sessi
     its hold release runs while the provider holds the money. The charge then
     returns ``succeeded`` into a cancelled order: the drive cannot commit the
     released holds (shortfall) and cannot pay, and because the order is terminal
-    no poller will ever claim it — so the drive refunds the charge itself
-    (ADR 0021). The end state has no orphan pair and nothing for the poller."""
+    no poller will ever claim it — so the drive refunds the charge itself.
+    The end state has no orphan pair and nothing for the poller."""
     line = _line()
     await _seed(session, str(line.product_id), 5)
     basket = _Basket()
@@ -1205,7 +1222,407 @@ async def test_cancel_racing_a_parked_payment_refunds_not_orphans(session, sessi
     assert await _payments_outbox(session) == ["PaymentSucceeded", "PaymentRefunded"]
     assert await _saga(session, _Basket()).recover_stuck(
         cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50
-    ) == {"completed": 0, "compensated": 0, "deferred": 0}
+    ) == {"completed": 0, "compensated": 0, "deferred": 0, "refunded": 0, "refund_failed": 0}
+
+
+class _CancelWinsAfterCharge(OrdersRepository):
+    """A user-facing cancel wins the guarded flip between the saga's commit and
+    its ``mark_paid``; the saga's own ``pending → paid`` flip then loses
+    (``None``) — the terminal-order frame the refund arm runs in."""
+
+    async def transition_status(self, order_id, *, expect, to_status, outbox=None):
+        if to_status == OrderStatus.PAID:
+            # The canceller's flip landed first — perform it as
+            # OrdersService.cancel_order would, then lose our own.
+            await super().transition_status(order_id, expect=[OrderStatus.PENDING], to_status=OrderStatus.CANCELLED)
+            return None
+        return await super().transition_status(order_id, expect=expect, to_status=to_status, outbox=outbox)
+
+
+async def test_drive_refund_raise_journals_intent_and_the_poller_retries(session):
+    """The cancel wins after the charge landed **and** the provider
+    refund raises (retries exhausted / open breaker). The drive journals
+    ``refund: requested`` before the attempt, so the raise answers 409 "refund
+    in progress" — no orphan — and the recovery poller's refund claim retries
+    the pair to ``refunded``: a transient provider fault on a terminal order
+    never becomes manual reconciliation."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    inventory = InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)
+    payments = PaymentsService(PaymentsRepository(session), StubPaymentGateway(), webhook_secret="test-secret")
+
+    class _FlakyRefundCharges(OrderCharges):
+        """The first refund attempt raises (provider down); later ones run for real."""
+
+        def __init__(self, payments: PaymentsService) -> None:
+            super().__init__(payments)
+            self.refund_calls = 0
+
+        async def refund(self, *, idempotency_key: str, reason: str) -> bool:
+            self.refund_calls += 1
+            if self.refund_calls == 1:
+                raise RuntimeError("refund provider unavailable")
+            return await super().refund(idempotency_key=idempotency_key, reason=reason)
+
+    saga = CheckoutSaga(
+        _CancelWinsAfterCharge(session),
+        basket,
+        OrderStockHolds(inventory),
+        _FlakyRefundCharges(payments),
+        _Idempotency(),
+        prices=_BasketTruth(basket),
+        step_timeout_seconds=60,
+    )
+
+    orphan_before = _counter("checkout_orphaned_paid_payments_total")
+    try:
+        await saga.checkout(user_id=USER_A, idempotency_key="key-refund-retry", payment_token="tok_visa")
+    except OrderStateConflictError as exc:
+        assert "refund is in progress" in exc.detail
+    else:
+        raise AssertionError("expected OrderStateConflictError")
+
+    order_id = (await session.execute(text("SELECT id FROM orders.orders"))).scalar_one()
+    assert await _order_status(session, order_id) == "cancelled"
+    assert _counter("checkout_orphaned_paid_payments_total") == orphan_before  # a transient raise is not an orphan
+    assert await _refund_markers(session, order_id) == ["requested"]  # the durable intent the poller reconciles from
+    assert await _payment_status(session, order_id) == "succeeded"  # money still out — for now
+
+    await _backdate_pending(session, order_id)
+    outcome = await _saga(session, _Basket()).recover_stuck(
+        cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50
+    )
+
+    assert outcome == {"completed": 0, "compensated": 0, "deferred": 0, "refunded": 1, "refund_failed": 0}
+    assert await _payment_status(session, order_id) == "refunded"  # the retry returned the money
+    assert await _refund_markers(session, order_id) == ["requested", "completed"]
+    assert _counter("checkout_orphaned_paid_payments_total") == orphan_before  # closed automatically, never an orphan
+    assert await _payments_outbox(session) == ["PaymentSucceeded", "PaymentRefunded"]
+
+
+async def test_drive_refund_refusal_is_terminal_and_never_retried(session):
+    """The provider's definitive **no** stays human-owned: the drive journals
+    ``refund: refused`` (terminal), counts the orphan once, and the poller's
+    refund claim must not re-ask a provider that already refused — no retry,
+    no second orphan increment."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    inventory = InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)
+    payments = PaymentsService(PaymentsRepository(session), StubPaymentGateway(), webhook_secret="test-secret")
+
+    class _RefundRefusingCharges(OrderCharges):
+        def __init__(self, payments: PaymentsService) -> None:
+            super().__init__(payments)
+            self.refund_calls = 0
+
+        async def refund(self, *, idempotency_key: str, reason: str) -> bool:
+            self.refund_calls += 1
+            return False
+
+    charges = _RefundRefusingCharges(payments)
+    saga = CheckoutSaga(
+        _CancelWinsAfterCharge(session),
+        basket,
+        OrderStockHolds(inventory),
+        charges,
+        _Idempotency(),
+        prices=_BasketTruth(basket),
+        step_timeout_seconds=60,
+    )
+
+    orphan_before = _counter("checkout_orphaned_paid_payments_total")
+    try:
+        await saga.checkout(user_id=USER_A, idempotency_key="key-refund-refused", payment_token="tok_visa")
+    except OrderStateConflictError as exc:
+        assert "reconciled" in exc.detail
+    else:
+        raise AssertionError("expected OrderStateConflictError")
+
+    order_id = (await session.execute(text("SELECT id FROM orders.orders"))).scalar_one()
+    assert charges.refund_calls == 1
+    assert _counter("checkout_orphaned_paid_payments_total") == orphan_before + 1
+    assert await _refund_markers(session, order_id) == ["requested", "refused"]  # closed terminally
+    assert await _payment_status(session, order_id) == "succeeded"  # the orphan pair, for RUNBOOK §9
+
+    await _backdate_pending(session, order_id)
+    outcome = await _saga(session, _Basket()).recover_stuck(
+        cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50
+    )
+
+    # The terminal marker keeps the poller out: nothing claimed, nothing retried,
+    # nothing re-counted.
+    assert outcome == {"completed": 0, "compensated": 0, "deferred": 0, "refunded": 0, "refund_failed": 0}
+    assert charges.refund_calls == 1
+    assert _counter("checkout_orphaned_paid_payments_total") == orphan_before + 1
+
+
+async def test_drive_refund_raise_without_journaled_intent_counts_an_orphan(session):
+    """The degraded arm: the refund raises **and** even the intent marker cannot
+    be journaled (the DB refused the write) — nothing will retry the pair, so
+    the honest answer is the orphan count and the "reconciled" 409."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    inventory = InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)
+    payments = PaymentsService(PaymentsRepository(session), StubPaymentGateway(), webhook_secret="test-secret")
+
+    class _UnjournaledRefunds(_CancelWinsAfterCharge):
+        """Every refund journal write fails before touching the session."""
+
+        def __init__(self, session) -> None:
+            super().__init__(session)
+            self.refund_journal_attempts: list[str] = []
+
+        async def log_saga_step(self, order_id, step, status):
+            if step == "refund":
+                self.refund_journal_attempts.append(status)
+                raise RuntimeError("journal write failed")
+            return await super().log_saga_step(order_id, step, status)
+
+    class _RaisingRefundCharges(OrderCharges):
+        async def refund(self, *, idempotency_key: str, reason: str) -> bool:
+            raise RuntimeError("refund provider unavailable")
+
+    repo = _UnjournaledRefunds(session)
+    saga = CheckoutSaga(
+        repo,
+        basket,
+        OrderStockHolds(inventory),
+        _RaisingRefundCharges(payments),
+        _Idempotency(),
+        prices=_BasketTruth(basket),
+        step_timeout_seconds=60,
+    )
+
+    orphan_before = _counter("checkout_orphaned_paid_payments_total")
+    try:
+        await saga.checkout(user_id=USER_A, idempotency_key="key-refund-unjournaled", payment_token="tok_visa")
+    except OrderStateConflictError as exc:
+        assert "reconciled" in exc.detail
+    else:
+        raise AssertionError("expected OrderStateConflictError")
+
+    order_id = (await session.execute(text("SELECT id FROM orders.orders"))).scalar_one()
+    # The intent was *attempted* and lost —
+    # which is exactly why this arm must count the orphan: nothing retries it.
+    assert repo.refund_journal_attempts == ["requested"]
+    assert _counter("checkout_orphaned_paid_payments_total") == orphan_before + 1  # no marker → no retry → orphan
+    assert await _refund_markers(session, order_id) == []  # the intent never landed
+    assert await _payment_status(session, order_id) == "succeeded"
+
+
+async def test_drive_refusal_with_lost_terminal_marker_defers_the_count_to_the_poller(session):
+    """The count rides the terminal marker: the provider refuses,
+    the intent is journaled, but the ``refused`` marker write fails — the drive
+    must NOT count the orphan (the open ``requested`` keeps the pair
+    claimable), and the poller's retry refuses again, journals the marker, and
+    counts it — exactly once across both frames."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    inventory = InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)
+    payments = PaymentsService(PaymentsRepository(session), StubPaymentGateway(), webhook_secret="test-secret")
+
+    class _RefusedMarkerLost(_CancelWinsAfterCharge):
+        """Only the terminal ``refused`` marker write fails (the intent lands)."""
+
+        async def log_saga_step(self, order_id, step, status):
+            if step == "refund" and status == "refused":
+                raise RuntimeError("journal write failed")
+            return await super().log_saga_step(order_id, step, status)
+
+    class _RefundRefusingCharges(OrderCharges):
+        def __init__(self, payments: PaymentsService) -> None:
+            super().__init__(payments)
+            self.refund_calls = 0
+
+        async def refund(self, *, idempotency_key: str, reason: str) -> bool:
+            self.refund_calls += 1
+            return False
+
+    saga = CheckoutSaga(
+        _RefusedMarkerLost(session),
+        basket,
+        OrderStockHolds(inventory),
+        _RefundRefusingCharges(payments),
+        _Idempotency(),
+        prices=_BasketTruth(basket),
+        step_timeout_seconds=60,
+    )
+
+    orphan_before = _counter("checkout_orphaned_paid_payments_total")
+    try:
+        await saga.checkout(user_id=USER_A, idempotency_key="key-refund-count-rides-marker", payment_token="tok_visa")
+    except OrderStateConflictError as exc:
+        assert "reconciled" in exc.detail
+    else:
+        raise AssertionError("expected OrderStateConflictError")
+
+    order_id = (await session.execute(text("SELECT id FROM orders.orders"))).scalar_one()
+    # Not counted here: the terminal marker never landed, so counting would
+    # double with the poller's retry. The pair stays claimable instead.
+    assert _counter("checkout_orphaned_paid_payments_total") == orphan_before
+    assert await _refund_markers(session, order_id) == ["requested"]
+
+    # The poller's retry (healthy journal, still-refusing provider) refuses
+    # again, lands the terminal marker, and counts — once, total.
+    payments2 = PaymentsService(PaymentsRepository(session), StubPaymentGateway(), webhook_secret="test-secret")
+    recovery = CheckoutSaga(
+        OrdersRepository(session),
+        _Basket(),
+        OrderStockHolds(inventory),
+        _RefundRefusingCharges(payments2),
+        _Idempotency(),
+        prices=_BasketTruth(_Basket()),
+        step_timeout_seconds=60,
+    )
+    await _backdate_pending(session, order_id)
+    outcome = await recovery.recover_stuck(cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50)
+
+    assert outcome == {"completed": 0, "compensated": 0, "deferred": 0, "refunded": 0, "refund_failed": 1}
+    assert _counter("checkout_orphaned_paid_payments_total") == orphan_before + 1  # exactly once across both frames
+    assert await _refund_markers(session, order_id) == ["requested", "refused"]
+    assert await _payment_status(session, order_id) == "succeeded"  # the orphan pair, human-owned
+
+
+async def test_poller_retries_a_journaled_refund_to_completion(session):
+    """The refund-retry claim itself: a cancelled order whose drive journaled
+    ``refund: requested`` and then crashed before the provider answered is
+    claimed by the poller, refunded under the charge's own key, and closed
+    ``completed`` — with ``PaymentRefunded`` riding the outbox."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    repo = OrdersRepository(session)
+
+    order, _ = await repo.create_pending_order(
+        user_id=USER_A,
+        idempotency_key="key-refund-claim",
+        body_hash="hash",
+        total=Decimal("19.99"),
+        lines=[(line.product_id, line.name, line.unit_price, line.quantity)],
+    )
+    await repo.transition_status(order.id, expect=[OrderStatus.PENDING], to_status=OrderStatus.CANCELLED)
+    payments_repo = PaymentsRepository(session)
+    payment, _ = await payments_repo.create_pending(
+        order_id=order.id, idempotency_key=payment_key_for(USER_A, "key-refund-claim"), amount=Decimal("19.99")
+    )
+    await payments_repo.transition(payment.id, to_status="succeeded", gateway_ref="stub_charge_ref")
+    await repo.log_saga_step(order.id, "refund", "requested")  # the drive's durable intent, then the crash
+    await _backdate_pending(session, order.id)
+
+    outcome = await _saga(session, _Basket()).recover_stuck(
+        cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50
+    )
+
+    assert outcome == {"completed": 0, "compensated": 0, "deferred": 0, "refunded": 1, "refund_failed": 0}
+    assert await _payment_status(session, order.id) == "refunded"
+    assert await _refund_markers(session, order.id) == ["requested", "completed"]
+    assert await _payments_outbox(session) == ["PaymentRefunded"]
+
+
+async def test_poller_closes_the_marker_when_the_refund_already_landed(session):
+    """The crash window between the provider's yes and the `completed` marker:
+    the row is already ``refunded``, so the retry must not refund again — it
+    just closes the journal (the payments service short-circuits a
+    not-``succeeded`` row, and the stub would dedupe the key anyway)."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    repo = OrdersRepository(session)
+
+    order, _ = await repo.create_pending_order(
+        user_id=USER_A,
+        idempotency_key="key-refund-landed",
+        body_hash="hash",
+        total=Decimal("19.99"),
+        lines=[(line.product_id, line.name, line.unit_price, line.quantity)],
+    )
+    await repo.transition_status(order.id, expect=[OrderStatus.PENDING], to_status=OrderStatus.CANCELLED)
+    payments_repo = PaymentsRepository(session)
+    payment, _ = await payments_repo.create_pending(
+        order_id=order.id, idempotency_key=payment_key_for(USER_A, "key-refund-landed"), amount=Decimal("19.99")
+    )
+    await payments_repo.transition(payment.id, to_status="succeeded", gateway_ref="stub_charge_ref")
+    await payments_repo.transition(payment.id, to_status="refunded", gateway_ref="stub_charge_ref", expect="succeeded")
+    await repo.log_saga_step(order.id, "refund", "requested")  # still open: the `completed` write was lost
+    await _backdate_pending(session, order.id)
+
+    outcome = await _saga(session, _Basket()).recover_stuck(
+        cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50
+    )
+
+    assert outcome == {"completed": 0, "compensated": 0, "deferred": 0, "refunded": 1, "refund_failed": 0}
+    assert await _payment_status(session, order.id) == "refunded"  # unchanged — no second refund
+    assert await _refund_markers(session, order.id) == ["requested", "completed"]
+    assert await _payments_outbox(session) == []  # the refund leg did not re-run, so no duplicate event
+
+
+async def test_poller_refund_retry_refusal_is_counted_once_and_closed(session):
+    """The retry meeting a definitive refusal: the marker closes ``refused``,
+    the orphan counter increments exactly once, and the next pass finds a
+    terminal marker — no re-ask, no re-count."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    repo = OrdersRepository(session)
+
+    order, _ = await repo.create_pending_order(
+        user_id=USER_A,
+        idempotency_key="key-refund-refused-poll",
+        body_hash="hash",
+        total=Decimal("19.99"),
+        lines=[(line.product_id, line.name, line.unit_price, line.quantity)],
+    )
+    await repo.transition_status(order.id, expect=[OrderStatus.PENDING], to_status=OrderStatus.CANCELLED)
+    payments_repo = PaymentsRepository(session)
+    payment, _ = await payments_repo.create_pending(
+        order_id=order.id, idempotency_key=payment_key_for(USER_A, "key-refund-refused-poll"), amount=Decimal("19.99")
+    )
+    await payments_repo.transition(payment.id, to_status="succeeded", gateway_ref="stub_charge_ref")
+    await repo.log_saga_step(order.id, "refund", "requested")
+    await _backdate_pending(session, order.id)
+
+    class _RefusingCharges(OrderCharges):
+        def __init__(self, payments: PaymentsService) -> None:
+            super().__init__(payments)
+            self.refund_calls = 0
+
+        async def refund(self, *, idempotency_key: str, reason: str) -> bool:
+            self.refund_calls += 1
+            return False
+
+    payments = PaymentsService(PaymentsRepository(session), StubPaymentGateway(), webhook_secret="test-secret")
+    charges = _RefusingCharges(payments)
+    inventory = InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)
+    saga = CheckoutSaga(
+        OrdersRepository(session),
+        _Basket(),
+        OrderStockHolds(inventory),
+        charges,
+        _Idempotency(),
+        prices=_BasketTruth(_Basket()),
+        step_timeout_seconds=60,
+    )
+
+    orphan_before = _counter("checkout_orphaned_paid_payments_total")
+    failed_before = _counter("checkout_recovery_total", outcome="refund_failed")
+    outcome = await saga.recover_stuck(cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50)
+
+    assert outcome == {"completed": 0, "compensated": 0, "deferred": 0, "refunded": 0, "refund_failed": 1}
+    assert _counter("checkout_orphaned_paid_payments_total") == orphan_before + 1
+    assert _counter("checkout_recovery_total", outcome="refund_failed") == failed_before + 1
+    assert await _refund_markers(session, order.id) == ["requested", "refused"]
+    assert await _payment_status(session, order.id) == "succeeded"  # the orphan pair survives for RUNBOOK §9
+
+    # The terminal marker closes the claim: a second pass asks nothing.
+    outcome = await saga.recover_stuck(cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50)
+    assert outcome == {"completed": 0, "compensated": 0, "deferred": 0, "refunded": 0, "refund_failed": 0}
+    assert charges.refund_calls == 1
+    assert _counter("checkout_orphaned_paid_payments_total") == orphan_before + 1
 
 
 async def test_recovery_settles_a_refunded_payment_by_compensating(session):
@@ -1241,7 +1658,7 @@ async def test_recovery_settles_a_refunded_payment_by_compensating(session):
         cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50
     )
 
-    assert outcome == {"completed": 0, "compensated": 1, "deferred": 0}
+    assert outcome == {"completed": 0, "compensated": 1, "deferred": 0, "refunded": 0, "refund_failed": 0}
     assert await _order_status(session, order.id) == "cancelled"
     assert await _stock(session, str(line.product_id)) == (5, 0)  # hold released, not re-deducted
 
@@ -1316,7 +1733,7 @@ async def test_recovery_skips_an_order_with_fresh_journal_activity(session):
     outcome = await _saga(session, _Basket()).recover_stuck(
         cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50
     )
-    assert outcome == {"completed": 0, "compensated": 0, "deferred": 0}
+    assert outcome == {"completed": 0, "compensated": 0, "deferred": 0, "refunded": 0, "refund_failed": 0}
     assert await _order_status(session, live.id) == "pending"  # untouched
     assert await _stock(session, str(line.product_id)) == (5, 1)  # hold kept
 
@@ -1351,7 +1768,7 @@ async def test_recovery_skips_an_order_with_fresh_journal_activity(session):
         step_timeout_seconds=60,
     ).recover_stuck(cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50)
 
-    assert outcome == {"completed": 0, "compensated": 0, "deferred": 1}
+    assert outcome == {"completed": 0, "compensated": 0, "deferred": 1, "refunded": 0, "refund_failed": 0}
     assert await _order_status(session, racing.id) == "pending"  # untouched
     assert await _stock(session, str(line.product_id)) == (5, 2)  # both holds kept
 
@@ -1409,7 +1826,7 @@ async def test_recovery_rolls_back_a_poisoned_order_and_finishes_the_batch(sessi
         step_timeout_seconds=60,
     ).recover_stuck(cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50)
 
-    assert outcome == {"completed": 0, "compensated": 1, "deferred": 1}
+    assert outcome == {"completed": 0, "compensated": 1, "deferred": 1, "refunded": 0, "refund_failed": 0}
     assert await _order_status(session, healthy_id) == "cancelled"  # batch finished despite the poison
     assert await _order_status(session, poisoned_id) == "pending"  # deferred, retried next pass
 
@@ -1444,7 +1861,7 @@ async def test_recovery_completes_a_checkout_crashed_after_payment(session):
         cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50
     )
 
-    assert outcome == {"completed": 1, "compensated": 0, "deferred": 0}
+    assert outcome == {"completed": 1, "compensated": 0, "deferred": 0, "refunded": 0, "refund_failed": 0}
     assert await _order_status(session, order.id) == "paid"
     assert await _stock(session, str(line.product_id)) == (4, 0)
     assert await _orders_outbox(session) == ["OrderPlaced"]
@@ -1472,7 +1889,7 @@ async def test_recovery_compensates_a_checkout_crashed_before_payment(session):
         cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50
     )
 
-    assert outcome == {"completed": 0, "compensated": 1, "deferred": 0}
+    assert outcome == {"completed": 0, "compensated": 1, "deferred": 0, "refunded": 0, "refund_failed": 0}
     assert await _order_status(session, order.id) == "cancelled"
     assert await _stock(session, str(line.product_id)) == (5, 0)
 
@@ -1520,7 +1937,7 @@ async def test_recovery_compensates_a_paid_order_whose_holds_were_reaped(session
         cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50
     )
 
-    assert outcome == {"completed": 0, "compensated": 1, "deferred": 0}
+    assert outcome == {"completed": 0, "compensated": 1, "deferred": 0, "refunded": 0, "refund_failed": 0}
     assert _counter("checkout_paid_without_consume_total") == before + 1
     assert _counter("checkout_orphaned_paid_payments_total") == orphan_before  # refunded: not an orphan
     assert await _order_status(session, order.id) == "cancelled"  # never paid
@@ -1585,7 +2002,7 @@ async def test_recovery_compensates_when_only_some_holds_survive_until_confirm(s
         cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50
     )
 
-    assert outcome == {"completed": 0, "compensated": 1, "deferred": 0}
+    assert outcome == {"completed": 0, "compensated": 1, "deferred": 0, "refunded": 0, "refund_failed": 0}
     assert _counter("checkout_paid_without_consume_total") == before + 1
     assert await _order_status(session, order.id) == "cancelled"
     assert await _stock(session, str(line_a.product_id)) == (5, 0)  # was already in the pool
@@ -1658,7 +2075,7 @@ async def test_recovery_defers_while_payment_is_pending(session):
         cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50
     )
 
-    assert outcome == {"completed": 0, "compensated": 0, "deferred": 1}
+    assert outcome == {"completed": 0, "compensated": 0, "deferred": 1, "refunded": 0, "refund_failed": 0}
     assert await _order_status(session, order.id) == "pending"
 
 
@@ -1713,7 +2130,7 @@ async def test_bcr_002_deferred_charge_settles_to_paid_via_the_workers(session, 
     # crashed-after-payment checkout.
     await _backdate_pending(session, order_id)
     outcome = await saga.recover_stuck(cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50)
-    assert outcome == {"completed": 1, "compensated": 0, "deferred": 0}
+    assert outcome == {"completed": 1, "compensated": 0, "deferred": 0, "refunded": 0, "refund_failed": 0}
     assert await _order_status(session, order_id) == "paid"
     assert await _stock(session, str(line.product_id)) == (4, 0)
     assert await _orders_outbox(session) == ["OrderPlaced"]
