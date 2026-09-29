@@ -55,6 +55,24 @@ class Product(Base, TimestampMixin, SoftDeleteMixin, VersionIdMixin):
             "image_upload_expires_at",
             postgresql_where=text(f"image_status = '{ImageStatus.PENDING.value}'"),
         ),
+        # Mirrors of the f23ec291a89d migration: pg_trgm GIN indexes so the
+        # `%term%` ILIKE search (substring filter) is index-served
+        # instead of scanning the live table. Partial on the soft-delete filter,
+        # same as the keyset indexes.
+        Index(
+            "ix_products_name_trgm",
+            "name",
+            postgresql_using="gin",
+            postgresql_ops={"name": "gin_trgm_ops"},
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+        Index(
+            "ix_products_description_trgm",
+            "description",
+            postgresql_using="gin",
+            postgresql_ops={"description": "gin_trgm_ops"},
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
         {"schema": SCHEMA},
     )
 

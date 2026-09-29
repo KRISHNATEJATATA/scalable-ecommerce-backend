@@ -332,6 +332,29 @@ async def test_search_composes_with_filters_and_pagination(app_ctx, rsa_key):
     assert miss["items"] == [] and miss["next_cursor"] is None
 
 
+async def test_search_has_trigram_gin_indexes(engine):
+    """P2 audit guard: the ``%term%`` ILIKE search must have its trigram GIN
+    indexes. Asserts catalog metadata — pg_trgm installed plus a
+    ``gin_trgm_ops`` index on both ``name`` and ``description`` — rather than a
+    planner plan, which is statistics-dependent and only flips to the GIN bitmap
+    at scale (verified manually: chosen over the B-tree/seq alternatives once the
+    live set reaches tens of thousands of rows)."""
+    async with engine.connect() as conn:
+        ext = await conn.scalar(text("SELECT count(*) FROM pg_extension WHERE extname = 'pg_trgm'"))
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT indexdef FROM pg_indexes "
+                    "WHERE schemaname = 'catalog' AND tablename = 'products' AND indexdef LIKE '%gin_trgm_ops%'"
+                )
+            )
+        ).all()
+    defs = "\n".join(row[0] for row in rows)
+    assert ext == 1
+    assert "USING gin (name gin_trgm_ops)" in defs
+    assert "USING gin (description gin_trgm_ops)" in defs
+
+
 # --- update ---------------------------------------------------------------
 
 
