@@ -221,6 +221,18 @@ class OrderPlacedData(_Strict):
     user_id: uuid.UUID
     total: Decimal
     items: list[OrderPlacedLine]
+    # The buyer's checkout-time email, snapshotted on the order row (same
+    # doctrine as OrderItem's price/name) and carried here so a consumer never
+    # depends on cross-topic event ordering: the notification send path used to
+    # resolve the recipient ONLY from its UserCreated-materialized table, so an
+    # OrderPlaced delivered before that user's UserCreated redrove → DLQed a
+    # healthy order's confirmation. Optional, so events written before the field
+    # consumers fall back to the recipients table. IN-PLACE FIELD ADDITION:
+    # payloads are ``extra="forbid"``, so a pre-change consumer strictly rejects
+    # the new field — the consumer-first rollout order in docs/DEPLOYMENT.md
+    # applies exactly as for a schema_version bump (notifications worker before
+    # the API/poller producers).
+    user_email: str | None = None
 
 
 class OrderPlaced(DomainEvent):

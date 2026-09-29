@@ -43,8 +43,15 @@ class OrdersRepositoryPort(Protocol):
         body_hash: str,
         total: Decimal,
         lines: list[tuple[uuid.UUID, str, Decimal, int]],
+        user_email: str = "",
     ) -> tuple[Any, bool]:
-        """Insert the ``pending`` order + lines; a key replay returns ``(winner, False)``."""
+        """Insert the ``pending`` order + lines; a key replay returns ``(winner, False)``.
+
+        ``user_email`` is the buyer's checkout-time address, snapshotted onto
+        the row so ``OrderPlaced`` can carry it ("" = unknown — legacy/tests;
+        the event then omits it and consumers fall back to the recipients
+        table).
+        """
         ...
 
     async def transition_status(

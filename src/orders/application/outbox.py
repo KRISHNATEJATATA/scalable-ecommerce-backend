@@ -22,14 +22,24 @@ from src.shared.config.logging import current_trace_id
 from src.shared.db.outbox import OutboxMessage
 
 
-def order_placed_outbox(*, order_id: uuid.UUID, user_id: uuid.UUID, total: Decimal, items: list[Any]) -> OutboxMessage:
-    """Build the ``OrderPlaced`` message from the paid transition's row + lines."""
+def order_placed_outbox(
+    *, order_id: uuid.UUID, user_id: uuid.UUID, total: Decimal, items: list[Any], user_email: str = ""
+) -> OutboxMessage:
+    """Build the ``OrderPlaced`` message from the paid transition's row + lines.
+
+    ``user_email`` is the order row's checkout-time snapshot; "" (a pre-snapshot
+    row) is normalized to ``None`` so the consumer falls back to its recipients
+    table. (The wire carries ``"user_email": null`` in that case — the field is
+    always serialized, which is why the consumer-first rollout order in
+    ``docs/DEPLOYMENT.md`` applies to this addition.)
+    """
     event = OrderPlaced.new(
         trace_id=current_trace_id(),
         data=OrderPlacedData(
             order_id=order_id,
             user_id=user_id,
             total=total if isinstance(total, Decimal) else Decimal(str(total)),
+            user_email=user_email or None,
             items=[
                 OrderPlacedLine(
                     product_id=item.product_id,

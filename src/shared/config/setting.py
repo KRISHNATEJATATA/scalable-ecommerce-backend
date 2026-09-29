@@ -276,9 +276,11 @@ class AppSettings(BaseSettings):
 
     # --- Notifications (order-confirmation consumer) ---
     # The worker drains OrderPlaced (+ UserCreated) from its own queue and sends
-    # the order-confirmation email. The recipient is materialized bus-side from
-    # UserCreated events (which carry user_id + email) into the module's own
-    # notifications.recipients table — no cross-module identity read.
+    # the order-confirmation email. The recipient is the event's own
+    # checkout-time user_email when present (an order-row snapshot — no
+    # cross-topic ordering dependency); the module's notifications.recipients
+    # table (materialized bus-side from UserCreated events, which carry
+    # user_id + email) is the fallback — no cross-module identity read either way.
     notifications_queue_url: str | None = None
     # The sender transport: smtp (Mailpit locally) or ses (AWS SES in prod; the
     # ECS task role supplies credentials, no keys in code).

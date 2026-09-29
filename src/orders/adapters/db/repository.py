@@ -160,6 +160,7 @@ class OrdersRepository:
         body_hash: str,
         total: Decimal,
         lines: list[tuple[uuid.UUID, str, Decimal, int]],
+        user_email: str = "",
     ) -> tuple[Order, bool]:
         """Insert the ``pending`` order + snapshotted lines; a key replay returns the winner.
 
@@ -175,6 +176,7 @@ class OrdersRepository:
             idempotency_body_hash=body_hash,
             status=OrderStatus.PENDING,
             total=total,
+            user_email=user_email,
         )
         self._session.add(order)
         try:

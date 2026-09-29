@@ -138,7 +138,7 @@ class CheckoutSaga:
     # --- the checkout entry point -------------------------------------
 
     async def checkout(
-        self, *, user_id: uuid.UUID, idempotency_key: str, payment_token: str
+        self, *, user_id: uuid.UUID, idempotency_key: str, payment_token: str, user_email: str = ""
     ) -> tuple[OrderResponse, bool]:
         """Run the saga; returns ``(order, created)`` (``created=False`` = exact replay).
 
@@ -157,6 +157,10 @@ class CheckoutSaga:
         longer match the cart's snapshots (or a product is gone) — raised
         before any order row exists, so the same-key retry works — and
         ``InsufficientStockError`` (409) when the shelves refuse.
+        ``user_email`` is the buyer's checkout-time address (the route passes the
+        authenticated caller's), snapshotted onto the order row so ``OrderPlaced``
+        carries it — the notification send path then never depends on the
+        ``UserCreated`` event having landed first.
         Every failure path compensates before raising — no half-state escapes
         except through a process crash, which is the recovery poller's job.
         """
@@ -203,6 +207,7 @@ class CheckoutSaga:
                     body_hash=body_hash,
                     total=total,
                     lines=[(line.product_id, line.name, line.unit_price, line.quantity) for line in lines],
+                    user_email=user_email,
                 )
                 if not created:
                     # Lost the create race: the winner's row is the truth — replay or
@@ -460,7 +465,11 @@ class CheckoutSaga:
                 expect=[OrderStatus.PENDING],
                 to_status=OrderStatus.PAID,
                 outbox=order_placed_outbox(
-                    order_id=order.id, user_id=order.user_id, total=order.total, items=order.items
+                    order_id=order.id,
+                    user_id=order.user_id,
+                    total=order.total,
+                    items=order.items,
+                    user_email=order.user_email,
                 ),
             )
             if paid is None:
@@ -824,7 +833,11 @@ class CheckoutSaga:
                 expect=[OrderStatus.PENDING],
                 to_status=OrderStatus.PAID,
                 outbox=order_placed_outbox(
-                    order_id=order.id, user_id=order.user_id, total=order.total, items=order.items
+                    order_id=order.id,
+                    user_id=order.user_id,
+                    total=order.total,
+                    items=order.items,
+                    user_email=order.user_email,
                 ),
             )
             if paid is not None and paid.status == OrderStatus.PAID:

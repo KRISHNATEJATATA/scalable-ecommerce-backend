@@ -2,17 +2,19 @@
 
 ``NotificationService`` consumes the validated ``OrderPlaced`` / ``UserCreated``
 events the SqsConsumer hands it (contract-validated before the handler runs).
-The recipient email is resolved from THIS module's own ``recipients`` table —
-materialized from ``UserCreated`` events, which carry ``user_id`` + ``email`` —
-so the send path never reads identity/Keycloak directly (no cross-module
-import; the bus is the delivery mechanism).
+The recipient email is resolved WITHOUT any cross-module identity read and —
+since ``OrderPlaced`` carries the buyer's checkout-time ``user_email`` (an
+order-row snapshot) — without depending on cross-topic event ordering either:
+the event's own address wins, this module's ``recipients`` table (materialized
+from ``UserCreated``) is the fallback for events written before the field
+existed, and only an event with NEITHER is left for redrive → DLQ.
 
 ``OrderPlaced`` send path (explicitly AT-LEAST-ONCE, never
 described as duplicate-proof):
-1. resolve the recipient — unknown ⇒ raise (the message is left for SQS
-   redrive → DLQ after ``maxReceiveCount``: never silently dropped; once the
-   user's first authenticated request JITs them, ``UserCreated`` materializes
-   the recipient and the redelivery sends);
+1. resolve the recipient — the event's ``user_email`` first, else the
+   ``recipients`` table; an event carrying neither (a pre-snapshot event whose
+   user the consumer has never seen) ⇒ raise (the message is left for SQS
+   redrive → DLQ after ``maxReceiveCount``: never silently dropped);
 2. suppression list ⇒ never send (counted, ack);
 3. CLAIM the durable send state: insert the ``sent_emails`` row ``pending``
    (generating its uuid4 message identifier) and commit BEFORE any send — a
@@ -50,7 +52,8 @@ log = logging.getLogger(__name__)
 
 
 class UnknownRecipientError(RuntimeError):
-    """No email is known for an ``OrderPlaced``'s user — left for redrive → DLQ, never silent."""
+    """No email is known for an ``OrderPlaced``'s user — neither carried on the
+    event nor materialized in ``recipients``. Left for redrive → DLQ, never silent."""
 
 
 class NotificationService:
@@ -81,7 +84,11 @@ class NotificationService:
         """
         data = event["data"]
         order_id = uuid.UUID(str(data["order_id"]))
-        email = await self._repo.get_recipient_email(uuid.UUID(str(data["user_id"])))
+        # The event's own checkout-time address wins (it rides the same message,
+        # so no cross-topic ordering with UserCreated can strand the send); the
+        # recipients table is the fallback for events written before OrderPlaced
+        # carried it. Only NEITHER raises — redrive → DLQ, never silent.
+        email = data.get("user_email") or await self._repo.get_recipient_email(uuid.UUID(str(data["user_id"])))
         if email is None:
             raise UnknownRecipientError(f"no address known for order {order_id}'s user; leaving for redrive → DLQ")
         if await self._repo.is_suppressed(email):

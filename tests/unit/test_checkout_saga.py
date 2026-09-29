@@ -13,6 +13,7 @@ Uses the shared Testcontainers-Postgres fixtures from ``conftest.py``.
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 import sys
 import uuid
@@ -474,6 +475,39 @@ async def test_checkout_pays_the_order_and_consumes_stock(session):
     assert basket.consumed == [(USER_A, ((line.product_id, 1),))]  # purchased lines removed only on success
     steps = await _saga_steps(session, order.id)
     assert {"create", "reserve", "charge", "commit", "mark_paid"} <= set(steps)  # journal is complete
+
+
+async def test_order_placed_carries_the_checkout_time_user_email(session):
+    """The buyer's address rides the event (an order-row snapshot): the
+    notification send path never depends on the user's UserCreated landing
+    first. A checkout without one (legacy/tests) omits it — consumers fall
+    back to the recipients table."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+
+    await _saga(session, basket).checkout(
+        user_id=USER_A, idempotency_key="key-email", payment_token="tok_visa", user_email="buyer@example.com"
+    )
+    payload = json.loads(
+        (await session.execute(text("SELECT payload FROM orders.outbox WHERE event_type = 'OrderPlaced'"))).scalar_one()
+    )
+    assert payload["data"]["user_email"] == "buyer@example.com"
+
+    # No email threaded (the default) → the field is null on the wire.
+    basket.stock(USER_A, line)
+    await _saga(session, basket).checkout(user_id=USER_A, idempotency_key="key-no-email", payment_token="tok_visa")
+    payload = json.loads(
+        (
+            await session.execute(
+                text("SELECT payload FROM orders.outbox WHERE event_type = 'OrderPlaced' ORDER BY occurred_at DESC")
+            )
+        )
+        .first()
+        .payload
+    )
+    assert payload["data"]["user_email"] is None
 
 
 async def test_concurrent_add_survives_a_successful_checkout(session):

@@ -8,10 +8,15 @@ and hands each validated event to the application service:
 
 * ``UserCreated`` upserts the recipient (user_id → email) into this module's
   own ``recipients`` table — the bus-delivered materialization that keeps the
-  send path free of any cross-module identity read.
+  send path free of any cross-module identity read, and the FALLBACK address
+  source for ``OrderPlaced`` events written before the event carried one.
 * ``OrderPlaced`` renders + sends the confirmation via the sender port, with
   the suppression-list check and the durable ``sent_emails`` claim state (see
-  :class:`~src.notifications.application.service.NotificationService`).
+  :class:`~src.notifications.application.service.NotificationService`). The
+  recipient is the event's own checkout-time ``user_email`` when present —
+  the send no longer depends on the user's ``UserCreated`` having landed
+  first (cross-subscription ordering was never guaranteed; the miss used to
+  redrive → DLQ a healthy order's confirmation).
 
 Delivery is explicitly AT-LEAST-ONCE, never duplicate-proof:
 ``SqsConsumer`` dedupes on ``event_id`` **within this subscription**

@@ -50,6 +50,12 @@ class Order(Base, TimestampMixin):
     # "same key, different body → 409" even after the Valkey fast-path record
     # was evicted.
     idempotency_body_hash: Mapped[str] = mapped_column(String(64), nullable=False, server_default="")
+    # The buyer's email snapshotted at checkout (from the authenticated
+    # caller's token claim) — the address ``OrderPlaced`` carries so the
+    # notification send path is self-sufficient (no cross-topic ordering
+    # dependency on UserCreated). "" = pre-snapshot row; the outbox builder
+    # normalizes it to None and consumers fall back to the recipients table.
+    user_email: Mapped[str] = mapped_column(String(320), nullable=False, server_default="")
     status: Mapped[OrderStatus] = mapped_column(
         Enum(
             OrderStatus,

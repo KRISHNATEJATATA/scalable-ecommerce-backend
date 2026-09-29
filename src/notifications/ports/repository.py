@@ -32,7 +32,10 @@ class NotificationRepositoryPort(Protocol):
         ...
 
     async def get_recipient_email(self, user_id: uuid.UUID) -> str | None:
-        """The email known for ``user_id`` (``None`` = never seen — the caller raises for redrive)."""
+        """The email known for ``user_id`` — the FALLBACK address source for an
+        ``OrderPlaced`` that doesn't carry one (pre-snapshot events). ``None``
+        = never seen; the caller raises for redrive only when the event carried
+        no address either."""
         ...
 
     async def is_suppressed(self, email: str) -> bool:

@@ -25,7 +25,7 @@ from src.notifications.themes import EmailTheme
 _THEME = EmailTheme.from_settings("")
 
 
-def _order_placed_event(order_id: uuid.UUID, user_id: uuid.UUID) -> dict:
+def _order_placed_event(order_id: uuid.UUID, user_id: uuid.UUID, user_email: str | None = None) -> dict:
     """A validated, normalized OrderPlaced (the shape SqsConsumer hands the handler)."""
     return OrderPlaced.new(
         trace_id="",
@@ -38,6 +38,7 @@ def _order_placed_event(order_id: uuid.UUID, user_id: uuid.UUID) -> dict:
                     product_id=uuid.uuid4(), product_name="Leather Ankle Boots", quantity=2, unit_price=Decimal("12.50")
                 )
             ],
+            user_email=user_email,
         ),
     ).model_dump(mode="json")
 
@@ -183,14 +184,43 @@ async def test_suppressed_recipient_is_never_sent(session):
 
 
 async def test_unknown_recipient_raises_for_redrive(session):
-    """No recipient materialized (user predates the consumer) → the handler raises:
-    the message is left for SQS redrive → DLQ, never silently dropped."""
+    """No recipient materialized (user predates the consumer) AND no event-carried
+    address → the handler raises: the message is left for SQS redrive → DLQ,
+    never silently dropped."""
     repo = NotificationRepository(session)
     sender = _RecordingSender()
     service = NotificationService(repo, sender, _THEME)
     with pytest.raises(UnknownRecipientError):
         await service.handle_order_placed(_order_placed_event(uuid.uuid4(), uuid.uuid4()))
     assert sender.calls == []
+
+
+async def test_event_carried_email_sends_without_the_recipient_row(session):
+    """The ordering-independence fix: an OrderPlaced that carries the buyer's
+    checkout-time user_email sends even when this user's UserCreated has NOT
+    reached the consumer yet — cross-subscription ordering can no longer DLQ a
+    healthy order's confirmation."""
+    repo = NotificationRepository(session)
+    sender = _RecordingSender()
+    service = NotificationService(repo, sender, _THEME)
+    user_id, order_id = uuid.uuid4(), uuid.uuid4()
+    # No handle_user_created — the recipients table is empty for this user.
+    await service.handle_order_placed(_order_placed_event(order_id, user_id, user_email="buyer@example.com"))
+    assert len(sender.calls) == 1
+    assert sender.calls[0]["to"] == "buyer@example.com"
+    assert await repo.has_sent(order_id, "order_confirmation") is True
+
+
+async def test_event_carried_email_wins_over_the_materialized_recipient(session):
+    """The event's checkout-time address is authoritative: a stale recipients row
+    does not redirect the confirmation."""
+    repo = NotificationRepository(session)
+    sender = _RecordingSender()
+    service = NotificationService(repo, sender, _THEME)
+    user_id, order_id = uuid.uuid4(), uuid.uuid4()
+    await service.handle_user_created(_user_created_event(user_id, "old@example.com"))
+    await service.handle_order_placed(_order_placed_event(order_id, user_id, user_email="new@example.com"))
+    assert [c["to"] for c in sender.calls] == ["new@example.com"]
 
 
 async def test_send_failure_after_the_claim_retries_cleanly(session):

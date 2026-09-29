@@ -39,7 +39,7 @@ depth):
 | Image worker | `python -m src.catalog.adapters.image_worker` | `image-uploads` | sniff · re-encode · thumbnails → `image_status` |
 | Cache worker | `python -m src.catalog.adapters.cache_worker` | `catalog-cache` | invalidate Valkey read-cache on `ProductUpdated`/`ProductDeleted` |
 | Cart consumer | `python -m src.cart.adapters.cart_consumer` | `cart-events` | refresh/prune Valkey cart snapshots on `ProductUpdated`/`ProductDeleted` |
-| Notification consumer | `python -m src.notifications.adapters.notification_worker` | `notifications` | send the order-confirmation email on `OrderPlaced` (recipients materialized from `UserCreated`); SMTP locally, SES in prod |
+| Notification consumer | `python -m src.notifications.adapters.notification_worker` | `notifications` | send the order-confirmation email on `OrderPlaced` (recipient from the event's checkout-time `user_email`; the `UserCreated`-materialized recipients table is the fallback); SMTP locally, SES in prod |
 | Reservation reaper | `python -m src.inventory.adapters.reaper` | Postgres `reservations` | release holds past `expires_at` (SKIP LOCKED) so a stalled saga can't leak stock |
 | Payment reconciler | `python -m src.payments.adapters.reconciler` | Postgres `payments` | resolve charges still `pending` past their grace window by asking the gateway (missed-webhook backstop) |
 | Retention prune | `python -m scripts.retention_prune` | Postgres `outbox`×5 + `reservations` + `saga_log` | batched deletes of terminal history past its retention (published outbox rows, released/committed reservations, saga_log of terminal orders) — see RUNBOOK §14 |
@@ -85,12 +85,17 @@ pure Valkey (no Postgres): size it by memory, not connections.
 cart, which is acceptable here and never is for an order.
 
 The **notification consumer** drains the `notifications` queue (`OrderPlaced` +
-`UserCreated`) and sends the order-confirmation email. Recipients are
-materialized bus-side from `UserCreated` events into `notifications.recipients`
-(the event carries `user_id` + `email`), so it never reads identity/Keycloak —
-a user created before the consumer first ran has no recipient until their next
-JIT (first authenticated request); until then their first order's confirmation
-is left for redrive → DLQ rather than silently dropped. Delivery is explicitly
+`UserCreated`) and sends the order-confirmation email. The recipient is the
+`OrderPlaced` event's own checkout-time `user_email` (an order-row snapshot
+taken from the authenticated caller), so the send no longer depends on the
+user's `UserCreated` having landed first — cross-subscription event ordering is
+not guaranteed, and the miss used to redrive → DLQ a healthy order's
+confirmation. Recipients are also materialized bus-side from `UserCreated`
+events into `notifications.recipients` (the event carries `user_id` + `email`),
+the fallback for `OrderPlaced` events written before they carried the address —
+neither path reads identity/Keycloak. Only an event with NEITHER address source
+(e.g. a pre-snapshot event from a user the consumer has never seen) is left for
+redrive → DLQ rather than silently dropped. Delivery is explicitly
 **at-least-once** — never described as duplicate-proof: the Valkey
 dedupe (per-subscription, on `event_id`) suppresses plain redeliveries, and the
 consumer claims the `UNIQUE(order_id, email_type)` row in
@@ -168,7 +173,14 @@ routes it to the DLQ after `maxReceiveCount` (5) receives. Deploying producers
 first therefore **manufactures a DLQ backlog** out of perfectly valid traffic.
 
 Order for any `schema_version` bump (the live example is product events v1 → v2,
-which added `data.product_version`):
+which added `data.product_version`). **The same order applies to an in-place
+optional field addition** (the live example is `OrderPlaced.user_email`, which
+lets the notification consumer resolve the recipient from the event itself):
+payloads are `extra="forbid"`, so a consumer running pre-change code rejects the
+new field as `extra_forbidden` — same DLQ backlog, same remedy. Consumer-first
+there too: the **notification worker** (`notifications`) before the producers
+(the API service, whose checkout emits `OrderPlaced`, and the saga recovery
+poller that re-emits it for crashed checkouts).
 
 1. **Consumers first.** Update every service that *reads domain events off the bus*
    to the image that registers the new version, and wait for it to reach a steady

@@ -93,7 +93,10 @@ async def checkout(
     when the cart changes — the key pins the first request it was sent with.
     """
     order, created = await saga.checkout(
-        user_id=caller.id, idempotency_key=idempotency_key, payment_token=body.payment_token
+        user_id=caller.id,
+        idempotency_key=idempotency_key,
+        payment_token=body.payment_token,
+        user_email=caller.email,
     )
     if not created:
         # The saga's second return value used to be discarded here: the response
