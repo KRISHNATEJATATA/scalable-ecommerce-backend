@@ -30,12 +30,15 @@ class CartRepositoryPort(Protocol):
         quantity: int,
         max_items: int,
         max_per_line: int,
+        product_version: int | None = None,
     ) -> Cart:
         """Add the line or increment it, atomically.
 
         An increment past ``max_per_line`` clamps to the cap (never rejects a
         well-formed add); a *new* line past ``max_items`` raises
         :class:`InvalidCartOperationError` (→ 400). Returns the resulting cart.
+        ``product_version`` lets the adapter ignore projections older than the
+        catalog snapshot; ``None`` supports legacy unversioned callers.
         """
         ...
 
@@ -65,14 +68,14 @@ class CartRepositoryPort(Protocol):
         ...
 
     async def clear_cart(self, user_id: uuid.UUID) -> None:
-        """Empty the whole cart (drops the key and its product index entries)."""
+        """Empty the whole cart."""
         ...
 
     async def consume_lines(self, user_id: uuid.UUID, *, lines: list[tuple[uuid.UUID, int]]) -> None:
         """Subtract purchased ``(product_id, quantity)`` pairs, atomically.
 
         Checkout's success path: decrement each purchased line (a line that
-        reaches zero is dropped with its index entry; a cart left holding only
+        reaches zero is dropped; a cart left holding only
         meta is deleted) — but lines added or changed while the checkout ran
         survive untouched, and absent lines are a no-op.
         """
@@ -86,18 +89,16 @@ class CartRepositoryPort(Protocol):
         unit_price: str,
         product_version: int | None,
     ) -> int:
-        """Apply a ``ProductUpdated`` payload to every cart holding the product.
+        """Record the latest update for lazy reconciliation on cart read.
 
-        Only lines still present are refreshed (a stale update never resurrects
-        a deleted line) and only when
-        :func:`~src.cart.domain.cart.should_apply_update` passes — a stale or
-        duplicate delivery is a no-op. Returns how many carts were touched.
+        Older events and updates after a tombstone are no-ops. Returns 1 if
+        the product projection changed, otherwise 0.
         """
         ...
 
     async def prune_product(self, product_id: uuid.UUID) -> int:
-        """Apply a ``ProductDeleted`` tombstone: drop the line wherever present.
+        """Record a permanent tombstone; each cart prunes its line on read.
 
-        Always wins, regardless of versions. Returns how many carts were touched.
+        Always wins, regardless of versions. Returns 1 if newly recorded.
         """
         ...

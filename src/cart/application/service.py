@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from fastapi import HTTPException, status
 
 from src.cart.application.dto import CartItemResponse, CartResponse
-from src.cart.domain.cart import Cart
+from src.cart.domain.cart import Cart, ProductTombstonedError
 from src.cart.ports.products import CartProductPort
 from src.cart.ports.repository import CartRepositoryPort
 from src.shared.errors.exceptions import InvalidCartOperationError
@@ -81,16 +81,20 @@ class CartService:
         snapshot = await self._products.get_snapshot(product_id)
         if snapshot is None:
             raise _NOT_FOUND
-        cart = await self._repo.add_item(
-            user_id,
-            product_id=product_id,
-            name=snapshot.name,
-            unit_price=str(snapshot.unit_price),
-            image_url=snapshot.image_url,
-            quantity=quantity,
-            max_items=self._max_items,
-            max_per_line=self._max_qty_per_line,
-        )
+        try:
+            cart = await self._repo.add_item(
+                user_id,
+                product_id=product_id,
+                name=snapshot.name,
+                unit_price=str(snapshot.unit_price),
+                image_url=snapshot.image_url,
+                quantity=quantity,
+                max_items=self._max_items,
+                max_per_line=self._max_qty_per_line,
+                product_version=snapshot.version,
+            )
+        except ProductTombstonedError as exc:
+            raise _NOT_FOUND from exc
         return _to_response(cart)
 
     async def set_quantity(self, user_id: uuid.UUID, *, product_id: uuid.UUID, quantity: int) -> CartResponse:

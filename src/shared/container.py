@@ -367,6 +367,7 @@ class CatalogCartProducts(CartProductPort):
             name=product.name,
             unit_price=product.price,
             image_url=product.image_url,
+            version=product.version,
         )
 
 

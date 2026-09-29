@@ -33,7 +33,7 @@ from testcontainers.postgres import PostgresContainer
 from src.app import create_app
 from src.cart.adapters.cart_consumer import make_cart_handler
 from src.cart.application.service import CartService
-from src.cart.domain.cart import Cart, CartLine, should_apply_update
+from src.cart.domain.cart import Cart, CartLine, ProductTombstonedError, should_apply_update
 from src.cart.ports.products import ProductSnapshot
 from src.shared.config.setting import AppSettings, get_settings
 from src.shared.container import get_cart_service
@@ -143,6 +143,7 @@ class FakeRepo:
 
     def __init__(self) -> None:
         self.carts: dict[str, dict[str, dict]] = {}
+        self.projections: dict[str, dict] = {}
 
     def _cart(self, user_id: uuid.UUID) -> Cart | None:
         lines = self.carts.get(str(user_id), {})
@@ -167,10 +168,32 @@ class FakeRepo:
         return Cart(user_id=str(user_id), items=items, updated_at="2026-01-01T00:00:00+00:00")
 
     async def get_cart(self, user_id: uuid.UUID) -> Cart | None:
+        lines = self.carts.get(str(user_id), {})
+        for pid, line in list(lines.items()):
+            state = self.projections.get(pid)
+            if state is None:
+                continue
+            if state["deleted"]:
+                del lines[pid]
+            elif should_apply_update(line["product_version"], state["version"]):
+                line["name"] = state["name"]
+                line["unit_price"] = state["price"]
+                if state["version"] is not None:
+                    line["product_version"] = state["version"]
         return self._cart(user_id)
 
     async def add_item(
-        self, user_id, *, product_id, name, unit_price, image_url, quantity, max_items, max_per_line
+        self,
+        user_id,
+        *,
+        product_id,
+        name,
+        unit_price,
+        image_url,
+        quantity,
+        max_items,
+        max_per_line,
+        product_version=None,
     ) -> Cart:
         lines = self.carts.setdefault(str(user_id), {})
         pid = str(product_id)
@@ -179,12 +202,23 @@ class FakeRepo:
         else:
             if len(lines) >= max_items:
                 raise InvalidCartOperationError(f"cart holds the maximum of {max_items} lines")
+            projection = self.projections.get(pid)
+            if projection is not None and projection["deleted"]:
+                raise ProductTombstonedError
+            if (
+                projection is not None
+                and projection["version"] is not None
+                and (product_version is None or product_version < projection["version"])
+            ):
+                if product_version is not None:
+                    name, unit_price = projection["name"], projection["price"]
+                product_version = projection["version"]
             lines[pid] = {
                 "name": name,
                 "unit_price": unit_price,
                 "image_url": image_url,
                 "quantity": min(quantity, max_per_line),
-                "product_version": None,
+                "product_version": product_version if product_version is not None else (0 if projection else None),
             }
         result = self._cart(user_id)
         assert result is not None
@@ -212,26 +246,19 @@ class FakeRepo:
         self.carts.pop(str(user_id), None)
 
     async def refresh_product(self, product_id, *, name, unit_price, product_version) -> int:
-        touched = 0
-        for lines in self.carts.values():
-            line = lines.get(str(product_id))
-            if line is None:
-                continue
-            if not should_apply_update(line["product_version"], product_version):
-                continue
-            line["name"] = name
-            line["unit_price"] = unit_price
-            if product_version is not None:
-                line["product_version"] = product_version
-            touched += 1
-        return touched
+        pid = str(product_id)
+        old = self.projections.get(pid)
+        if old is not None and (old["deleted"] or not should_apply_update(old["version"], product_version)):
+            return 0
+        self.projections[pid] = {"deleted": False, "name": name, "price": unit_price, "version": product_version}
+        return 1
 
     async def prune_product(self, product_id) -> int:
-        touched = 0
-        for lines in self.carts.values():
-            if lines.pop(str(product_id), None) is not None:
-                touched += 1
-        return touched
+        pid = str(product_id)
+        if self.projections.get(pid, {}).get("deleted"):
+            return 0
+        self.projections[pid] = {"deleted": True}
+        return 1
 
 
 @pytest.fixture
@@ -288,6 +315,15 @@ async def test_add_unknown_product_is_404(app_ctx, rsa_key):
         resp = await client.post(
             "/v1/cart/items", headers=_auth(token), json={"product_id": str(uuid.uuid4()), "quantity": 1}
         )
+    assert resp.status_code == 404
+
+
+async def test_add_after_tombstone_is_404_even_if_catalog_cache_is_stale(app_ctx, rsa_key, fakes):
+    _, repo, pid = fakes
+    await repo.prune_product(pid)
+    token = _make_token(rsa_key, roles=["consumer"])
+    async with _client(app_ctx) as client:
+        resp = await client.post("/v1/cart/items", headers=_auth(token), json={"product_id": str(pid), "quantity": 1})
     assert resp.status_code == 404
 
 
@@ -425,6 +461,8 @@ async def test_consumer_refreshes_stale_guarded_and_prunes():
         max_per_line=10,
     )
     await handler(_event("ProductUpdated", pid, version=2))
+    assert repo.carts[str(user)][str(pid)]["unit_price"] == "9.99"  # lazy until read
+    await repo.get_cart(user)
     assert repo.carts[str(user)][str(pid)]["unit_price"] == "12.50"
     await handler(_event("ProductUpdated", pid, version=1))  # stale: dropped
     assert repo.carts[str(user)][str(pid)]["unit_price"] == "12.50"
@@ -433,6 +471,7 @@ async def test_consumer_refreshes_stale_guarded_and_prunes():
     await handler(_event("ProductUpdated", pid, version=2))  # duplicate: dropped
     assert repo.carts[str(user)][str(pid)]["unit_price"] == "12.50"
     await handler(_event("ProductDeleted", pid, version=2))  # tombstone always wins
+    await repo.get_cart(user)
     assert str(pid) not in repo.carts[str(user)]
     await handler(_event("ProductUpdated", pid, version=3))  # never resurrects
     assert str(pid) not in repo.carts.get(str(user), {})
@@ -454,4 +493,5 @@ async def test_consumer_v1_applies_to_versionless_line():
         max_per_line=10,
     )
     await handler(_event("ProductUpdated", pid, version=None))
+    await repo.get_cart(user)
     assert repo.carts[str(user)][str(pid)]["name"] == "widget-v2"

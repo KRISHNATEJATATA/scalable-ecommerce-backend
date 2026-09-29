@@ -449,20 +449,20 @@ keeps answering when the worker is dead).
 
 The `service`-role **cart consumer** (`python -m src.cart.adapters.cart_consumer`)
 drains the **`cart-events`** SQS queue subscribed to `ProductUpdated` +
-`ProductDeleted` and projects each event into every Valkey cart holding that
-product: `ProductUpdated` refreshes the line's `name`/`unit_price` snapshot (only
-lines still present, only strictly-newer `product_version` — unordered SNS delivery
-makes stale updates routine), while `ProductDeleted` is an ungated tombstone that
-always prunes. `image_url` is deliberately not refreshed (the event doesn't carry
-it); the snapshot re-aligns on the next add. The consumer is idempotent twice over
-(`event:{consumer}:{event_id}` dedupe plus naturally idempotent projections) —
-replay just rewrites the same snapshot or re-prunes an absent line.
+`ProductDeleted` and records one Valkey projection per product event, regardless
+of cart popularity. Reads reconcile at most `CART_MAX_ITEMS` lines per cart:
+`ProductUpdated` refreshes `name`/`unit_price` only when its `product_version`
+is newer (unordered SNS delivery can reorder updates); `ProductDeleted` is a
+permanent ungated tombstone and prunes a line at its next read. `image_url`
+is not in the event and re-aligns on the next add. The consumer is idempotent
+(`event:{consumer}:{event_id}` plus projection version/tombstone gates).
 
 **Staleness bound.** Projection is eventual: bounded by the outbox relay poll
 interval + queue latency. A cart read shortly after a product edit may serve the
-prior price until the event drains — accepted, and self-healing on the next event.
-There is no negative-cache equivalent here: a product with no carts to update is a
-no-op, never a tombstone.
+prior price until the event drains — accepted; its next read reconciles once
+the event is recorded. A deletion is retained even when no carts currently
+reference the product: the tombstone must outlive rolling cart TTLs. Legacy
+`cart:by-product:*` sets expire naturally and are no longer used or refreshed.
 
 | Symptom | Likely cause | Action |
 |---|---|---|

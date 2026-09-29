@@ -3,8 +3,8 @@ cart snapshots honest.
 
 Thin SQS transport shell over the generic idempotent :class:`SqsConsumer`: it
 drains the ``cart-events`` queue (subscribed to ``ProductUpdated`` and
-``ProductDeleted`` via SNS) and projects each event into every cart holding
-that product:
+``ProductDeleted`` via SNS) and records one product projection in Valkey.
+Each cart reconciles its own lines on read:
 
 * ``ProductDeleted`` (any schema version) prunes the line — a tombstone always
   wins, and a pruned line stays pruned.
@@ -26,9 +26,8 @@ DB before creating the order and refuses with 409 "Cart Changed" when they
 disagree.
 
 Idempotent twice over: ``SqsConsumer`` dedupes on ``event_id`` **within this
-subscription** (``event:cart-events:{event_id}``), and both projections are
-naturally idempotent (re-applying a refresh writes the same snapshot;
-re-pruning is a no-op). A handler that raises leaves the message for SQS
+subscription** (``event:cart-events:{event_id}``), and the version gate and
+permanent tombstone are idempotent. A handler that raises leaves the message for SQS
 redrive → DLQ (replay per ``docs/RUNBOOK.md``).
 
 The handler is pure Valkey (no Postgres): refresh needs nothing the event
@@ -52,23 +51,23 @@ log = logging.getLogger(__name__)
 
 
 def make_cart_handler(repo: CartRepositoryPort) -> Handler:
-    """Build the SqsConsumer handler projecting product events into carts."""
+    """Build the SqsConsumer handler recording product projections."""
 
     async def _handle(event: dict[str, Any]) -> None:
         event_type = event.get("type")
         data = event.get("data", {})
         product_id = uuid.UUID(str(data["product_id"]))
         if event_type == "ProductDeleted":
-            pruned = await repo.prune_product(product_id)
-            log.debug("pruned product %s from %d cart(s)", product_id, pruned)
+            recorded = await repo.prune_product(product_id)
+            log.debug("recorded product %s deletion: %d", product_id, recorded)
         elif event_type == "ProductUpdated":
-            refreshed = await repo.refresh_product(
+            recorded = await repo.refresh_product(
                 product_id,
                 name=str(data["name"]),
                 unit_price=str(data["price"]),
                 product_version=data.get("product_version"),
             )
-            log.debug("refreshed product %s in %d cart(s)", product_id, refreshed)
+            log.debug("recorded product %s update: %d", product_id, recorded)
         else:  # pragma: no cover - the subscription only carries product events
             log.warning("cart consumer ignoring unexpected event type %r", event_type)
 

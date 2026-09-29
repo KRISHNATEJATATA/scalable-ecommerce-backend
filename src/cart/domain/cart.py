@@ -11,14 +11,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+class ProductTombstonedError(Exception):
+    """A product was deleted between catalog lookup and cart insertion."""
+
+
 @dataclass(frozen=True, slots=True)
 class CartLine:
     """One product in a cart — a snapshot, not a reference.
 
     ``name``/``unit_price``/``image_url`` are copied from the catalog at add
-    time and refreshed by ``ProductUpdated``; ``product_version`` is the
+    time and reconciled on read; ``product_version`` is the
     catalog aggregate's ``version_id`` the snapshot was last aligned to
-    (``None`` for lines added before any versioned event was applied).
+    (``None`` for lines added before any event; ``0`` suppresses a v1 event
+    that predates an add).
     """
 
     product_id: str
@@ -41,7 +46,7 @@ class Cart:
 def should_apply_update(stored_version: int | None, incoming_version: int | None) -> bool:
     """Whether a ``ProductUpdated`` payload supersedes a cart line's snapshot.
 
-    The ordering gate both the consumer and the Valkey adapter enforce (the
+    The ordering gate the Valkey adapter enforces (the
     Lua mirrors this predicate — keep them in sync): a versioned event applies
     only when strictly newer than what the line already reflects, and a legacy
     version-less (v1) event applies only when the line carries no versioned

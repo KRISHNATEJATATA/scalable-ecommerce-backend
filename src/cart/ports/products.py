@@ -16,12 +16,17 @@ from typing import Protocol
 
 @dataclass(frozen=True, slots=True)
 class ProductSnapshot:
-    """The catalog facts a cart line snapshots at add time."""
+    """The catalog facts a cart line snapshots at add time.
+
+    The version distinguishes a fresh catalog read from an older product
+    projection when the catalog cache has not yet been invalidated.
+    """
 
     product_id: uuid.UUID
     name: str
     unit_price: Decimal
     image_url: str | None
+    version: int | None = None
 
 
 class CartProductPort(Protocol):

@@ -2,10 +2,9 @@
 
 The route/consumer suite (``test_cart.py``) runs against an in-memory fake;
 these tests pin the real atomic semantics the fake mirrors: clamp-on-increment
-*with version carryover*, cart-full, line-absent, the consumer version gates
-(including the ``cjson.null`` comparison), tombstone prune + no-resurrect,
-index self-healing, and index-TTL refresh on read. Requires Docker (like the
-Postgres suites); no environment-dependent skip.
+*with version carryover*, cart-full, line-absent, projection version gates,
+tombstone prune + no-resurrect, and bounded lazy reconciliation. Requires
+Docker (like the Postgres suites); no environment-dependent skip.
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ import pytest
 from testcontainers.core.container import DockerContainer
 from valkey.asyncio import Valkey
 
-from src.cart.adapters.valkey.repository import ValkeyCartRepository, _cart_key, _index_key
+from src.cart.adapters.valkey.repository import ValkeyCartRepository, _cart_key, _product_key
 from src.shared.errors.exceptions import InvalidCartOperationError
 
 TTL = 100
@@ -80,6 +79,7 @@ async def test_increment_preserves_version_and_clamps(repo):
     user, pid = uuid.uuid4(), uuid.uuid4()
     await _add(repo, user, pid)
     assert await repo.refresh_product(pid, name="w2", unit_price="12.50", product_version=2) == 1
+    await repo.get_cart(user)
     cart = await _add(repo, user, pid, qty=2)
     (line,) = cart.items
     assert line.quantity == 3  # clamped to the cap
@@ -107,24 +107,19 @@ async def test_set_remove_clear(repo, client):
     await _add(repo, user, pid)
     await repo.clear_cart(user)
     assert await repo.get_cart(user) is None
-    assert await client.smembers(_index_key(pid)) == []
 
 
 async def test_consume_subtracts_purchases_and_leaves_other_lines_alone(repo, client):
-    """Checkout's consume: the purchased line goes (with its index entry),
+    """Checkout's consume: the purchased line goes,
     lines added after checkout's snapshot survive — deleting the hash instead
-    would be the data-loss bug. Survivors' index TTLs refresh too."""
+    would be the data-loss bug."""
     user, a, b = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     await _add(repo, user, a)
     await _add(repo, user, b, qty=2)
-    await client.expire(_index_key(b), 5)  # simulate an index near expiry
     await repo.consume_lines(user, lines=[(a, 1)])
     cart = await repo.get_cart(user)
     assert cart is not None
     assert [(line.product_id, line.quantity) for line in cart.items] == [(str(b), 2)]
-    assert await client.smembers(_index_key(a)) == []
-    assert [m.decode() if isinstance(m, bytes) else m for m in await client.smembers(_index_key(b))] == [str(user)]
-    assert await client.ttl(_index_key(b)) > 5  # the survivor keeps receiving events
 
 
 async def test_consume_partial_quantity_keeps_the_line(repo):
@@ -135,13 +130,12 @@ async def test_consume_partial_quantity_keeps_the_line(repo):
     assert cart is not None and cart.items[0].quantity == 1
 
 
-async def test_consume_emptied_cart_drops_key_and_index(repo, client):
+async def test_consume_emptied_cart_drops_key(repo, client):
     user, pid = uuid.uuid4(), uuid.uuid4()
     await _add(repo, user, pid)
     await repo.consume_lines(user, lines=[(pid, 1)])
     assert await repo.get_cart(user) is None
     assert not await client.exists(_cart_key(user))  # emptied by consume, like set-to-zero
-    assert await client.smembers(_index_key(pid)) == []
 
 
 async def test_consume_absent_lines_are_a_noop(repo):
@@ -159,7 +153,6 @@ async def test_consume_duplicate_pairs_are_additive(repo, client):
     await repo.consume_lines(user, lines=[(pid, 1), (pid, 1)])
     assert await repo.get_cart(user) is None
     assert not await client.exists(_cart_key(user))
-    assert await client.smembers(_index_key(pid)) == []
 
 
 async def test_consume_skips_non_positive_quantities(repo):
@@ -181,17 +174,86 @@ async def test_consumer_gates_tombstone_and_self_heal(repo, client):
     assert await repo.refresh_product(pid, name="legacy", unit_price="0.02", product_version=None) == 0
     assert await repo.prune_product(pid) == 1
     assert await repo.refresh_product(pid, name="ghost", unit_price="99.00", product_version=9) == 0
+    assert await repo.get_cart(user) is None
     assert await repo.prune_product(pid) == 0
-    assert await client.smembers(_index_key(pid)) == []
-    # A stale index member (cart expired away) self-heals on the next event.
     assert await repo.refresh_product(pid, name="ghost", unit_price="99.00", product_version=9) == 0
-    assert await client.smembers(_index_key(pid)) == []
+    assert await client.exists(_product_key(pid))
 
 
-async def test_get_refreshes_index_ttl(repo, client):
+async def test_projection_work_is_constant_per_event_and_lazy_per_cart(repo, client):
+    pid = uuid.uuid4()
+    users = [uuid.uuid4() for _ in range(120)]
+    for user in users:
+        await _add(repo, user, pid)
+    assert await repo.refresh_product(pid, name="new", unit_price="12.50", product_version=4) == 1
+    assert await client.get(_product_key(pid))
+    assert await client.hget(_cart_key(users[-1]), str(pid)) is not None  # not visited by the event
+    first = await repo.get_cart(users[0])
+    assert first is not None and first.items[0].unit_price == "12.50"
+    assert b'"unit_price":"9.99"' in await client.hget(_cart_key(users[-1]), str(pid))
+    assert await repo.prune_product(pid) == 1
+    assert await repo.get_cart(users[0]) is None
+    assert await repo.get_cart(users[-1]) is None
+    assert await client.ttl(_product_key(pid)) == -1  # tombstone outlives cart TTL
+
+
+async def test_add_after_update_does_not_reapply_old_projection(repo):
+    user, pid = uuid.uuid4(), uuid.uuid4()
+    await repo.refresh_product(pid, name="old", unit_price="2.00", product_version=3)
+    cart = await _add(repo, user, pid, name="current", unit_price="4.00", product_version=4)
+    assert cart.items[0].product_version == 4
+    cart = await repo.get_cart(user)
+    assert cart is not None and cart.items[0].unit_price == "4.00"
+
+
+async def test_add_from_stale_catalog_cache_uses_newer_projection(repo):
+    user, pid = uuid.uuid4(), uuid.uuid4()
+    await repo.refresh_product(pid, name="latest", unit_price="4.00", product_version=4)
+    cart = await _add(repo, user, pid, name="old", unit_price="2.00", product_version=3)
+    assert cart.items[0].product_version == 4
+    assert cart.items[0].name == "latest" and cart.items[0].unit_price == "4.00"
+    cart = await _add(repo, user, pid, name="old", unit_price="2.00", product_version=3)
+    assert cart.items[0].name == "latest" and cart.items[0].unit_price == "4.00"
+
+
+async def test_add_after_legacy_update_does_not_reapply_old_projection(repo):
+    user, pid = uuid.uuid4(), uuid.uuid4()
+    await repo.refresh_product(pid, name="old", unit_price="2.00", product_version=None)
+    await _add(repo, user, pid, name="current", unit_price="4.00")
+    cart = await repo.get_cart(user)
+    assert cart is not None and cart.items[0].unit_price == "4.00"
+    assert cart.items[0].product_version == 0
+    await repo.refresh_product(pid, name="new", unit_price="5.00", product_version=1)
+    cart = await repo.get_cart(user)
+    assert cart is not None and cart.items[0].unit_price == "5.00"
+
+
+async def test_tombstone_rejects_add_and_outlives_cart_ttl(repo, client):
+    from src.cart.domain.cart import ProductTombstonedError
+
+    user, pid = uuid.uuid4(), uuid.uuid4()
+    await repo.prune_product(pid)
+    with pytest.raises(ProductTombstonedError):
+        await _add(repo, user, pid)
+    assert await client.ttl(_product_key(pid)) == -1
+
+
+async def test_tombstone_prunes_one_line_without_losing_survivor(repo, client):
+    user, deleted, survivor = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _add(repo, user, deleted)
+    await _add(repo, user, survivor)
+    await repo.prune_product(deleted)
+    cart = await repo.get_cart(user)
+    assert cart is not None and [line.product_id for line in cart.items] == [str(survivor)]
+    assert await client.ttl(_cart_key(user)) > 0
+
+
+async def test_tombstone_rejects_increment_before_next_read(repo):
+    from src.cart.domain.cart import ProductTombstonedError
+
     user, pid = uuid.uuid4(), uuid.uuid4()
     await _add(repo, user, pid)
-    await client.expire(_index_key(pid), 5)  # simulate a read-heavy cart near index expiry
-    assert await client.ttl(_index_key(pid)) <= 5
-    assert await repo.get_cart(user) is not None
-    assert await client.ttl(_index_key(pid)) > 5  # read refreshed it back to ~TTL
+    await repo.prune_product(pid)
+    with pytest.raises(ProductTombstonedError):
+        await _add(repo, user, pid)
+    assert await repo.get_cart(user) is None

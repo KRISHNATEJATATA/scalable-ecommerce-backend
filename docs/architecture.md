@@ -58,7 +58,7 @@ flowchart TD
   Relay["Relay (service role)<br/>outbox → SNS · SKIP LOCKED"]
   IMG["Image worker (service role)<br/>S3 event → sniff · re-encode · thumbnails"]
   CW["Cache worker (service role)<br/>ProductUpdated/Deleted → invalidate Valkey"]
-  CART["Cart consumer (service role)<br/>ProductUpdated/Deleted → refresh/prune carts"]
+  CART["Cart consumer (service role)<br/>ProductUpdated/Deleted → product projection"]
   REAPER["Reservation reaper (service role)<br/>expired holds → release"]
   RECON["Payment reconciler (service role)<br/>pending charges → ask gateway"]
   SREC["Saga recovery poller (service role)<br/>crashed checkouts → settle"]
@@ -82,7 +82,7 @@ flowchart TD
   SQS -.->|ProductUpdated/Deleted| CW
   CW -->|invalidate product cache key| VK
   SQS -.->|ProductUpdated/Deleted| CART
-  CART -->|refresh/prune cart snapshot| VK
+  CART -->|write one product projection| VK
   REAPER -->|release expired holds| PG
   RECON -->|settle pending charges| PG
   SREC -->|settle crashed sagas| PG
@@ -246,8 +246,8 @@ payment row `succeeded` and is counted
 the exceptional path, not the routine race outcome.
 
 - **Prices are revalidated against the catalog DB before the order exists**
-  . Cart lines carry *snapshot* prices refreshed asynchronously by
-  the cart consumer, so a merchant edit can be committed while its
+  . Cart lines carry *snapshot* prices reconciled from product events
+  on cart read, so a merchant edit can be committed while its
   `ProductUpdated` event is still in flight. Before creating the `pending`
   order the saga re-reads the catalog's authoritative (uncached) prices via
   its `PriceTruthPort`; a changed price or a gone product is a **409
@@ -361,7 +361,9 @@ prod, compose services locally — never `BackgroundTasks`:
 - **Catalog cache worker** (`src.catalog.adapters.cache_worker`): drains
   `ProductUpdated`/`ProductDeleted` → evicts the product read-cache key.
 - **Cart consumer** (`src.cart.adapters.cart_consumer`): drains the same
-  product events → refreshes/prunes Valkey cart snapshots (pure Valkey, no DB).
+  product events → records one versioned product projection or permanent
+  tombstone in Valkey per event. Cart reads reconcile only their own capped
+  lines; the checkout saga still validates price and liveness against the DB.
 - **Reservation reaper** (`src.inventory.adapters.reaper`): releases stock
   holds past `expires_at`. Cron-style loop locally; EventBridge-scheduled
   `--once` ECS task in prod.
