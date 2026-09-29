@@ -26,7 +26,7 @@ from src.shared.auth.jwks import resolve_signing_key
 from src.shared.bus.polling import poll_forever
 from src.shared.config.setting import AppSettings
 from src.shared.errors.exceptions import DependencyUnavailableError, KeycloakConflictError, KeycloakEntityNotFoundError
-from src.shared.resilience import CircuitBreaker, CircuitOpenError, retry_transient
+from src.shared.resilience import CircuitBreaker, CircuitOpenError, ValkeyConcurrencyBudget, retry_transient
 
 log = logging.getLogger(__name__)
 
@@ -362,6 +362,243 @@ def test_breaker_success_resets_the_failure_streak():
 def test_circuit_open_error_is_a_dependency_unavailable_error():
     # The fail-fast error must ride the existing 503 Problem handler.
     assert issubclass(CircuitOpenError, DependencyUnavailableError)
+
+
+# --- ValkeyConcurrencyBudget (fleet-wide semaphore) ------------------
+
+# A fixed base timestamp (ms epoch) so permit expiry is deterministic — the
+# budget only ever sees the ``now_ms`` we pass, never the wall clock.
+_T0_MS = 1_700_000_000_000
+
+
+async def test_budget_admits_up_to_the_fleet_limit_then_sheds(real_valkey):
+    budget = ValkeyConcurrencyBudget(real_valkey, max_concurrent=2, permit_ttl_seconds=60)
+    first = await budget.acquire("dep", now_ms=_T0_MS)
+    second = await budget.acquire("dep", now_ms=_T0_MS)
+    assert first and second  # two distinct permits
+    assert first != second
+    assert await budget.acquire("dep", now_ms=_T0_MS) is None  # the third call sheds
+
+
+async def test_budget_is_shared_across_instances(real_valkey):
+    """Two budget objects (two 'replicas') share one Valkey key — the whole point."""
+    replica_a = ValkeyConcurrencyBudget(real_valkey, max_concurrent=1, permit_ttl_seconds=60)
+    replica_b = ValkeyConcurrencyBudget(real_valkey, max_concurrent=1, permit_ttl_seconds=60)
+    assert await replica_a.acquire("dep", now_ms=_T0_MS) is not None
+    assert await replica_b.acquire("dep", now_ms=_T0_MS) is None  # replica B sees A's permit
+
+
+async def test_budget_release_frees_the_slot(real_valkey):
+    budget = ValkeyConcurrencyBudget(real_valkey, max_concurrent=1, permit_ttl_seconds=60)
+    permit = await budget.acquire("dep", now_ms=_T0_MS)
+    assert await budget.acquire("dep", now_ms=_T0_MS) is None
+    await budget.release("dep", permit)
+    assert await budget.acquire("dep", now_ms=_T0_MS) is not None
+
+
+async def test_budget_reaps_a_crashed_replicas_permits(real_valkey):
+    """A crashed holder never releases; its permit must self-heal via the TTL."""
+    budget = ValkeyConcurrencyBudget(real_valkey, max_concurrent=1, permit_ttl_seconds=30)
+    assert await budget.acquire("dep", now_ms=_T0_MS) is not None  # holder "crashes": never released
+    assert await budget.acquire("dep", now_ms=_T0_MS + 1_000) is None  # still held inside the TTL
+    assert await budget.acquire("dep", now_ms=_T0_MS + 31_000) is not None  # TTL elapsed → reaped
+
+
+async def test_budget_fails_open_on_valkey_fault():
+    """A Valkey outage must not take the dependency down with it: fail open."""
+
+    class _BoomValkey:
+        async def eval(self, *_args, **_kwargs):
+            raise OSError("valkey is down")
+
+        async def zrem(self, *_args, **_kwargs):
+            raise OSError("valkey is down")
+
+    budget = ValkeyConcurrencyBudget(_BoomValkey(), max_concurrent=1, permit_ttl_seconds=60)  # type: ignore[arg-type]
+    permit = await budget.acquire("dep")  # fault → synthetic permit, the call proceeds
+    assert permit is not None
+    await budget.release("dep", permit)  # best-effort, must not raise
+
+
+async def test_gateway_sheds_when_the_fleet_budget_is_spent(real_valkey):
+    """With every in-flight slot held (by 'other replicas'), a call fails fast 503
+    *without* touching the gateway — and records no breaker outcome (a shed is a
+    load signal, not a health signal)."""
+    budget = ValkeyConcurrencyBudget(real_valkey, max_concurrent=1, permit_ttl_seconds=60)
+    down = _DownGateway()
+    gateway = ResilientPaymentGateway(down, budget=budget, max_attempts=1, failure_threshold=2)
+
+    held = await budget.acquire("payment_gateway")  # another replica's in-flight call holds the one slot
+    with pytest.raises(DependencyUnavailableError, match="saturated"):
+        await gateway.charge(amount=10, idempotency_key="k1", payment_method_token="tok")
+    assert down.calls == 0  # the gateway was never contacted
+    assert gateway._breaker.state == "closed"  # shed recorded no failure
+
+    await budget.release("payment_gateway", held)  # the slot frees...
+    await budget.release("payment_gateway", await budget.acquire("payment_gateway"))  # ...and is reusable
+
+
+async def test_gateway_releases_its_permit_after_the_call(real_valkey):
+    """A completed call returns its permit: with limit 1, a sequential second call
+    must still be admitted."""
+    budget = ValkeyConcurrencyBudget(real_valkey, max_concurrent=1, permit_ttl_seconds=60)
+    stub = StubPaymentGateway()
+    gateway = ResilientPaymentGateway(stub, budget=budget, max_attempts=1)
+    for i in range(2):
+        result = await gateway.charge(amount=10, idempotency_key=f"k{i}", payment_method_token="tok")
+        assert result.outcome == GatewayOutcome.SUCCEEDED
+
+
+async def test_gateway_fails_open_when_budget_valkey_is_down():
+    """Budget Valkey fault → the call proceeds on the per-process breaker alone."""
+
+    class _BoomValkey:
+        async def eval(self, *_args, **_kwargs):
+            raise OSError("valkey is down")
+
+        async def zrem(self, *_args, **_kwargs):
+            raise OSError("valkey is down")
+
+    budget = ValkeyConcurrencyBudget(_BoomValkey(), max_concurrent=1, permit_ttl_seconds=60)  # type: ignore[arg-type]
+    gateway = ResilientPaymentGateway(StubPaymentGateway(), budget=budget, max_attempts=1)
+    result = await gateway.charge(amount=10, idempotency_key="k", payment_method_token="tok")
+    assert result.outcome == GatewayOutcome.SUCCEEDED
+
+
+async def test_keycloak_sheds_when_the_fleet_budget_is_spent(monkeypatch, real_valkey):
+    settings = AppSettings(**{**_SETTINGS, "resilience_dependency_max_concurrent": 1})
+    admin = KeycloakIdentityAdmin(settings, valkey=real_valkey)
+    kc = _FlakyKeycloak(KeycloakConnectionError("refused"))
+
+    async def fake_client():
+        return kc
+
+    monkeypatch.setattr(admin, "_client", fake_client)
+
+    held = await admin._budget.acquire("keycloak_admin")  # another replica holds the one slot
+    with pytest.raises(DependencyUnavailableError, match="saturated"):
+        await admin.grant_realm_role("sub", "merchant")
+    assert kc.calls == 0  # Keycloak was never contacted
+    await admin._budget.release("keycloak_admin", held)
+
+
+async def test_gateway_releases_its_permit_on_the_failure_path(real_valkey):
+    """A failed logical call returns its permit too: with limit 1, the next call
+    must still reach the gateway (a leaked permit would shed it)."""
+    budget = ValkeyConcurrencyBudget(real_valkey, max_concurrent=1, permit_ttl_seconds=60)
+    down = _DownGateway()
+    gateway = ResilientPaymentGateway(down, budget=budget, max_attempts=1, failure_threshold=10)
+    for key in ("k1", "k2"):
+        with pytest.raises(DependencyUnavailableError):
+            await gateway.charge(amount=10, idempotency_key=key, payment_method_token="tok")
+    assert down.calls == 2  # both calls were admitted — the first permit was released
+
+
+async def test_shed_while_half_open_frees_the_probe_slot(real_valkey):
+    """A shed records no outcome — the admitted half-open probe slot must be
+    released, or the breaker wedges and 503s until restart."""
+    budget = ValkeyConcurrencyBudget(real_valkey, max_concurrent=1, permit_ttl_seconds=60)
+    down = _DownGateway()
+    gateway = ResilientPaymentGateway(
+        down, budget=budget, max_attempts=1, failure_threshold=1, reset_timeout_seconds=0.01
+    )
+    with pytest.raises(DependencyUnavailableError):
+        await gateway.lookup("k1")  # trips the breaker
+    assert gateway._breaker.state == "open"
+    await asyncio.sleep(0.02)  # reset window elapses → the next call is the probe
+
+    held = await budget.acquire("payment_gateway")  # ...but the fleet budget is spent
+    with pytest.raises(DependencyUnavailableError, match="saturated"):
+        await gateway.lookup("k2")
+    assert gateway._breaker.state == "half_open"
+    assert gateway._breaker.allow()  # probe slot freed — a fresh probe is admitted
+    await budget.release("payment_gateway", held)
+
+
+class _StickyBudget:
+    """In-memory budget stand-in that hangs on acquire/release once flagged
+    (a stuck Valkey): the calls before the flag complete normally."""
+
+    def __init__(self) -> None:
+        self.hang_acquire = False
+        self.hang_release = False
+        self.held: list[str] = []
+
+    async def acquire(self, dependency: str):  # noqa: ANN001, ANN202
+        if self.hang_acquire:
+            await asyncio.sleep(30)
+        permit = f"permit-{len(self.held)}"
+        self.held.append(permit)
+        return permit
+
+    async def release(self, dependency: str, permit_id: str):  # noqa: ANN001, ANN202
+        if self.hang_release:
+            await asyncio.sleep(30)
+        if permit_id in self.held:
+            self.held.remove(permit_id)
+
+
+async def test_cancellation_mid_acquire_frees_the_probe_slot():
+    """A call cancelled during the budget round-trip records no outcome — the
+    probe slot must be released or the breaker wedges half-open until restart."""
+    budget = _StickyBudget()
+    gateway = ResilientPaymentGateway(
+        _ScriptedGateway(ConnectionError("gateway down")),
+        budget=budget,  # type: ignore[arg-type]
+        max_attempts=1,
+        failure_threshold=1,
+        reset_timeout_seconds=0.01,
+    )
+    with pytest.raises(DependencyUnavailableError):
+        await gateway.lookup("k1")  # acquire works; the transient fault trips the breaker
+    assert gateway._breaker.state == "open"
+    budget.hang_acquire = True  # Valkey now hangs
+    await asyncio.sleep(0.02)  # next call is the half-open probe
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(gateway.lookup("k2"), timeout=0.05)  # cancelled inside budget.acquire
+    assert gateway._breaker.allow()  # probe slot freed — the breaker is not wedged
+
+
+async def test_cancellation_during_release_keeps_the_recorded_success():
+    """A success is recorded *before* the release await: a cancellation landing on
+    the release must not swallow a decided probe outcome."""
+    budget = _StickyBudget()
+    gateway = ResilientPaymentGateway(
+        _ScriptedGateway(ConnectionError("gateway down")),  # first call trips; the probe answers None (healthy)
+        budget=budget,  # type: ignore[arg-type]
+        max_attempts=1,
+        failure_threshold=1,
+        reset_timeout_seconds=0.01,
+    )
+    with pytest.raises(DependencyUnavailableError):
+        await gateway.lookup("k1")
+    budget.hang_release = True  # Valkey hangs on the way out
+    await asyncio.sleep(0.02)  # next call is the probe
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(gateway.lookup("k2"), timeout=0.05)  # cancelled inside budget.release
+    assert gateway._breaker.state == "closed"  # the probe's success was already recorded
+
+
+async def test_keycloak_fails_open_when_budget_valkey_is_down(monkeypatch):
+    """Budget Valkey fault → the admin call proceeds on the per-process breaker."""
+
+    class _BoomValkey:
+        async def eval(self, *_args, **_kwargs):
+            raise OSError("valkey is down")
+
+        async def zrem(self, *_args, **_kwargs):
+            raise OSError("valkey is down")
+
+    admin = KeycloakIdentityAdmin(AppSettings(**_SETTINGS), valkey=_BoomValkey())  # type: ignore[arg-type]
+    kc = _FlakyKeycloak(KeycloakConnectionError("refused"))
+    kc.up = True
+
+    async def fake_client():
+        return kc
+
+    monkeypatch.setattr(admin, "_client", fake_client)
+    await admin.grant_realm_role("sub", "merchant")  # must not raise
+    assert kc.calls == 2  # the call went through (role lookup + assign)
 
 
 # --- retry_transient ----------------------------------------------------------

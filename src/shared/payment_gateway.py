@@ -18,6 +18,7 @@ from src.payments.adapters.resilient_gateway import ResilientPaymentGateway
 from src.payments.adapters.stub_gateway import stub_gateway_from_settings
 from src.payments.ports.gateway import PaymentGatewayPort
 from src.shared.config.setting import AppSettings
+from src.shared.resilience import ValkeyConcurrencyBudget
 
 
 def make_payment_gateway(settings: AppSettings, valkey: Any | None) -> PaymentGatewayPort:
@@ -25,10 +26,22 @@ def make_payment_gateway(settings: AppSettings, valkey: Any | None) -> PaymentGa
 
     ``valkey`` backs the stub's deferred-charge window when the dev/demo pending
     trigger is enabled (``stub_gateway_from_settings`` refuses a pending trigger
-    without one); a real provider ignores it.
+    without one); a real provider ignores it. It also backs the fleet-wide
+    concurrency budget — ``None`` (bare test app) leaves the
+    per-process breaker as the only guard.
     """
+    budget = (
+        ValkeyConcurrencyBudget(
+            valkey,
+            max_concurrent=settings.resilience_dependency_max_concurrent,
+            permit_ttl_seconds=settings.resilience_permit_ttl_seconds,
+        )
+        if valkey is not None
+        else None
+    )
     return ResilientPaymentGateway(
         stub_gateway_from_settings(settings, valkey),
+        budget=budget,
         max_attempts=settings.resilience_max_attempts,
         base_delay_seconds=settings.resilience_retry_base_delay_seconds,
         max_delay_seconds=settings.resilience_retry_max_delay_seconds,

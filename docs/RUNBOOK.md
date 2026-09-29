@@ -488,12 +488,30 @@ dead dependency. After `RESILIENCE_BREAKER_RESET_SECONDS` it **half-opens** and
 admits exactly one probe — success closes it, failure re-opens it for another
 window. Recovery is automatic; no restart is involved.
 
+**Fleet-wide concurrency budget.** The breaker is process-local by design
+(fast, partition-proof), but with N replicas a struggling dependency would
+still receive N× concurrent retry traffic. A **shared concurrency budget**
+(`ValkeyConcurrencyBudget`) caps total in-flight calls per
+dependency across the whole fleet at `RESILIENCE_DEPENDENCY_MAX_CONCURRENT`
+— a Valkey semaphore with self-healing permits (TTL
+`RESILIENCE_PERMIT_TTL_SECONDS` covers crashed replicas). A spent budget sheds
+the call with a 503 (`...saturated (concurrency budget exhausted)`) without
+touching the dependency and without counting a breaker failure. It **fails
+open** on a Valkey fault — the per-process breaker is the backstop.
+
 **Observable.** The state is the `circuit_state{dependency="payment_gateway"|"keycloak_admin"}`
 gauge (**0** closed, **1** half_open, **2** open) plus
 `circuit_transitions_total{dependency, from, to}`; every transition also logs a
 `circuit <name>: closed -> open (...)` line. Alarm on `circuit_state == 2` for
 longer than 2× the reset window; a high `circuit_transitions_total` rate means a
 flapping dependency (breaker correctly opening/closing over and over).
+
+Budget observability: `dependency_budget_exhausted_total{dependency}` counts
+shed calls — a sustained rate means the fleet-wide in-flight cap is the
+bottleneck (raise `RESILIENCE_DEPENDENCY_MAX_CONCURRENT` or fix the slow
+dependency); `dependency_budget_fail_open_total{dependency}` counts Valkey
+faults where the budget degraded to the per-process breaker (investigate
+Valkey; protection is reduced, not gone).
 
 | Breaker open means | User-visible behavior | Action |
 |---|---|---|

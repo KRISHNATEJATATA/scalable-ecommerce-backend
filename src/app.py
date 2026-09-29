@@ -56,9 +56,10 @@ async def _lifespan(app: FastAPI):
     app.state.db_probe_engine = postgres_client.create_probe_engine(settings)
     app.state.valkey = valkey_client.create_client(settings)
     # Process-wide JWKS client (reuses PyJWT's kid cache) + Keycloak admin adapter
-    # (constructed lazily-connecting: no network at startup).
+    # (constructed lazily-connecting: no network at startup). Valkey backs the
+    # adapter's fleet-wide concurrency budget.
     app.state.jwks_client = build_jwks_client(settings)
-    app.state.identity_admin = KeycloakIdentityAdmin(settings)
+    app.state.identity_admin = KeycloakIdentityAdmin(settings, valkey=app.state.valkey)
     # Process-wide aioboto3 S3 client (entered once) for presigned uploads +
     # serving private assets. None if S3 isn't configured (e.g. bare test app).
     app.state.s3 = None

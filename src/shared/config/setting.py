@@ -365,6 +365,17 @@ class AppSettings(BaseSettings):
     # after ``resilience_breaker_reset_seconds`` to let one probe call through.
     resilience_breaker_failure_threshold: int = Field(default=5, ge=1)
     resilience_breaker_reset_seconds: float = Field(default=30.0, gt=0)
+    # Fleet-wide concurrency budget per dependency (Valkey semaphore):
+    # breakers are process-local, so N replicas would otherwise aim N× in-flight
+    # traffic at a struggling dependency. This caps total in-flight calls across
+    # all replicas. Fail-open on Valkey faults (the per-process breaker is the
+    # backstop). Permit TTL must exceed the slowest logical call: the default
+    # 240s covers the default worst case with headroom (3 attempts ×
+    # python-keycloak's 60s client timeout + retry backoff) — raise it in step
+    # if either knob grows. Early expiry only over-admits the soft bound,
+    # never deadlocks.
+    resilience_dependency_max_concurrent: int = Field(default=64, ge=1)
+    resilience_permit_ttl_seconds: float = Field(default=240.0, gt=0)
     # SIGTERM drain bound for in-process work (seconds): the lifespan stops the
     # outbox-lag poller, waits for in-flight requests to finish, then closes the
     # pools last. Must stay **below** ECS's stopTimeout (~30s image stop) so

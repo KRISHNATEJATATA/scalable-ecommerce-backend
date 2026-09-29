@@ -12,6 +12,15 @@ adapter:
   every caller wait out the outage, and it is observable: every transition logs
   a line and flips the ``circuit_state`` gauge (0 closed, 1 half_open, 2 open),
   so an open breaker is alertable on ``/metrics`` (docs/RUNBOOK.md §11).
+- :class:`ValkeyConcurrencyBudget` — a **fleet-wide** bound on in-flight calls
+  to one dependency (a distributed semaphore in Valkey, shared by every API
+  replica). The breaker is process-local by design — fast, partition-proof,
+  and enough to fail one replica fast — but with N replicas a struggling
+  dependency could still receive N x concurrent retry traffic; the shared
+  budget caps that pile-up at ``resilience_dependency_max_concurrent`` across
+  the whole fleet. It **fails open** on a Valkey fault: the
+  per-process breaker remains as the backstop, so a Valkey blip never becomes
+  a dependency outage of its own.
 
 The half-open probe is deliberately **one call**: several concurrent probes
 against a flapping dependency would multiply its load exactly when it can least
@@ -30,6 +39,8 @@ import logging
 import random
 import time
 from collections.abc import Awaitable, Callable
+from typing import Any
+from uuid import uuid4
 
 from prometheus_client import Counter, Gauge
 
@@ -175,6 +186,113 @@ class CircuitBreaker:
         CIRCUIT_TRANSITIONS.labels(self._dependency, _STATE_NAMES[previous], _STATE_NAMES[to]).inc()
         log = logger.warning if to == _OPEN else logger.info
         log("circuit %s: %s -> %s (%s)", self._dependency, _STATE_NAMES[previous], _STATE_NAMES[to], why)
+
+
+#: ``dependency_budget_exhausted_total{dependency}`` — a call was shed because
+#: the fleet-wide in-flight budget was spent. A sustained rate means the
+#: dependency (or the limit) is the bottleneck, fleet-wide — not one replica's.
+DEPENDENCY_BUDGET_EXHAUSTED = Counter(
+    "dependency_budget_exhausted_total",
+    "Calls shed by the shared concurrency budget per dependency.",
+    ["dependency"],
+)
+
+#: ``dependency_budget_fail_open_total{dependency}`` — a Valkey fault while
+#: acquiring/releasing a permit; the budget degraded to the per-process breaker.
+DEPENDENCY_BUDGET_FAIL_OPEN = Counter(
+    "dependency_budget_fail_open_total",
+    "Concurrency-budget Valkey faults per dependency (budget running fail-open).",
+    ["dependency"],
+)
+
+# Distributed semaphore, fully atomic: reap expired permits, admit if under the
+# limit, stamp the permit with its expiry as the score. Permits are ZSET members
+# (member = permit id, score = wall-clock expiry ms) so a crashed replica's
+# permits **self-heal**: the next acquire reaps them. The key itself expires one
+# TTL after the last acquire — stale permits in a vanished key are equivalent to
+# reaped ones, so the bound stays soft (over-admit at worst), never a deadlock.
+_ACQUIRE_PERMIT_LUA = """
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[2]) then
+    return 0
+end
+redis.call('ZADD', KEYS[1], ARGV[3], ARGV[4])
+redis.call('PEXPIRE', KEYS[1], ARGV[5])
+return 1
+"""
+
+
+class ValkeyConcurrencyBudget:
+    """Fleet-wide bound on in-flight calls to one dependency (distributed semaphore).
+
+    The per-process :class:`CircuitBreaker` alone cannot coordinate across
+    replicas: with N API tasks, a provider outage is met by N independent
+    breakers, each admitting its own retry traffic. This budget caps the
+    *concurrency* the whole fleet may aim at one dependency
+    (``resilience_dependency_max_concurrent`` per dependency key), so a
+    struggling dependency sees a bounded pile-up no matter the replica count.
+
+    Deliberately a **budget, not a distributed breaker**: no shared state
+    machine to split-brain, and a Valkey fault **fails open** (logged +
+    counted) onto the per-process breaker rather than taking the dependency
+    down with it. Scores use the caller's wall clock; replica clock skew
+    shrinks/expands permit lifetimes by at most the skew — acceptable for a
+    soft bound, exactly as in the rate-limit token bucket.
+
+    Usage: ``permit = await budget.acquire(dep)`` → ``None`` means shed the
+    call (503); otherwise run the call and ``await budget.release(dep,
+    permit)`` in a ``finally``. A lost release (crash, cancellation mid-await)
+    is harmless — the permit expires after ``permit_ttl_seconds``.
+    """
+
+    def __init__(self, valkey: Any, *, max_concurrent: int, permit_ttl_seconds: float) -> None:
+        # Typed ``Any`` like every other Valkey adapter (ValkeyTokenBucket,
+        # ValkeyProductCache): the redis-py-compatible stubs don't describe the
+        # async client's replies.
+        self._valkey = valkey
+        self._limit = max_concurrent
+        self._ttl_ms = int(permit_ttl_seconds * 1000)
+
+    async def acquire(self, dependency: str, *, now_ms: int | None = None) -> str | None:
+        """Take one permit for ``dependency``; return its id, or ``None`` to shed.
+
+        ``now_ms`` is injectable so tests drive expiry deterministically (no
+        wall-clock sleeps). Fail-open: a Valkey fault returns a synthetic
+        permit — the per-process breaker is the backstop, and abuse control
+        must never become the reason a call fails.
+        """
+        now = int(time.time() * 1000) if now_ms is None else now_ms
+        permit_id = uuid4().hex
+        try:
+            granted = await self._valkey.eval(
+                _ACQUIRE_PERMIT_LUA,
+                1,
+                f"budget:{dependency}",
+                # ARGV cross into Lua as strings; ``tonumber`` parses them there.
+                str(now),
+                str(self._limit),
+                str(now + self._ttl_ms),
+                permit_id,
+                str(self._ttl_ms),
+            )
+        except Exception:  # boundary: a Valkey fault is not a reason to refuse the call
+            DEPENDENCY_BUDGET_FAIL_OPEN.labels(dependency).inc()
+            logger.warning("concurrency budget for %s fail-open (Valkey fault)", dependency)
+            return permit_id
+        if not granted:
+            DEPENDENCY_BUDGET_EXHAUSTED.labels(dependency).inc()
+            logger.info("concurrency budget for %s exhausted (%d in-flight fleet-wide)", dependency, self._limit)
+            return None
+        return permit_id
+
+    async def release(self, dependency: str, permit_id: str) -> None:
+        """Return a permit. Best-effort: a lost release self-heals via the TTL,
+        so a Valkey fault here is a counted debug line, never an error."""
+        try:
+            await self._valkey.zrem(f"budget:{dependency}", permit_id)
+        except Exception:  # boundary: the permit expires on its own
+            DEPENDENCY_BUDGET_FAIL_OPEN.labels(dependency).inc()
+            logger.debug("concurrency budget release lost for %s (self-heals via TTL)", dependency)
 
 
 async def retry_transient[R](

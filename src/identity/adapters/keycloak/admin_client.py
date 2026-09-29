@@ -11,8 +11,10 @@ passed straight through as the admin ``user_id``.
 Every Admin-API call runs through :meth:`KeycloakIdentityAdmin._guarded`:
 bounded retry (transient faults only — connection errors, timeouts, 5xx/429)
 inside one circuit-breaker decision, with a per-process breaker on the
-``keycloak_admin`` dependency. While the breaker is open, calls fail fast with
-a 503 :class:`DependencyUnavailableError` without touching the network. Only
+``keycloak_admin`` dependency and a fleet-wide concurrency budget in Valkey
+bounding in-flight calls across replicas. While the breaker is
+open, calls fail fast with a 503 :class:`DependencyUnavailableError` without
+touching the network. Only
 **idempotent** operations retry (role grant/revoke, enable/disable, lookups);
 ``create_user`` is breaker-guarded but never retried — its compensating delete
 can itself fail mid-outage, and re-running a create against a half-dead
@@ -23,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from keycloak.exceptions import KeycloakConnectionError, KeycloakError, KeycloakGetError
 
@@ -78,6 +81,7 @@ from src.shared.errors.exceptions import DependencyUnavailableError  # noqa: E40
 from src.shared.resilience import (  # noqa: E402
     CircuitBreaker,
     CircuitOpenError,
+    ValkeyConcurrencyBudget,
     is_transient_exception,
     retry_transient,
 )
@@ -93,7 +97,7 @@ def _keycloak_transient(exc: BaseException) -> bool:
 class KeycloakIdentityAdmin:
     """Grant/revoke realm roles and enable/disable users via Keycloak's Admin API."""
 
-    def __init__(self, settings: AppSettings) -> None:
+    def __init__(self, settings: AppSettings, valkey: Any | None = None) -> None:
         self._settings = settings
         self._admin: KeycloakAdmin | None = None
         # One breaker per adapter instance (one per process via app.state).
@@ -101,6 +105,18 @@ class KeycloakIdentityAdmin:
             "keycloak_admin",
             failure_threshold=settings.resilience_breaker_failure_threshold,
             reset_timeout_seconds=settings.resilience_breaker_reset_seconds,
+        )
+        # Fleet-wide concurrency budget: bounds in-flight Admin-API
+        # calls across all replicas. None (no Valkey — bare test app, one-shot
+        # scripts) leaves the per-process breaker as the only guard.
+        self._budget = (
+            ValkeyConcurrencyBudget(
+                valkey,
+                max_concurrent=settings.resilience_dependency_max_concurrent,
+                permit_ttl_seconds=settings.resilience_permit_ttl_seconds,
+            )
+            if valkey is not None
+            else None
         )
 
     async def _client(self) -> KeycloakAdmin:
@@ -124,13 +140,21 @@ class KeycloakIdentityAdmin:
     async def _guarded[R](self, operation: Callable[[], Awaitable[R]], *, retry: bool = True) -> R:
         """One breaker-bracketed Admin-API call (see :mod:`src.shared.resilience`).
 
+        Gate order is deliberate: the breaker gate is in-memory and free (an
+        open breaker must fail fast *without* spending a Valkey round-trip);
+        the shared concurrency budget is acquired next — a shed carries no
+        dependency-health signal, so the breaker's probe slot is released via
+        ``record_abandoned`` and the failure streak is untouched.
+
         The breaker sees a *single* outcome per logical call: a definitive
         answer — including handled 4xx — records success (a dependency that
         answers 404 is healthy; the breaker tracks reachability, not business
         outcomes); a transient fault after the bounded attempts records a
         failure and surfaces as :class:`DependencyUnavailableError` (503); a
         cancellation records an **abandoned** call (no health signal, but the
-        half-open probe slot must be released or the breaker wedges).
+        half-open probe slot must be released or the breaker wedges). The
+        budget permit is always released (``finally``); a lost release
+        self-heals via the permit TTL.
 
         Retried only when ``retry`` is set — for the idempotent operations.
         While the breaker is open, the call fails fast without touching the
@@ -138,6 +162,19 @@ class KeycloakIdentityAdmin:
         """
         if not self._breaker.allow():
             raise CircuitOpenError("Keycloak Admin API is unavailable (circuit open)")
+        budget = self._budget
+        permit: str | None = None
+        if budget is not None:
+            try:
+                permit = await budget.acquire("keycloak_admin")
+            except BaseException:
+                # Cancelled mid-acquire (step timeout, drain): no outcome —
+                # release any half-open probe slot or the breaker wedges.
+                self._breaker.record_abandoned()
+                raise
+            if permit is None:
+                self._breaker.record_abandoned()  # a shed is no health signal; free any probe slot
+                raise DependencyUnavailableError("Keycloak is saturated (concurrency budget exhausted)")
         try:
             result = await retry_transient(
                 operation,
@@ -157,7 +194,14 @@ class KeycloakIdentityAdmin:
             # slot — a cancelled call must not wedge the breaker in half-open.
             self._breaker.record_abandoned()
             raise
-        self._breaker.record_success()
+        else:
+            # Record before the release await in ``finally``: a cancellation
+            # landing on that await must not swallow a decided outcome (a
+            # successful probe would leak its slot and wedge the breaker).
+            self._breaker.record_success()
+        finally:
+            if permit is not None and budget is not None:
+                await budget.release("keycloak_admin", permit)
         return result
 
     @map_admin_errors
