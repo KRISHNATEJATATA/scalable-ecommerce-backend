@@ -91,8 +91,18 @@ class BasketPort(Protocol):
 
 
 class StockHoldsPort(Protocol):
-    async def reserve(self, sku: str, qty: int, order_id: uuid.UUID) -> uuid.UUID:
-        """Hold ``qty`` of ``sku`` for ``order_id``; raises ``InsufficientStockError`` (409) when refused."""
+    async def reserve_many(self, lines: list[tuple[str, int]], order_id: uuid.UUID) -> None:
+        """Hold every ``(sku, qty)`` line for ``order_id`` in ONE all-or-nothing transaction.
+
+        Batched, not per-line: a cart-full (up to 50 lines) of sequential reserve
+        transactions stretched the saga step's latency, connection occupancy and
+        lock exposure. One transaction commits every line's hold together — a
+        rejected line rolls the whole batch back, leaving nothing partial to
+        compensate, and the SKU-sorted work order keeps row-lock acquisition
+        deterministic (no new deadlock surface). Idempotent per order line: a
+        retry returns the existing holds rather than deducting twice. Raises
+        ``InsufficientStockError`` (409) naming the refused line.
+        """
         ...
 
     async def release_for_order(self, order_id: uuid.UUID) -> int:

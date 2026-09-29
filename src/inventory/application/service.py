@@ -31,7 +31,7 @@ from src.inventory.application.metrics import (
     reservation_conflict_total,
 )
 from src.inventory.application.outbox import stock_released_outbox, stock_reserved_outbox
-from src.inventory.ports.repository import InventoryRepositoryPort
+from src.inventory.ports.repository import InventoryRepositoryPort, StockRejection
 from src.shared.errors.exceptions import (
     InsufficientStockError,
     InvalidReservationError,
@@ -119,6 +119,47 @@ class InventoryService:
             log.info("reservation rejected: insufficient stock for sku=%s qty=%s", sku, qty)
             raise InsufficientStockError(sku, qty)
         return ReservationResponse.model_validate(reservation_to_domain(row))
+
+    async def reserve_many(self, lines: list[tuple[str, int]], order_id: uuid.UUID) -> list[ReservationResponse]:
+        """Hold every ``(sku, qty)`` line for ``order_id`` in one all-or-nothing transaction.
+
+        The checkout saga's reserve step: the batch form of :meth:`reserve`, so a
+        cart-full of lines costs one transaction instead of one per line. Same
+        contract per line — idempotent retry (an already-held line is returned,
+        not re-deducted), :class:`InsufficientStockError` (409) naming the first
+        line whose stock fell short (or has no stock row) with the whole batch
+        rolled back, :class:`ReservationConflictError` when a line is re-reserved
+        at a different quantity (counted apart from the oversell signal), and
+        :class:`InvalidReservationError` (400) for a non-positive quantity, which
+        no stock level would make valid. SKUs must be unique across ``lines``
+        (the cart keys lines by product, so they are): a duplicate is a caller
+        contradiction no reservation state can satisfy twice, rejected as invalid.
+        """
+        if not lines:
+            return []
+        seen: set[str] = set()
+        for sku, qty in lines:
+            if qty <= 0:
+                raise InvalidReservationError(f"invalid reservation for {sku!r}: quantity {qty} must be positive")
+            if sku in seen:
+                raise InvalidReservationError(f"invalid reservation batch: sku {sku!r} appears more than once")
+            seen.add(sku)
+        try:
+            rows = await self._repo.reserve_many(
+                lines=lines,
+                order_id=order_id,
+                expires_at=datetime.now(UTC) + self._ttl,
+                outbox_factory=stock_reserved_outbox,
+            )
+        except ReservationConflictError:
+            reservation_conflict_total.inc()
+            log.info("reservation conflict: order line re-reserved at a different quantity (order=%s)", order_id)
+            raise
+        if isinstance(rows, StockRejection):
+            oversell_blocked_total.inc()
+            log.info("batch reservation rejected: insufficient stock for sku=%s qty=%s", rows.sku, rows.qty)
+            raise InsufficientStockError(rows.sku, rows.qty)
+        return [ReservationResponse.model_validate(reservation_to_domain(row)) for row in rows]
 
     async def release(self, reservation_id: uuid.UUID) -> bool:
         """Give a held reservation's stock back (saga compensation); ``False`` on replay."""

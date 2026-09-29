@@ -218,7 +218,155 @@ async def test_retry_with_a_changed_quantity_conflicts_instead_of_reading_as_no_
 
     assert _metric("inventory_oversell_blocked_total") == oversells  # not an oversell
     assert _metric("inventory_reservation_conflict_total") == conflicts + 1
-    assert await _stock(session, "sku-qty") == (10, 1)  # the conflicting attempt moved nothing
+
+
+# --- batch reserve (the checkout saga's one-transaction reserve step) -------
+
+
+async def test_reserve_many_holds_every_line_and_emits_one_event_each(session):
+    await _seed(session, "sku-batch-a", 5)
+    await _seed(session, "sku-batch-b", 3)
+    order_id = uuid.uuid4()
+
+    reservations = await _service(session).reserve_many([("sku-batch-a", 2), ("sku-batch-b", 1)], order_id)
+
+    assert {r.sku for r in reservations} == {"sku-batch-a", "sku-batch-b"}
+    assert all(r.status is ReservationStatus.HELD for r in reservations)
+    assert await _stock(session, "sku-batch-a") == (5, 2)
+    assert await _stock(session, "sku-batch-b") == (3, 1)
+    assert await _outbox_types(session) == ["StockReserved", "StockReserved"]
+
+
+async def test_reserve_many_is_all_or_nothing_when_one_line_falls_short(session):
+    """A rejected line rolls the whole batch back — nothing partial to compensate."""
+    await _seed(session, "sku-plenty", 5)
+    await _seed(session, "sku-short-batch", 1)
+    before = _metric("inventory_oversell_blocked_total")
+
+    with pytest.raises(InsufficientStockError) as excinfo:
+        await _service(session).reserve_many([("sku-plenty", 2), ("sku-short-batch", 5)], uuid.uuid4())
+
+    assert excinfo.value.sku == "sku-short-batch"
+    # The cover-able line was rolled back with the rejected one: no holds, no
+    # stock moved, no events — the saga's compensation finds nothing to release.
+    assert await _stock(session, "sku-plenty") == (5, 0)
+    assert await _stock(session, "sku-short-batch") == (1, 0)
+    assert await _outbox_types(session) == []
+    assert _metric("inventory_oversell_blocked_total") == before + 1
+
+
+async def test_reserve_many_rejects_an_unstocked_sku_without_holding_the_rest(session):
+    """A SKU with no inventory row is unavailability (409), not a 500 — and still all-or-nothing."""
+    await _seed(session, "sku-stocked", 5)
+    before = _metric("inventory_oversell_blocked_total")
+
+    with pytest.raises(InsufficientStockError) as excinfo:
+        await _service(session).reserve_many([("sku-stocked", 1), ("sku-never-seeded", 1)], uuid.uuid4())
+
+    assert excinfo.value.sku == "sku-never-seeded"
+    assert await _stock(session, "sku-stocked") == (5, 0)
+    assert await _outbox_types(session) == []
+    assert _metric("inventory_oversell_blocked_total") == before + 1
+
+
+async def test_reserve_many_retry_is_idempotent_and_never_double_deducts(session):
+    """A replay of a landed batch (the saga's timeout ambiguity) returns the same holds."""
+    await _seed(session, "sku-replay-a", 2)
+    await _seed(session, "sku-replay-b", 4)
+    order_id = uuid.uuid4()
+    service = _service(session)
+
+    first = await service.reserve_many([("sku-replay-a", 2), ("sku-replay-b", 3)], order_id)
+    # sku-replay-a is now fully held — the replay's CAS would reject it, and must
+    # still get its reservation back rather than reading as out of stock.
+    second = await service.reserve_many([("sku-replay-a", 2), ("sku-replay-b", 3)], order_id)
+
+    assert {r.sku: r.id for r in second} == {r.sku: r.id for r in first}
+    assert await _stock(session, "sku-replay-a") == (2, 2)
+    assert await _stock(session, "sku-replay-b") == (4, 3)
+    assert await _outbox_types(session) == ["StockReserved", "StockReserved"]  # no duplicate events
+
+
+async def test_reserve_many_with_a_changed_quantity_conflicts_instead_of_double_deducting(session):
+    await _seed(session, "sku-batch-qty", 10)
+    order_id = uuid.uuid4()
+    service = _service(session)
+    await service.reserve_many([("sku-batch-qty", 1)], order_id)
+    oversells = _metric("inventory_oversell_blocked_total")
+    conflicts = _metric("inventory_reservation_conflict_total")
+
+    with pytest.raises(ReservationConflictError):
+        await service.reserve_many([("sku-batch-qty", 4)], order_id)
+
+    assert _metric("inventory_oversell_blocked_total") == oversells  # not an oversell
+    assert _metric("inventory_reservation_conflict_total") == conflicts + 1
+    assert await _stock(session, "sku-batch-qty") == (10, 1)  # the original hold, untouched
+
+
+async def test_reserve_many_conflict_rolls_back_the_lines_it_already_placed(session):
+    """A mid-batch conflict must not leak the earlier lines' pending work.
+
+    The fresh line sorts *before* the conflicting one, so the conflict surfaces
+    with its insert/decrement/outbox row still pending in the transaction. The
+    raise must roll that back: a dirty session would let the saga's compensation
+    (same request-scoped session) commit phantom ``StockReserved`` events for a
+    batch that never landed.
+    """
+    await _seed(session, "sku-aaa-fresh", 5)  # sorts first
+    await _seed(session, "sku-zzz-held", 5)
+    order_id = uuid.uuid4()
+    service = _service(session)
+    await service.reserve("sku-zzz-held", 1, order_id)  # the line the retry contradicts
+
+    with pytest.raises(ReservationConflictError):
+        await service.reserve_many([("sku-aaa-fresh", 2), ("sku-zzz-held", 4)], order_id)
+
+    assert await _stock(session, "sku-aaa-fresh") == (5, 0)  # rolled back, nothing held
+    assert await _stock(session, "sku-zzz-held") == (5, 1)  # the original hold, untouched
+    assert await _outbox_types(session) == ["StockReserved"]  # only the original hold's event
+    # And the session is clean: a following write commits nothing stray.
+    await service.release_for_order(order_id)
+    assert await _outbox_types(session) == ["StockReserved", "StockReleased"]
+
+
+async def test_reserve_many_rejects_duplicate_skus_and_non_positive_quantities(session):
+    await _seed(session, "sku-dup", 10)
+    service = _service(session)
+
+    with pytest.raises(InvalidReservationError):
+        await service.reserve_many([("sku-dup", 1), ("sku-dup", 2)], uuid.uuid4())
+    with pytest.raises(InvalidReservationError):
+        await service.reserve_many([("sku-dup", 0)], uuid.uuid4())
+
+    assert await _stock(session, "sku-dup") == (10, 0)  # nothing held, nothing attempted
+
+
+async def test_parallel_batches_racing_the_same_unit_yield_exactly_one_winner(async_engine, session):
+    """Two overlapping batches, one scarce SKU: no deadlock, no oversell, no split holds.
+
+    Both batches take the inventory row locks in SKU-sorted order, so they queue
+    on the shared SKU instead of cycling; the loser's CAS rejects and its whole
+    batch — including the line it *could* have covered — rolls back.
+    """
+    await _seed(session, "sku-shared", 1)
+    await _seed(session, "sku-only-a", 5)
+    await _seed(session, "sku-only-b", 5)
+    maker = async_sessionmaker(async_engine, expire_on_commit=False)
+
+    async def attempt(private_sku: str) -> bool:
+        async with maker() as own_session:
+            try:
+                await _service(own_session).reserve_many([(private_sku, 1), ("sku-shared", 1)], uuid.uuid4())
+            except InsufficientStockError:
+                return False
+            return True
+
+    results = await asyncio.gather(attempt("sku-only-a"), attempt("sku-only-b"))
+
+    assert sum(results) == 1, "exactly one batch may win the shared unit"
+    assert await _stock(session, "sku-shared") == (1, 1)
+    # The winner's private line landed; the loser's rolled back with its batch.
+    assert sorted([await _stock(session, "sku-only-a"), await _stock(session, "sku-only-b")]) == [(5, 0), (5, 1)]
 
 
 async def test_retry_after_commit_does_not_deduct_stock_twice(session):
@@ -430,9 +578,9 @@ async def test_retry_exhaustion_raises_contention_and_does_not_count_as_an_overs
     repo = InventoryRepository(session)
 
     async def _never_found(*args, **kwargs):  # noqa: ANN002, ANN003
-        return None
+        return {}
 
-    repo._find_active = _never_found
+    repo._active_map = _never_found
     oversells_before = _metric("inventory_oversell_blocked_total")
 
     with pytest.raises(ReservationContendedError):
@@ -455,18 +603,18 @@ async def test_retry_succeeds_when_the_conflicting_hold_is_released_mid_flight(s
 
     maker = async_sessionmaker(async_engine, expire_on_commit=False)
     repo = InventoryRepository(session)
-    original_find = repo._find_active
+    original_map = repo._active_map
     released = False
 
-    async def _release_then_find(*args, **kwargs):
+    async def _release_then_map(*args, **kwargs):
         nonlocal released
         if not released:  # only on the first lookup, i.e. mid-flight
             released = True
             async with maker() as other:
                 await _service(other).release(first.id)
-        return await original_find(*args, **kwargs)
+        return await original_map(*args, **kwargs)
 
-    repo._find_active = _release_then_find
+    repo._active_map = _release_then_map
     retry = await InventoryService(repo, reservation_ttl_seconds=900).reserve("sku-vanish", 1, order_id)
 
     assert retry.id != first.id  # a fresh hold, because the old one was released

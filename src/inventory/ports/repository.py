@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
 
@@ -23,6 +24,21 @@ from src.shared.db.outbox import OutboxMessage
 #: Defined here (the contract), imported by the adapter — never redeclared.
 #: ``stock_released_outbox`` satisfies it directly.
 OutboxFactory = Callable[[str, uuid.UUID, int], OutboxMessage]
+
+
+@dataclass(frozen=True, slots=True)
+class StockRejection:
+    """The batch reserve's stock-refusal answer: which line's free stock fell short.
+
+    Returned, not raised, so it stays distinguishable from a caller contradiction
+    (:class:`ReservationConflictError`) and line churn
+    (:class:`ReservationContendedError`) — the service maps it to
+    :class:`InsufficientStockError` and the oversell counter, exactly like the
+    single-line ``reserve`` returning ``None``.
+    """
+
+    sku: str
+    qty: int
 
 
 class InventoryRepositoryPort(Protocol):
@@ -75,6 +91,35 @@ class InventoryRepositoryPort(Protocol):
         :class:`ReservationContendedError` when repeated uniqueness races mean the
         line is under churn — transient pressure that must not be reported, or
         counted, as a stock rejection."""
+        ...
+
+    async def reserve_many(
+        self,
+        *,
+        lines: list[tuple[str, int]],
+        order_id: uuid.UUID,
+        expires_at: datetime,
+        outbox_factory: OutboxFactory,
+    ) -> Any:
+        """Hold every ``(sku, qty)`` line for ``order_id`` in ONE all-or-nothing transaction.
+
+        The checkout saga's reserve step: up to a cart-full of lines placed as one
+        batch instead of N sequential transactions — one connection checkout, one
+        commit, and no partial holds to compensate when a line is rejected (the
+        whole batch rolls back). Lines are worked in SKU-sorted order so every
+        batch takes the inventory row locks in the same global sequence — the
+        deterministic lock order that keeps two overlapping batches from
+        deadlocking (no parallelism is introduced, so there is no new deadlock
+        surface beyond ordering). ``lines`` must have unique SKUs.
+
+        Returns the order's active reservation rows for the lines (freshly placed
+        plus any an earlier attempt already landed — a retry never deducts their
+        stock twice), or a :class:`StockRejection` naming the line whose free
+        stock (or missing stock row) refused the batch. Raises
+        ``ReservationConflictError`` (line already held at a different quantity)
+        and :class:`ReservationContendedError` (repeated uniqueness races), with
+        the same meaning as :meth:`reserve`.
+        """
         ...
 
     async def release(self, reservation_id: uuid.UUID, outbox_factory: OutboxFactory) -> bool:

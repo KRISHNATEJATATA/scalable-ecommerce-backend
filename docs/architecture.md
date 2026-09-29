@@ -223,8 +223,12 @@ app-level bucket protects what WAF can't see
 Checkout is an **orchestrated saga** (`src/orders/application/checkout_saga.py`),
 not choreography: one state machine drives a cart to exactly one terminal order
 (`paid` or `cancelled`). **Order-first**: the saga creates the `pending` order
-(to anchor reservations and the idempotency guard), reserves each line through
-the inventory service, charges through the payments service, commits the holds,
+(to anchor reservations and the idempotency guard), reserves all lines through
+the inventory service **in one all-or-nothing batch transaction** (SKU-sorted
+lock order; a rejected line rolls the whole batch back, so there is nothing
+partial to compensate — and a cart-full costs one connection checkout and one
+commit instead of up to 50 sequential reserve transactions), charges through
+the payments service, commits the holds,
 then marks the order `paid` — journaling every step to the persisted
 **`saga_log`** as it goes. Each step has a compensating action (release holds +
 cancel order); only unpaid sagas compensate — a `paid` order unwinds via the
@@ -377,8 +381,13 @@ prod, compose services locally — never `BackgroundTasks`:
 - **Atomic conditional decrement** on inventory — the single
   `UPDATE ... WHERE on_hand - reserved >= :qty` *is* the oversell guard
   (`rowcount = 0` = rejected). The reservation row and its `StockReserved` outbox
-  row commit in the **same transaction**. Never replace it with read-then-write,
-  a row lock held across the request, or a Valkey lock.
+  row commit in the **same transaction**. Checkout reserves the whole cart as
+  **one batch transaction** (`reserve_many`): lines are worked in SKU-sorted
+  order so concurrent batches take inventory row locks in the same global
+  sequence (the deadlock-avoidance invariant — no parallel sessions are
+  introduced), and any rejection rolls back every line. Never replace it with
+  read-then-write, a row lock held across the request, a Valkey lock, or a
+  per-line transaction loop.
 - **Reservation TTL + reaper**: every hold carries `expires_at`; the `service`-role
   reaper releases expired holds so a stalled saga can't leak stock into a phantom
   oversell-block. Keep `RESERVATION_TTL_SECONDS` longer than the saga's step

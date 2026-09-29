@@ -8,9 +8,11 @@ affected rowcount (1 = reserved, 0 = rejected).
 Everything else here composes that primitive into the full reservation
 lifecycle, each step **one transaction**:
 
-* :meth:`reserve` — ``reservations`` row + CAS decrement + ``StockReserved``
-  outbox row. Either all three land or none do, so the bus can never announce a
-  hold that isn't in the table (no dual-write).
+* :meth:`reserve` / :meth:`reserve_many` — ``reservations`` row(s) + CAS
+  decrement(s) + ``StockReserved`` outbox row(s). Either all of them land or none
+  do, so the bus can never announce a hold that isn't in the table (no
+  dual-write). The batch form is the checkout saga's reserve step: one
+  transaction per *order*, not per cart line, with SKU-sorted lock order.
 * :meth:`release` / :meth:`release_expired` — give the hold back (``reserved -=
   qty``) + ``StockReleased`` outbox row. Both are guarded on ``status = 'held'``,
   so a replayed release updates zero rows and emits no second event.
@@ -40,7 +42,7 @@ from sqlalchemy.sql import text
 
 from src.inventory.adapters.db.models import SCHEMA, Inventory, Outbox, Reservation
 from src.inventory.domain.reservation import ReservationStatus
-from src.inventory.ports.repository import OutboxFactory
+from src.inventory.ports.repository import OutboxFactory, StockRejection
 from src.shared.db.outbox import OutboxMessage
 from src.shared.errors.exceptions import (
     InvalidReservationError,
@@ -240,53 +242,152 @@ class InventoryRepository:
         (nothing to hold → ``None``), a check violation means the request itself is
         invalid (:class:`InvalidReservationError`), and anything unrecognised is
         re-raised rather than mistranslated into a stock answer.
+
+        Implemented as the one-line case of :meth:`reserve_many` — one copy of the
+        tricky idempotency/lock-order logic, not two that can drift apart.
         """
+        result = await self.reserve_many(
+            lines=[(sku, qty)],
+            order_id=order_id,
+            expires_at=expires_at,
+            outbox_factory=lambda _sku, _order_id, _qty: outbox,
+        )
+        if isinstance(result, StockRejection):
+            return None
+        return result[0]
+
+    async def reserve_many(
+        self,
+        *,
+        lines: list[tuple[str, int]],
+        order_id: uuid.UUID,
+        expires_at: datetime,
+        outbox_factory: OutboxFactory,
+    ) -> list[Reservation] | StockRejection:
+        """Hold every ``(sku, qty)`` line for ``order_id`` in ONE all-or-nothing transaction.
+
+        The checkout saga's reserve step, batched: the per-line loop it replaces
+        spent one transaction — connection checkout, commit, outbox flush — per
+        cart line (up to 50), stretching the step's latency, connection occupancy
+        and lock exposure under concurrency. Here all reservation rows, their CAS
+        decrements and their ``StockReserved`` outbox rows commit together: either
+        the whole basket is held or none of it is, so a rejected line leaves
+        nothing partial behind for the saga to compensate.
+
+        Lines are worked **sorted by SKU**, and each line keeps the module-wide
+        lock order (its fresh reservation row first, the inventory row second via
+        the decrement). Sorting gives every batch the same global acquisition
+        sequence for the inventory rows, so two overlapping batches queue instead
+        of cycling — no parallelism is introduced (one session, one transaction),
+        which keeps the deadlock surface at exactly this ordering guarantee.
+
+        **All-or-nothing makes a batch replay complete or absent, never partial.**
+        Like the single-line path, the INSERT is what anchors a retry: it
+        serializes against the partial unique index, so it blocks on — and then
+        sees the final fate of — an in-flight release of the line's previous row.
+        Only a unique violation triggers the lookup pass: lines found active
+        (``held``, or ``committed`` after payment consumed them) at the same
+        quantity are returned as-is and their stock is NOT decremented again; a
+        quantity mismatch is a caller contradiction
+        (:class:`ReservationConflictError`); still-missing lines are inserted,
+        decremented and given an outbox row, so a retried batch neither
+        double-deducts nor double-announces. (Reading the active set *before*
+        inserting would not be anchored: a stale read could wave a line through
+        as "already held" while a releaser was concurrently releasing it.)
+
+        Fresh rows are flushed one at a time, not bulk-inserted: the per-row
+        IntegrityError is what attributes a rejection to *its* line — a
+        foreign-key violation means that SKU has no stock row (nothing to hold →
+        :class:`StockRejection`, the batch form of ``reserve``'s ``None``), a
+        check violation means the request itself is invalid
+        (:class:`InvalidReservationError`), and a unique violation is the
+        uniqueness race, retried once after a rollback-and-reread exactly like the
+        single-line path (bounded at two attempts; a second loss is real churn →
+        :class:`ReservationContendedError`). Unrecognised SQLSTATEs re-raise
+        rather than being mistranslated into a stock answer.
+
+        The return is the placed rows refreshed after the commit (the commit
+        expires every loaded row) — one primary-key read per line, the same cost
+        the single-line path paid, while the batch's win is the single
+        connection, transaction and commit. Refresh by PK, not a re-read of the
+        active set: a row compensation flipped to ``released`` in the race window
+        still refreshes fine, where a set re-read would lose it.
+        """
+        if not lines:
+            return []
+        ordered = sorted(lines, key=lambda line: line[0])
+        skus = [sku for sku, _qty in ordered]
         # Retries once, because the conflicting row can be released between our
         # failed INSERT and the lookup — then the line is genuinely free and the
         # INSERT that just failed would now succeed. Bounded at two attempts: a
         # second loss means real churn on the line, and the caller can retry.
-        for _ in range(2):
-            reservation = Reservation(
-                sku=sku,
-                qty=qty,
-                order_id=order_id,
-                expires_at=expires_at,
-                status=ReservationStatus.HELD.value,
-            )
-            self._session.add(reservation)
-            try:
-                await self._session.flush()
-            except IntegrityError as exc:
-                await self._session.rollback()
-                state = _sqlstate(exc)
-                if state == _FOREIGN_KEY_VIOLATION:
-                    # No inventory row for this SKU, so there is nothing to hold.
-                    # Reported as insufficient stock, not a 500: to the caller an
-                    # unstocked SKU and a sold-out one are the same unavailability.
-                    log.info("reservation rejected: no inventory row for sku=%s", sku)
-                    return None
-                if state == _CHECK_VIOLATION:
-                    raise InvalidReservationError(
-                        f"invalid reservation for {sku!r}: quantity {qty} must be positive"
-                    ) from exc
-                if state != _UNIQUE_VIOLATION:
-                    raise  # not ours to interpret — surface the real cause
-                existing = await self._find_active(order_id, sku, qty)
-                if existing is not None:
-                    return existing
-                continue  # the conflicting reservation was released mid-flight; retry
-            if await self.try_reserve_decrement(sku, qty) == 0:
-                await self._session.rollback()
-                return None
-            self._session.add(self._outbox_row(outbox))
+        raced_sku = skus[0]
+        for attempt in range(2):
+            # First attempt inserts blind (the INSERT itself is the serialization
+            # point against in-flight releases); only a unique violation earns
+            # the lookup pass, which then knows every conflicting row's fate.
+            existing = await self._active_map(order_id, skus) if attempt else {}
+            placed: list[Reservation] = []
+            raced = False
+            for sku, qty in ordered:
+                current = existing.get(sku)
+                if current is not None:
+                    held_qty = current.qty  # read BEFORE the rollback expires the row
+                    if held_qty != qty:
+                        # Roll back first: earlier-sorted lines of this attempt may
+                        # already be inserted/decremented in the open transaction,
+                        # and the saga's compensation runs on this same session —
+                        # raising dirty would let it commit a batch that never landed.
+                        await self._session.rollback()
+                        raise ReservationConflictError(sku, held_qty, qty)
+                    placed.append(current)  # earlier attempt's hold — don't deduct its stock twice
+                    continue
+                reservation = Reservation(
+                    sku=sku,
+                    qty=qty,
+                    order_id=order_id,
+                    expires_at=expires_at,
+                    status=ReservationStatus.HELD.value,
+                )
+                self._session.add(reservation)
+                try:
+                    await self._session.flush()
+                except IntegrityError as exc:
+                    await self._session.rollback()
+                    state = _sqlstate(exc)
+                    if state == _FOREIGN_KEY_VIOLATION:
+                        # No inventory row for this SKU, so there is nothing to hold.
+                        # Reported as insufficient stock, not a 500: to the caller an
+                        # unstocked SKU and a sold-out one are the same unavailability.
+                        log.info("reservation rejected: no inventory row for sku=%s", sku)
+                        return StockRejection(sku, qty)
+                    if state == _CHECK_VIOLATION:
+                        raise InvalidReservationError(
+                            f"invalid reservation for {sku!r}: quantity {qty} must be positive"
+                        ) from exc
+                    if state != _UNIQUE_VIOLATION:
+                        raise  # not ours to interpret — surface the real cause
+                    raced = True  # a duplicate landed between our read and this INSERT; reread and retry
+                    raced_sku = sku
+                    break
+                if await self.try_reserve_decrement(sku, qty) == 0:
+                    # The oversell guard refused this line: roll the WHOLE batch
+                    # back so no partial holds leak into the saga's compensation.
+                    await self._session.rollback()
+                    return StockRejection(sku, qty)
+                self._session.add(self._outbox_row(outbox_factory(sku, order_id, qty)))
+                placed.append(reservation)
+            if raced:
+                continue
             await self._session.commit()
-            await self._session.refresh(reservation)
-            return reservation
-        # Both attempts lost the uniqueness race with no duplicate to return: real
-        # churn on this order line. Raised, not returned as ``None`` — ``None``
-        # means *stock* refused the request (the oversell counter's meaning), and
+            for reservation in placed:
+                await self._session.refresh(reservation)
+            return placed
+        # Both attempts lost the uniqueness race: real churn on this order's
+        # lines. Raised, not returned as a StockRejection — a rejection means
+        # *stock* refused the request (the oversell counter's meaning), and
         # contention says nothing about stock levels.
-        raise ReservationContendedError(sku)
+        raise ReservationContendedError(raced_sku)
 
     async def release(self, reservation_id: uuid.UUID, outbox_factory: OutboxFactory) -> bool:
         """Return a held reservation's stock; ``False`` if it wasn't ``held`` (no-op replay).
@@ -433,33 +534,22 @@ class InventoryRepository:
         ).scalar_one()
         return int(committed)
 
-    async def _find_active(self, order_id: uuid.UUID, sku: str, qty: int) -> Reservation | None:
-        """This order line's existing non-released reservation, or ``None`` if it's gone.
+    async def _active_map(self, order_id: uuid.UUID, skus: list[str]) -> dict[str, Reservation]:
+        """This order's existing non-released reservations for ``skus``, as ``{sku: row}``.
 
-        Normally reached after the uniqueness guard rejected our INSERT, so a row
-        is there — ``held`` (in flight) or ``committed`` (payment already consumed
-        it). Both are legitimate retry answers; returning the committed one is what
-        stops a late retry from re-reserving and deducting the stock twice.
-
-        ``None`` is a real outcome, not an impossibility: compensation or the
-        reaper can release the conflicting row between the failed INSERT and this
-        lookup, which leaves the line free. The caller retries rather than crashing
-        on a missing row.
-
-        A quantity mismatch is *not* an out-of-stock condition — the caller changed
-        its mind about a line it already holds — so it raises
-        :class:`ReservationConflictError` rather than being reported as an oversell
-        block. The caller must release the stale hold first.
+        A row present here — ``held`` (in flight) or ``committed`` (payment already
+        consumed it) — is a legitimate retry answer; returning the committed one is
+        what stops a late retry from re-reserving and deducting the stock twice. A
+        SKU absent from the map is genuinely free: compensation or the reaper may
+        have released it since any earlier attempt.
         """
         stmt = select(Reservation).where(
             Reservation.order_id == order_id,
-            Reservation.sku == sku,
+            Reservation.sku.in_(skus),
             Reservation.status.in_(_ACTIVE_STATUSES),
         )
-        existing = (await self._session.execute(stmt)).scalar_one_or_none()
-        if existing is not None and existing.qty != qty:
-            raise ReservationConflictError(sku, existing.qty, qty)
-        return existing
+        rows = (await self._session.execute(stmt)).scalars().all()
+        return {row.sku: row for row in rows}
 
     async def _require_one(self, sql, params: dict, *, what: str) -> None:
         """Execute a stock mutation that must affect exactly one row, or fail loudly.

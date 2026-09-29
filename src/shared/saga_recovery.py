@@ -133,8 +133,8 @@ class _WorkerHolds:
     def __init__(self, inventory: InventoryService) -> None:
         self._inventory = inventory
 
-    async def reserve(self, sku: str, qty: int, order_id: uuid.UUID) -> uuid.UUID:
-        return (await self._inventory.reserve(sku, qty, order_id)).id
+    async def reserve_many(self, lines: list[tuple[str, int]], order_id: uuid.UUID) -> None:
+        await self._inventory.reserve_many(lines, order_id)
 
     async def release_for_order(self, order_id: uuid.UUID) -> int:
         return await self._inventory.release_for_order(order_id)

@@ -330,9 +330,11 @@ class CheckoutSaga:
             await self._log(order_id, "reserve", "started")
             try:
                 async with asyncio.timeout(self._step_timeout):
-                    for line in lines:
-                        # SKU mapping str(product.id).
-                        await self._holds.reserve(str(line.product_id), line.quantity, order_id)
+                    # One all-or-nothing batch, not a per-line loop: up to a
+                    # cart-full of sequential reserve transactions stretched the
+                    # step's latency, connection occupancy and lock exposure.
+                    # SKU mapping str(product.id) is the composition seam.
+                    await self._holds.reserve_many([(str(line.product_id), line.quantity) for line in lines], order_id)
             except TimeoutError as exc:
                 # The reserve may have landed without its answer returning —
                 # compensate whatever holds exist rather than leaking them.
