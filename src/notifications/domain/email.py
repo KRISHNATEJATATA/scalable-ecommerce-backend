@@ -17,3 +17,14 @@ class EmailType(StrEnum):
     """The kind of notification email (the ``sent_emails.email_type`` vocabulary)."""
 
     ORDER_CONFIRMATION = "order_confirmation"
+
+
+class EmailStatus(StrEnum):
+    """The durable send state of one ``sent_emails`` row.
+
+    ``PENDING`` = the intent is claimed but the send outcome is unknown (the
+    crash window lives here); ``SENT`` = the sender accepted the message.
+    """
+
+    PENDING = "pending"
+    SENT = "sent"

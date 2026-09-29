@@ -1,10 +1,11 @@
-"""Notification consumer tests: the send path, the backstops, and the routing.
+"""Notification consumer tests: the send path, the claim state, and the routing.
 
-Real Postgres via the session fixtures (never SQLite — ``record_sent`` leans on
-the UNIQUE(order_id, email_type) backstop); the sender is a recording test
+Real Postgres via the session fixtures (never SQLite — ``claim_send`` leans on
+the UNIQUE(order_id, email_type) guard); the sender is a recording test
 double behind the port (no real SMTP in tests).
 """
 
+import email as stdlib_email
 import uuid
 from decimal import Decimal
 
@@ -14,7 +15,9 @@ from src.events.models import OrderPlaced, OrderPlacedData, OrderPlacedLine, Use
 from src.notifications.adapters.db.models import EmailSuppression
 from src.notifications.adapters.db.repository import NotificationRepository
 from src.notifications.adapters.notification_worker import make_notification_handler
+from src.notifications.adapters.senders import SesSender, _build_mime
 from src.notifications.application.service import NotificationService, UnknownRecipientError
+from src.notifications.domain.email import EmailType
 from src.notifications.themes import EmailTheme
 
 # The packaged minimal theme (from_settings("") = the default): exercises the
@@ -50,18 +53,81 @@ class _RecordingSender:
         self.calls: list[dict[str, str | None]] = []
         self.fail = fail
 
-    async def send(self, *, to: str, subject: str, body: str, body_html: str | None = None) -> None:
+    async def send(
+        self, *, to: str, subject: str, body: str, body_html: str | None = None, message_id: str | None = None
+    ) -> None:
         if self.fail:
             raise RuntimeError("smtp down")
-        self.calls.append({"to": to, "subject": subject, "body": body, "body_html": body_html})
+        self.calls.append(
+            {"to": to, "subject": subject, "body": body, "body_html": body_html, "message_id": message_id}
+        )
 
 
-async def test_record_sent_replay_returns_false_via_the_unique_backstop(session):
+async def test_claim_send_semantics_via_the_unique_guard(session):
+    """claimed → takeover → already_sent: the durable send state's three answers,
+    with ONE persisted uuid4 message_id across every claim of the same row."""
     repo = NotificationRepository(session)
     order_id = uuid.uuid4()
-    assert await repo.record_sent(order_id, "order_confirmation", "buyer@example.com") is True
-    # The replay (a redelivery after the dedupe-TTL expiry) hits the UNIQUE backstop.
-    assert await repo.record_sent(order_id, "order_confirmation", "buyer@example.com") is False
+    email_type = EmailType.ORDER_CONFIRMATION.value
+    first = await repo.claim_send(order_id, email_type, "buyer@example.com")
+    assert first.outcome == "claimed"
+    # A redelivery over the un-marked claim (the crash window) takes it over —
+    # and reuses the PERSISTED id, not a fresh one.
+    takeover = await repo.claim_send(order_id, email_type, "buyer@example.com")
+    assert takeover.outcome == "takeover"
+    assert takeover.message_id == first.message_id
+    await repo.mark_sent(order_id, email_type, "buyer@example.com")
+    # A redelivery after the recorded send (dedupe-TTL expiry) never resends.
+    done = await repo.claim_send(order_id, email_type, "buyer@example.com")
+    assert done.outcome == "already_sent"
+    assert done.message_id == first.message_id
+    assert await repo.has_sent(order_id, email_type) is True
+
+
+async def test_claim_generates_distinct_uuid4_ids_per_send(session):
+    """Ids are plain uuid4 (codebase-consistent), unique per (order, type) claim."""
+    repo = NotificationRepository(session)
+    a = await repo.claim_send(uuid.uuid4(), "order_confirmation", "a@example.com")
+    b = await repo.claim_send(uuid.uuid4(), "order_confirmation", "b@example.com")
+    assert a.message_id != b.message_id
+    assert a.message_id.version == 4
+
+
+def test_build_mime_carries_the_deterministic_headers():
+    """Both headers ride the MIME: Message-ID (threading) + the SES-proof X- header."""
+    msg = _build_mime("shop@example.com", "buyer@example.com", "Subject", "text", "<p>html</p>", "abc-123")
+    assert msg["Message-ID"] == "<abc-123@example.com>"
+    assert msg["X-Notification-Message-Id"] == "abc-123"
+    assert msg["From"] == "shop@example.com"
+    assert msg["To"] == "buyer@example.com"
+    assert msg.get_content_type() == "multipart/alternative"  # text + html parts
+
+
+class _StubSesClient:
+    """Records send_raw_email kwargs (the aioboto3 client's async shape)."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def send_raw_email(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"MessageId": "ses-provider-id"}
+
+
+async def test_ses_sender_sends_raw_mime_with_the_deterministic_header():
+    """SES gets raw MIME (the structured API takes no custom headers); the
+    deterministic id is in the bytes, under the header SES preserves."""
+    stub = _StubSesClient()
+    sender = SesSender(stub, "shop@example.com")
+    await sender.send(to="buyer@example.com", subject="Sub", body="text", message_id="abc-123")
+    assert len(stub.calls) == 1
+    call = stub.calls[0]
+    assert call["Source"] == "shop@example.com"
+    assert call["Destinations"] == ["buyer@example.com"]
+    parsed = stdlib_email.message_from_bytes(call["RawMessage"]["Data"])
+    assert parsed["X-Notification-Message-Id"] == "abc-123"
+    assert parsed["Message-ID"] == "<abc-123@example.com>"
+    assert parsed["Subject"] == "Sub"
 
 
 async def test_order_placed_sends_the_confirmation_and_records_it(session):
@@ -82,6 +148,8 @@ async def test_order_placed_sends_the_confirmation_and_records_it(session):
     assert sender.calls[0]["body_html"] is not None
     assert str(order_id) in sender.calls[0]["body_html"]
     assert "<li>" in sender.calls[0]["body_html"]
+    # The send carries the claim's persisted uuid4 message identifier.
+    assert uuid.UUID(sender.calls[0]["message_id"]).version == 4
     assert await repo.has_sent(order_id, "order_confirmation") is True
 
 
@@ -125,9 +193,9 @@ async def test_unknown_recipient_raises_for_redrive(session):
     assert sender.calls == []
 
 
-async def test_send_failure_before_the_record_retries_cleanly(session):
-    """A transient send failure raises BEFORE anything is recorded, so the redrive
-    retries cleanly and the second attempt sends."""
+async def test_send_failure_after_the_claim_retries_cleanly(session):
+    """A transient send failure raises AFTER the claim: the row stays ``pending``
+    (not yet sent), so the redrive takes the claim over and the retry sends."""
     repo = NotificationRepository(session)
     failing = _RecordingSender(fail=True)
     service = NotificationService(repo, failing, _THEME)
@@ -142,6 +210,29 @@ async def test_send_failure_before_the_record_retries_cleanly(session):
     sender = _RecordingSender()
     await NotificationService(repo, sender, _THEME).handle_order_placed(event)
     assert len(sender.calls) == 1
+    assert await repo.has_sent(order_id, "order_confirmation") is True
+
+
+async def test_crash_window_takeover_resends_with_the_same_message_id(session):
+    """Crash AFTER the provider accepted but BEFORE the mark: the redelivery finds
+    the ``pending`` claim, takes it over, and resends with the SAME persisted
+    message_id — the at-least-once duplicate is now detectable and reconcilable."""
+    repo = NotificationRepository(session)
+    sender = _RecordingSender()
+    service = NotificationService(repo, sender, _THEME)
+    user_id, order_id = uuid.uuid4(), uuid.uuid4()
+    event = _order_placed_event(order_id, user_id)
+    await service.handle_user_created(_user_created_event(user_id, "buyer@example.com"))
+    email_type = EmailType.ORDER_CONFIRMATION.value
+    # Simulate the crashed attempt: claim + send, no mark (process died here).
+    claim = await repo.claim_send(order_id, email_type, "buyer@example.com")
+    assert claim.outcome == "claimed"
+    assert await repo.has_sent(order_id, email_type) is False
+    # The redelivery: takeover → resend with the identical persisted id.
+    await service.handle_order_placed(event)
+    assert len(sender.calls) == 1
+    assert sender.calls[0]["message_id"] == str(claim.message_id)
+    assert await repo.has_sent(order_id, email_type) is True
 
 
 async def test_handler_routes_user_created_and_order_placed(sessionmaker_factory):

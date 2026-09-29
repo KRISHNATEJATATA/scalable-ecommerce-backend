@@ -598,6 +598,45 @@ as `ops/prometheus/retention-prune-alerts.yaml` (`RetentionPruneBacklog`, `for: 
 fed by the `retention_backlog` postgres_exporter query. The per-table counter says
 what ran; the backlog says what it failed to.
 
+### 15. Notification sends stuck `pending` (the crash window, reconciled)
+
+Order-confirmation delivery is explicitly **at-least-once** : the
+notification consumer claims a `notifications.sent_emails` row as `pending`
+**before** sending and marks it `sent` after the provider accepts. A row that
+stays `pending` past the redrive window means the worker crashed between claim
+and mark — the send outcome is **unknown** (the provider may have accepted the
+message). This is the one place a duplicate or a lost confirmation can live.
+
+```sql
+-- Sends whose outcome is unknown. Healthy = zero rows older than the redrive
+-- window (visibility timeout × maxReceiveCount, minutes — 15m is generous).
+SELECT order_id, email_type, recipient, message_id, created_at
+FROM notifications.sent_emails
+WHERE status = 'pending' AND created_at < now() - interval '15 minutes';
+```
+
+Per row, decide from evidence, not guesswork:
+
+1. **Did it land?** Search the receiving side for the row's persisted
+   `message_id`: every attempt carries it in the `X-Notification-Message-Id`
+   MIME header, which SES preserves (SES **overwrites** the RFC `Message-ID`
+   even on raw sends, so never correlate on that in prod). Locally, search
+   Mailpit for the header value. Takeover resends reuse the SAME persisted id,
+   so every attempt of one confirmation correlates under one identifier.
+2. **It landed** ⇒ flip the row: `UPDATE notifications.sent_emails
+   SET status='sent', updated_at=now() WHERE order_id=... AND email_type=...;`
+   — no resend, done.
+3. **It never landed** ⇒ delete the row (`DELETE ... WHERE status='pending'
+   AND ...`); the next `OrderPlaced` redelivery/DLQ replay re-claims and
+   sends cleanly. (If the original message already DLQ'd, replay it per §4.)
+
+**Monitoring.** `notification_send_recovered_total` counts takeovers of
+claimed-but-unmarked sends — each increment is one crash-window recovery (a
+*possible* duplicate, same persisted message identifier). It should move only when a worker
+actually crashed; growth without a crash event means sends are failing after
+the claim — check the worker logs and the sender transport. A rising count of
+stuck `pending` rows from the query above is the same signal from the DB side.
+
 ## Post-incident
 - Re-enable automated backups on the promoted instance.
 - Rotate any exposed secrets (JWT keys, DB creds) via Secrets Manager.

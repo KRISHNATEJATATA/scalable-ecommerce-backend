@@ -6,8 +6,10 @@ Three small tables, no outbox (this module emits no events — it consumes them)
   (user_id → email). ``user_id`` is an id-value ref to ``identity.users``
   (no cross-module FK). The send path resolves the recipient here, so the
   consumer never reads identity/Keycloak directly.
-* ``sent_emails`` — the idempotency backstop: ``UNIQUE(order_id, email_type)``
-  written with the send flow, so a dedupe-TTL expiry can never double-send.
+* ``sent_emails`` — the durable send state: ``UNIQUE(order_id, email_type)``
+  claimed (``pending``) BEFORE the send and marked ``sent`` after, so every
+  send has a durable record and a crash mid-window is visible + reconcilable.
+  ``message_id`` is the uuid4 generated at claim time, reused by every resend.
 * ``email_suppressions`` — hard bounce / spam complaint ⇒ never send again.
   The check is live now; the writer is the SES bounce/complaint consumer,
   a future SES step (documented in docs/DEPLOYMENT.md).
@@ -15,10 +17,11 @@ Three small tables, no outbox (this module emits no events — it consumes them)
 
 import uuid
 
-from sqlalchemy import String, UniqueConstraint
+from sqlalchemy import CheckConstraint, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from src.notifications.domain.email import EmailStatus
 from src.shared.db.mixins import TimestampMixin
 
 SCHEMA = "notifications"
@@ -41,11 +44,12 @@ class Recipient(Base, TimestampMixin):
 
 
 class SentEmail(Base, TimestampMixin):
-    """One sent confirmation. ``UNIQUE(order_id, email_type)`` is the send backstop."""
+    """One confirmation's durable send state. ``UNIQUE(order_id, email_type)`` is the claim guard."""
 
     __tablename__ = "sent_emails"
     __table_args__ = (
         UniqueConstraint("order_id", "email_type", name="uq_sent_emails_order_id_email_type"),
+        CheckConstraint("status IN ('pending', 'sent')", name="ck_sent_emails_status"),
         {"schema": SCHEMA},
     )
 
@@ -55,6 +59,9 @@ class SentEmail(Base, TimestampMixin):
     )  # id-value ref to orders.orders (no cross-module FK)
     email_type: Mapped[str] = mapped_column(String(64), nullable=False)
     recipient: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default=EmailStatus.PENDING.value)
+    # NULL only for rows that predate the claim state (they were all sent).
+    message_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
 
 class EmailSuppression(Base, TimestampMixin):

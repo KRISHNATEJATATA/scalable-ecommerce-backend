@@ -29,6 +29,30 @@ _session = aioboto3.Session()
 _SMTP_TIMEOUT_SECONDS = 10
 
 
+def _build_mime(
+    from_address: str, to: str, subject: str, body: str, body_html: str | None, message_id: str | None
+) -> EmailMessage:
+    """The MIME message both transports send — identical bytes on a takeover
+    resend. The persisted id rides in TWO headers:
+    ``Message-ID`` (RFC 5322 threading; honored by SMTP receivers) and
+    ``X-Notification-Message-Id`` — the correlation key that survives SES,
+    which overwrites ``Message-ID`` even on raw sends but preserves custom
+    ``X-`` headers."""
+    message = EmailMessage()
+    message["From"] = from_address
+    message["To"] = to
+    message["Subject"] = subject
+    if message_id is not None:
+        domain = from_address.rpartition("@")[2] or "localhost"
+        message["Message-ID"] = f"<{message_id}@{domain}>"
+        message["X-Notification-Message-Id"] = message_id
+    message.set_content(body)
+    if body_html is not None:
+        # multipart/alternative: text-first clients get the plain part.
+        message.add_alternative(body_html, subtype="html")
+    return message
+
+
 class SmtpSender(NotificationSenderPort):
     """SMTP transport (Mailpit locally; any SMTP host via ``NOTIFICATION_SMTP_HOST``)."""
 
@@ -42,36 +66,34 @@ class SmtpSender(NotificationSenderPort):
         with smtplib.SMTP(self._host, self._port, timeout=_SMTP_TIMEOUT_SECONDS) as smtp:
             smtp.send_message(message)
 
-    async def send(self, *, to: str, subject: str, body: str, body_html: str | None = None) -> None:
-        message = EmailMessage()
-        message["From"] = self._from
-        message["To"] = to
-        message["Subject"] = subject
-        message.set_content(body)
-        if body_html is not None:
-            # multipart/alternative: text-first clients get the plain part.
-            message.add_alternative(body_html, subtype="html")
-        await run_in_threadpool(self._send_sync, message)
+    async def send(
+        self, *, to: str, subject: str, body: str, body_html: str | None = None, message_id: str | None = None
+    ) -> None:
+        await run_in_threadpool(self._send_sync, _build_mime(self._from, to, subject, body, body_html, message_id))
 
 
 class SesSender(NotificationSenderPort):
-    """AWS SES transport (prod). The entered aioboto3 client is the task-role caller."""
+    """AWS SES transport (prod). The entered aioboto3 client is the task-role caller.
+
+    Sends RAW MIME, not ``send_email``: the structured API accepts no custom
+    headers at all, so only a raw message carries the persisted id. Note
+    SES **overwrites the ``Message-ID`` header even on raw sends** — the
+    reconciliation key is the preserved ``X-Notification-Message-Id`` header
+    (ADR 0024).
+    """
 
     def __init__(self, client: Any, from_address: str) -> None:
         self._client = client
         self._from = from_address
 
-    async def send(self, *, to: str, subject: str, body: str, body_html: str | None = None) -> None:
-        body_block: dict[str, dict[str, str]] = {"Text": {"Data": body, "Charset": "UTF-8"}}
-        if body_html is not None:
-            body_block["Html"] = {"Data": body_html, "Charset": "UTF-8"}
-        await self._client.send_email(
+    async def send(
+        self, *, to: str, subject: str, body: str, body_html: str | None = None, message_id: str | None = None
+    ) -> None:
+        message = _build_mime(self._from, to, subject, body, body_html, message_id)
+        await self._client.send_raw_email(
             Source=self._from,
-            Destination={"ToAddresses": [to]},
-            Message={
-                "Subject": {"Data": subject, "Charset": "UTF-8"},
-                "Body": body_block,
-            },
+            Destinations=[to],
+            RawMessage={"Data": message.as_bytes()},
         )
 
 

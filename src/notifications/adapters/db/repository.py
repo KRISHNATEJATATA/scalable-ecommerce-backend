@@ -1,22 +1,24 @@
 """Notifications repository — implements the port over this module's schema.
 
 All queries are local to the ``notifications`` schema (id-value refs to other
-modules, never cross-schema joins). ``record_sent`` is the durable backstop: a
-concurrent duplicate hits the UNIQUE(order_id, email_type), rolls back, and is
-reported as "already sent" — never mistranslated.
+modules, never cross-schema joins). ``claim_send`` is the durable claim: the
+``pending`` row commits BEFORE the send; a concurrent or repeated
+claim hits UNIQUE(order_id, email_type), rolls back, and is resolved by the
+recorded status — never mistranslated (any other integrity failure re-raises).
 """
 
 from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.notifications.adapters.db.models import EmailSuppression, Recipient, SentEmail
-from src.notifications.ports.repository import NotificationRepositoryPort
+from src.notifications.domain.email import EmailStatus
+from src.notifications.ports.repository import ClaimOutcome, ClaimResult, NotificationRepositoryPort
 
 # SQLSTATEs, not constraint names: names drift with migrations, these are standard.
 _UNIQUE_VIOLATION = "23505"
@@ -58,20 +60,52 @@ class NotificationRepository(NotificationRepositoryPort):
         return (await self._session.execute(stmt)).scalar_one_or_none() is not None
 
     async def has_sent(self, order_id: uuid.UUID, email_type: str) -> bool:
-        stmt = select(SentEmail.id).where(SentEmail.order_id == order_id, SentEmail.email_type == email_type).limit(1)
+        stmt = (
+            select(SentEmail.id)
+            .where(
+                SentEmail.order_id == order_id,
+                SentEmail.email_type == email_type,
+                SentEmail.status == EmailStatus.SENT.value,
+            )
+            .limit(1)
+        )
         return (await self._session.execute(stmt)).scalar_one_or_none() is not None
 
-    async def record_sent(self, order_id: uuid.UUID, email_type: str, recipient: str) -> bool:
-        """Record one sent confirmation; ``False`` when the UNIQUE backstop says it exists.
-
-        Any other integrity failure is re-raised, never mistranslated into "already sent".
+    async def claim_send(self, order_id: uuid.UUID, email_type: str, recipient: str) -> ClaimResult:
+        """Insert the ``pending`` claim (fresh uuid4 message_id) and commit BEFORE
+        the send; on the UNIQUE backstop, resolve from the recorded status AND
+        reuse the persisted message_id (``sent`` ⇒ never resend; ``pending`` ⇒
+        the prior attempt crashed mid-window — take it over with the same id).
         """
-        self._session.add(SentEmail(order_id=order_id, email_type=email_type, recipient=recipient))
+        message_id = uuid.uuid4()
+        self._session.add(
+            SentEmail(
+                order_id=order_id,
+                email_type=email_type,
+                recipient=recipient,
+                status=EmailStatus.PENDING.value,
+                message_id=message_id,
+            )
+        )
         try:
             await self._session.commit()
         except IntegrityError as exc:
             await self._session.rollback()
             if _sqlstate(exc) != _UNIQUE_VIOLATION:
                 raise
-            return False
-        return True
+            stmt = select(SentEmail.status, SentEmail.message_id).where(
+                SentEmail.order_id == order_id, SentEmail.email_type == email_type
+            )
+            status, persisted_id = (await self._session.execute(stmt)).one()
+            outcome: ClaimOutcome = "already_sent" if status == EmailStatus.SENT.value else "takeover"
+            return ClaimResult(outcome, persisted_id)
+        return ClaimResult("claimed", message_id)
+
+    async def mark_sent(self, order_id: uuid.UUID, email_type: str, recipient: str) -> None:
+        """Flip the claimed row to ``sent`` (and the recipient actually used)."""
+        await self._session.execute(
+            update(SentEmail)
+            .where(SentEmail.order_id == order_id, SentEmail.email_type == email_type)
+            .values(status=EmailStatus.SENT.value, recipient=recipient, updated_at=func.now())
+        )
+        await self._session.commit()

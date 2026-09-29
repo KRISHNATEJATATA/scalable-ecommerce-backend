@@ -10,14 +10,19 @@ and hands each validated event to the application service:
   own ``recipients`` table — the bus-delivered materialization that keeps the
   send path free of any cross-module identity read.
 * ``OrderPlaced`` renders + sends the confirmation via the sender port, with
-  the suppression-list and ``sent_emails`` backstops (see
+  the suppression-list check and the durable ``sent_emails`` claim state (see
   :class:`~src.notifications.application.service.NotificationService`).
 
-Idempotent twice over: ``SqsConsumer`` dedupes on ``event_id`` **within this
-subscription** (``event:notifications:{event_id}``), and the service's DB
-backstop (``UNIQUE(order_id, email_type)``) means a redelivery after the
-dedupe-TTL expiry can never double-send. A handler that raises leaves the
-message for SQS redrive → DLQ (replay per ``docs/RUNBOOK.md``).
+Delivery is explicitly AT-LEAST-ONCE, never duplicate-proof:
+``SqsConsumer`` dedupes on ``event_id`` **within this subscription**
+(``event:notifications:{event_id}``), and the service claims the
+``UNIQUE(order_id, email_type)`` row ``pending`` BEFORE sending — so a
+redelivery after the dedupe-TTL expiry or after a send that was recorded acks
+without resending, while a crash between the send and the mark is taken over
+and resent ONCE with the same persisted message identifier (counted via
+``notification_send_recovered_total``; reconciliation in RUNBOOK §15). A
+handler that raises leaves the message for SQS redrive → DLQ (replay per
+``docs/RUNBOOK.md``).
 
 Run: ``python -m src.notifications.adapters.notification_worker``.
 """

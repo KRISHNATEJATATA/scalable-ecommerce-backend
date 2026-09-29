@@ -7,19 +7,27 @@ materialized from ``UserCreated`` events, which carry ``user_id`` + ``email`` �
 so the send path never reads identity/Keycloak directly (no cross-module
 import; the bus is the delivery mechanism).
 
-``OrderPlaced`` send path:
+``OrderPlaced`` send path (explicitly AT-LEAST-ONCE, never
+described as duplicate-proof):
 1. resolve the recipient — unknown ⇒ raise (the message is left for SQS
    redrive → DLQ after ``maxReceiveCount``: never silently dropped; once the
    user's first authenticated request JITs them, ``UserCreated`` materializes
    the recipient and the redelivery sends);
 2. suppression list ⇒ never send (counted, ack);
-3. the ``sent_emails`` backstop ⇒ already sent ⇒ ack (the check that keeps a
-   dedupe-TTL expiry from ever double-sending);
-4. render + send via the sender port, then record the sent row — a transient
-   send failure raises BEFORE anything is recorded, so the redrive retries
-   cleanly; the crash window between the send and the record can double-send
-   once (at-least-once email delivery — email APIs are not transactional), the
-   accepted residual.
+3. CLAIM the durable send state: insert the ``sent_emails`` row ``pending``
+   (generating its uuid4 message identifier) and commit BEFORE any send — a
+   claimed ``sent`` row ⇒ ack (the dedupe-TTL-expiry backstop); a claimed
+   ``pending`` row ⇒ a prior attempt crashed mid-window ⇒ TAKE OVER: resend
+   with the same persisted identifier and count it
+   (``notification_send_recovered_total``);
+4. render + send via the sender port, then mark the row ``sent``.
+
+The crash window between the send and the mark can still double-send once —
+email APIs are not transactional — but every send now has durable state, every
+duplicate carries the SAME persisted identifier (the
+``X-Notification-Message-Id`` MIME header, reconcilable downstream — SES
+overwrites the RFC ``Message-ID``), and stuck ``pending`` rows are the
+reconciliation query (RUNBOOK §15).
 """
 
 from __future__ import annotations
@@ -28,7 +36,11 @@ import logging
 import uuid
 from typing import Any
 
-from src.notifications.application.metrics import notification_sent_total, notification_suppressed_total
+from src.notifications.application.metrics import (
+    notification_send_recovered_total,
+    notification_sent_total,
+    notification_suppressed_total,
+)
 from src.notifications.domain.email import EmailType
 from src.notifications.ports.repository import NotificationRepositoryPort
 from src.notifications.ports.sender import NotificationSenderPort
@@ -61,18 +73,34 @@ class NotificationService:
         await self._repo.upsert_recipient(uuid.UUID(str(data["user_id"])), str(data["email"]))
 
     async def handle_order_placed(self, event: dict[str, Any]) -> None:
-        """Send the order confirmation for one ``OrderPlaced`` (idempotent, suppression-aware)."""
+        """Send the order confirmation for one ``OrderPlaced`` (at-least-once, suppression-aware).
+
+        The durable claim happens BEFORE the send (ADR 0024): a redelivery after
+        a recorded send acks; a redelivery over a crashed attempt takes the claim
+        over and resends with the same persisted message identifier.
+        """
         data = event["data"]
         order_id = uuid.UUID(str(data["order_id"]))
         email = await self._repo.get_recipient_email(uuid.UUID(str(data["user_id"])))
         if email is None:
-            raise UnknownRecipientError(f"no email known for order {order_id}'s user; leaving for redrive → DLQ")
+            raise UnknownRecipientError(f"no address known for order {order_id}'s user; leaving for redrive → DLQ")
         if await self._repo.is_suppressed(email):
             notification_suppressed_total.labels(reason="suppressed").inc()
             return
-        if await self._repo.has_sent(order_id, EmailType.ORDER_CONFIRMATION.value):
+        email_type = EmailType.ORDER_CONFIRMATION.value
+        claim = await self._repo.claim_send(order_id, email_type, email)
+        if claim.outcome == "already_sent":
             notification_suppressed_total.labels(reason="already_sent").inc()
             return
+        # The ONE id this confirmation ever carries: generated (uuid4) at the
+        # first claim, persisted on the row, reused by every takeover resend.
+        message_id = claim.message_id
+        if claim.outcome == "takeover":
+            # A prior attempt claimed but never marked — its send outcome is
+            # unknown. Resend with the SAME persisted identifier (the
+            # at-least-once residual, now detectable) and count the recovery.
+            notification_send_recovered_total.labels(email_type=email_type).inc()
+            log.warning("taking over a claimed-but-unmarked send for order %s (message_id=%s)", order_id, message_id)
         items = [
             # The label is the checkout-time product snapshot's name — the mail
             # shows what the user bought, not the opaque id. Events written
@@ -85,8 +113,8 @@ class NotificationService:
         subject, body, body_html = self._theme.render_order_confirmation(
             str(data["order_id"]), str(data["total"]), items_text, items_html
         )
-        await self._sender.send(to=email, subject=subject, body=body, body_html=body_html)
-        if not await self._repo.record_sent(order_id, EmailType.ORDER_CONFIRMATION.value, email):
-            # A concurrent worker recorded it first (the crash window) — sent either way.
-            log.debug("sent_emails backstop hit for order %s (concurrent send); tolerated", order_id)
-        notification_sent_total.labels(email_type=EmailType.ORDER_CONFIRMATION.value).inc()
+        await self._sender.send(to=email, subject=subject, body=body, body_html=body_html, message_id=str(message_id))
+        # A send failure raises BEFORE the mark — the row stays ``pending`` and
+        # the redrive takes it over above, so the retry sends cleanly.
+        await self._repo.mark_sent(order_id, email_type, email)
+        notification_sent_total.labels(email_type=email_type).inc()

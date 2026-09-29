@@ -90,15 +90,26 @@ materialized bus-side from `UserCreated` events into `notifications.recipients`
 (the event carries `user_id` + `email`), so it never reads identity/Keycloak —
 a user created before the consumer first ran has no recipient until their next
 JIT (first authenticated request); until then their first order's confirmation
-is left for redrive → DLQ rather than silently dropped. Double-sends are
-blocked twice over: the Valkey dedupe (per-subscription, on `event_id`) and the
-`UNIQUE(order_id, email_type)` backstop in `notifications.sent_emails`. The
-sender is SMTP locally (Mailpit) and **AWS SES via `aioboto3`** in prod — the
-ECS task role supplies credentials, no keys in code. SES bounce/complaint
-handling (an `email_suppressions` table maintained by a second consumer) is a
-future SES step — the suppression check is live now. Deliverability (SES domain
-verification + SPF/DKIM/DMARC) is DNS-level: it belongs in the IaC ticket, not
-app code.
+is left for redrive → DLQ rather than silently dropped. Delivery is explicitly
+**at-least-once** — never described as duplicate-proof: the Valkey
+dedupe (per-subscription, on `event_id`) suppresses plain redeliveries, and the
+consumer claims the `UNIQUE(order_id, email_type)` row in
+`notifications.sent_emails` as `pending` **before** sending, marking it `sent`
+after the provider accepts. A redelivery over a recorded `sent` acks without
+resending; a crash between the provider's accept and the mark is taken over and
+resent once with the **same persisted message identifier** (a uuid4 generated
+at the first claim and stored on the row, carried in the
+`X-Notification-Message-Id` MIME header — SES preserves it, while it
+overwrites the RFC `Message-ID`), counted
+by `notification_send_recovered_total`.
+Stuck `pending` rows are the reconciliation query — RUNBOOK §15. The
+sender is SMTP locally (Mailpit) and **AWS SES via `aioboto3`** in prod — raw
+MIME (`SendRawEmail`), because only a raw message carries the custom
+header; the ECS task role supplies credentials, no keys in code. SES
+bounce/complaint handling (an `email_suppressions` table maintained by a second
+consumer) is a future SES step — the suppression check is live now.
+Deliverability (SES domain verification + SPF/DKIM/DMARC) is DNS-level: it
+belongs in the IaC ticket, not app code.
 
 **Topic ARNs.** The per-event-type SNS topics must be provisioned out-of-band
 (once IaC exists, Terraform owns them), so give the relay task
