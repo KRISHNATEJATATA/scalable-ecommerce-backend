@@ -437,6 +437,7 @@ services:
       - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./ops/prometheus/inventory-reaper-alerts.yaml:/etc/prometheus/inventory-reaper-alerts.yaml:ro
       - ./ops/prometheus/retention-prune-alerts.yaml:/etc/prometheus/retention-prune-alerts.yaml:ro
+      - ./ops/prometheus/db-connection-budget-alerts.yaml:/etc/prometheus/db-connection-budget-alerts.yaml:ro
       - ./ops/prometheus/postgres-exporter-queries.yaml:/etc/prometheus/postgres-exporter-queries.yaml:ro
 
   # Same profile, second half: the DB-side exporter whose queries (expired-hold

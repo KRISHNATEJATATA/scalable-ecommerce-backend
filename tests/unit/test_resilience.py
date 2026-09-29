@@ -46,12 +46,26 @@ _SETTINGS = dict(
 # --- JWKS unknown-kid guards (unchanged contracts) -----------------------------
 
 
+class _FakeJWK:
+    """Stand-in for ``jwt.PyJWK`` — real cached entries expose ``.key_id``, not a dict."""
+
+    def __init__(self, kid: str) -> None:
+        self.key_id = kid
+
+
+class _FakeJWKSet:
+    """Stand-in for ``jwt.PyJWKSet`` — real ``JWKSetCache.get()`` returns this, not a dict."""
+
+    def __init__(self, kids: list[str]) -> None:
+        self.keys = [_FakeJWK(k) for k in kids]
+
+
 class _CountingJWKClient:
     """PyJWKClient stand-in that reports its cached JWK set and counts fetches."""
 
     def __init__(self, cached_kids: list[str]) -> None:
         self.fetches = 0
-        self._cached = {"keys": [{"kid": k} for k in cached_kids]}
+        self._cached = _FakeJWKSet(cached_kids)
         client = self
 
         class _Cache:

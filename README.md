@@ -112,7 +112,11 @@ SLO claim — and the nightly CI job runs it next to `checkout.js`.
 
 ### Multi-replica proof (concurrency under real scale-out)
 
-`make compose-up-multi` runs the **same compose file** with `--scale app=2
+`make compose-up-multi` runs the **same compose file** (layered with
+`docker-compose.multi-loadtest.override.yml`, which raises the per-user
+checkout rate limit so the deliberate one-shared-user burst below doesn't
+drown the proof in unrelated `429`s — `make compose-up`/`make run` are
+unaffected and still enforce the real default limit) with `--scale app=2
 --scale relay=2 --scale notification-consumer=2` — the documented one-command
 multi-replica topology (port ranges in `docker-compose.yml` keep host mappings
 collision-free). Then `make multi-loadtest` runs

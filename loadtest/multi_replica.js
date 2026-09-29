@@ -66,8 +66,16 @@ const proofFailures = new Counter('proof_failures');
 export const options = {
   scenarios: {
     proof: {
+      // vus MUST stay 1: the whole stack shares ONE user/ONE cart, and each
+      // iteration's own two racers (http.batch()) are the only intended
+      // contention. With vus>1, DIFFERENT iterations' cart-add+checkout
+      // sequences (different Idempotency-Keys) interleave on that same
+      // shared cart, so one iteration's checkout can legitimately empty the
+      // cart out from under a sibling iteration's — a genuine "cart is
+      // empty" 409 that measures cross-iteration harness contention, not
+      // the one-order-per-key invariant this proof exists to check.
       executor: 'shared-iterations',
-      vus: 4,
+      vus: 1,
       iterations: RACES,
       maxDuration: '5m',
     },

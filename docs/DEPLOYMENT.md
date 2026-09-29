@@ -151,6 +151,30 @@ plus four workers is ~308, which fits but leaves little headroom: past that, eit
 `DB_POOL_SIZE`/`WEB_CONCURRENCY` or front RDS with **RDS Proxy / PgBouncer**
 rather than raising `max_connections`.
 
+**The budget is the autoscaling ceiling.** CPU-based target tracking will happily add API
+tasks past the point where Postgres refuses connections — and the refusal hits readiness
+probes too, so the failure mode is a fleet-wide 503, not slow requests. Derive the API
+service's `max_capacity` from the budget, not from a guess:
+
+```
+max_api_tasks = floor((max_connections - worker_budget - probe_headroom)
+                      / ((DB_POOL_SIZE + DB_MAX_OVERFLOW) x WEB_CONCURRENCY))
+              = floor((340 - 8 - 20) / (15 x 2)) = 10          # documented example
+```
+
+(`worker_budget` counts every worker task at its small pool; `probe_headroom` ~20 covers
+in-flight `/v1/ready` probes plus RDS's own reserved connections.) Pin the ECS service's
+autoscaling `max_capacity` to that number once Terraform lands; until then it is a manual
+ceiling — **do not raise the API task count past it**, scale up (bigger tasks / RDS Proxy)
+instead of out.
+
+**Watch both layers** (`ops/prometheus/db-connection-budget-alerts.yaml`, runbook §16):
+server-wide `db_connections_connections_in_use / db_connections_max_connections` from the
+postgres_exporter (fires even when every app process is down — 80% means the ceiling is
+*reached*), and per-pool `db_pool_connections_{capacity,checked_out,open,overflow}` scraped
+from each process (`pool="api"|"worker"|"probe"`), which names the connection holder and
+catches one task saturating its own pool before the server limit matters.
+
 **Health checks.** Point the ALB at `/v1/ready` and set its timeout **above**
 `READINESS_PROBE_TIMEOUT_SECONDS` (default 2s per dependency). Only Postgres gates
 readiness — a Valkey outage returns `200 {"status": "degraded"}` because the app falls

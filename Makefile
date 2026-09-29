@@ -79,7 +79,7 @@ compose-up: ## Start local backing services (Postgres, Valkey, LocalStack S3/SNS
 	docker compose up -d
 
 compose-up-multi: ## Start the stack with 2 replicas each of app, relay and notification-consumer (the multi-replica concurrency proof — one documented command)
-	docker compose up -d --scale app=2 --scale relay=2 --scale notification-consumer=2
+	docker compose -f docker-compose.yml -f docker-compose.multi-loadtest.override.yml up -d --scale app=2 --scale relay=2 --scale notification-consumer=2
 
 seed: ## Seed the demo state into the running stack (idempotent: 5 users — incl. the suspended demo, 11 products, images, stock)
 	docker compose run --rm catalog-seed

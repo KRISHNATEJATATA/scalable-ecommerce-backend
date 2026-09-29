@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async
 from sqlalchemy.sql import text
 
 from src.shared.config.setting import AppSettings
+from src.shared.observability.db_pool_metrics import register_pool_metrics
 
 
 def create_engine(settings: AppSettings, *, worker: bool = False) -> AsyncEngine:
@@ -18,13 +19,20 @@ def create_engine(settings: AppSettings, *, worker: bool = False) -> AsyncEngine
     (``5 + 10`` per process) would reserve ~15 connections each for nothing —
     and every process's pool counts against the same RDS ``max_connections``.
     See the connection-budget formula in ``docs/DEPLOYMENT.md``.
+
+    The pool's status is registered for scrape-time metrics (one process holds
+    at most one engine of each kind, so the ``api``/``worker`` label is unique).
     """
-    return create_async_engine(
+    pool_size = settings.db_worker_pool_size if worker else settings.db_pool_size
+    max_overflow = settings.db_worker_max_overflow if worker else settings.db_max_overflow
+    engine = create_async_engine(
         str(settings.database_url),
-        pool_size=settings.db_worker_pool_size if worker else settings.db_pool_size,
-        max_overflow=settings.db_worker_max_overflow if worker else settings.db_max_overflow,
+        pool_size=pool_size,
+        max_overflow=max_overflow,
         pool_pre_ping=settings.db_pool_pre_ping,
     )
+    register_pool_metrics("worker" if worker else "api", engine, capacity=pool_size + max_overflow)
+    return engine
 
 
 def create_probe_engine(settings: AppSettings) -> AsyncEngine:
@@ -43,13 +51,15 @@ def create_probe_engine(settings: AppSettings) -> AsyncEngine:
     deadline), and ``pool_pre_ping`` keeps a long-idle probe connection from
     reporting a stale socket as a dead database.
     """
-    return create_async_engine(
+    engine = create_async_engine(
         str(settings.database_url),
         pool_size=1,
         max_overflow=0,
         pool_timeout=settings.readiness_probe_timeout_seconds,
         pool_pre_ping=True,
     )
+    register_pool_metrics("probe", engine, capacity=1)
+    return engine
 
 
 def create_sessionmaker(engine: AsyncEngine) -> async_sessionmaker:

@@ -348,7 +348,22 @@ class CheckoutSaga:
             # not after it. The canceller owns the release in that case — this
             # branch only refuses to charge a dead order.
             live = await self._orders.get_order(order_id)
-            if live is None or live.status != OrderStatus.PENDING:
+            if live is None:
+                log.error("checkout order %s was cancelled mid-drive before charging", order_id)
+                raise OrderStateConflictError("the order was cancelled while checking out; start a new checkout")
+            if live.status == OrderStatus.PAID:
+                # Not a cancel: the create-race loser resuming this same PENDING
+                # order (or vice versa) already drove it to PAID concurrently —
+                # reserve/commit are idempotent per order, so both frames reaching
+                # here is expected, not a crash. Replay the final state exactly
+                # like ``_replay_or_resume``'s PAID branch, rather than refusing a
+                # checkout that in fact succeeded.
+                log.info("checkout order %s settled concurrently before charging; reading final state", order_id)
+                response = _response(live)
+                await self._remember(user_id, idempotency_key, body_hash, 201, response)
+                await self._clear_basket_if_replay_mop_up(user_id, response.items)
+                return response, False
+            if live.status != OrderStatus.PENDING:
                 log.error("checkout order %s was cancelled mid-drive before charging", order_id)
                 raise OrderStateConflictError("the order was cancelled while checking out; start a new checkout")
             try:

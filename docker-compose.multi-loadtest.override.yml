@@ -1,0 +1,19 @@
+# Local-only override for the multi-replica concurrency proof (`make multi-loadtest`).
+#
+# loadtest/multi_replica.js deliberately races ONE shared user (demo.consumer)
+# through up to K6_RACES*2 (default 80) concurrent checkout POSTs within a few
+# seconds, to prove the (user_id, idempotency_key) UNIQUE constraint arbitrates
+# correctly across replicas. That burst always exceeds the default per-user
+# checkout rate limit (RATE_LIMIT_CHECKOUT_CAPACITY=30, refilling 30/60s) — a
+# real anti-abuse control we don't want to weaken by default — which drowns the
+# correctness proof in unrelated 429s.
+#
+# `make compose-up-multi` layers this file on top of docker-compose.yml (via
+# `-f`) so ONLY the multi-replica local workflow gets a bigger bucket; `make
+# compose-up` / `make run` are untouched and still exercise the real default
+# limit.
+services:
+  app:
+    environment:
+      RATE_LIMIT_CHECKOUT_CAPACITY: "1000"
+      RATE_LIMIT_CHECKOUT_REFILL: "1000"

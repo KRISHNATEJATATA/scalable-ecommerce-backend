@@ -655,6 +655,51 @@ actually crashed; growth without a crash event means sends are failing after
 the claim — check the worker logs and the sender transport. A rising count of
 stuck `pending` rows from the query above is the same signal from the DB side.
 
+### 16. DB connection budget exhaustion (autoscaling outran Postgres)
+
+Every process builds its own pool against one shared `max_connections`
+(budget formula and the derived `max_api_tasks` ceiling: `docs/DEPLOYMENT.md`,
+"Connection budget"). Exhaustion is not slow requests — Postgres answers
+`FATAL: too many connections`, which readiness probes hit too, so the failure
+mode is the whole fleet 503ing at once.
+
+**Alerts** (`ops/prometheus/db-connection-budget-alerts.yaml`):
+
+| Signal | Means | Do |
+|---|---|---|
+| `DatabaseConnectionsNearLimit` (>80% for 10m) | the documented task ceiling is **reached** | do not raise the API task count; shrink `DB_POOL_SIZE`/`WEB_CONCURRENCY` or front RDS with RDS Proxy/PgBouncer — then re-derive the ceiling |
+| `DatabaseConnectionsExhaustionImminent` (>95% for 2m) | the next checkout fails; probes fail with it | scale the API service **in** immediately, then find the holder below |
+| `DbPoolSaturated` (one pool >90% checked out for 5m) | that process's pool is the bottleneck (or leaking checkouts), server may still have headroom | inspect the named `pool`/`instance`; a saturated `probe` pool means Postgres itself is hung, not the app |
+
+**Find the holder from the DB side** — this keeps working when app metrics are
+gone, same doctrine as the reaper backlog:
+
+```sql
+-- Connections by process kind. The app sets no application_name, so group by
+-- client address: one row per ECS task tells you who scaled out of budget.
+SELECT client_addr, usename, state, count(*)
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+GROUP BY client_addr, usename, state
+ORDER BY count DESC;
+```
+
+Per-pool gauges (`db_pool_connections_checked_out` / `db_pool_connections_capacity`,
+label `pool="api"|"worker"|"probe"`) say whether a *single* task saturated its
+own pool (look for a checkout leak: `checked_out` climbing without request
+load) or whether every task is uniformly hot (genuine capacity problem — scale
+in, then fix the ceiling). Sustained non-zero `db_pool_connections_overflow`
+(connections open beyond `pool_size`) means the base pool is undersized for
+normal load — raise `DB_POOL_SIZE` rather than `DB_MAX_OVERFLOW`.
+
+Caveat on the `api`/`probe` series: the API target is served by
+`WEB_CONCURRENCY` gunicorn workers with **independent pools and registries**, so
+each scrape samples one of them. `DbPoolSaturated` uses a 5m max so a single
+saturated worker still fires, but don't read fine-grained trends into one
+worker — the server-wide `db_connections_*` ratio is the authoritative signal,
+and per-worker precision would need prometheus_client multiprocess mode (not
+worth it at this scale).
+
 ## Post-incident
 - Re-enable automated backups on the promoted instance.
 - Rotate any exposed secrets (JWT keys, DB creds) via Secrets Manager.

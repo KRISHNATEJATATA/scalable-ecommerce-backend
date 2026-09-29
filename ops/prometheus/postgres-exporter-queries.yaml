@@ -21,6 +21,26 @@ inventory_reservations:
         usage: "GAUGE"
         description: "Reservations past expires_at still held — the reaper's backlog. Healthy = near zero."
 
+db_connections:
+  # Server-wide connection pressure — the total every process's pool draws
+  # against (budget formula in docs/DEPLOYMENT.md). Sourced from Postgres
+  # itself so it keeps answering when every app process is down, same doctrine
+  # as the reaper backlog above. This is the signal autoscaling's API-task
+  # ceiling is judged against.
+  # Alert rules on it: ops/prometheus/db-connection-budget-alerts.yaml. Runbook: docs/RUNBOOK.md §16.
+  query: >-
+    SELECT
+      (SELECT count(*) FROM pg_stat_activity) AS connections_in_use,
+      (SELECT setting::float8 FROM pg_settings WHERE name = 'max_connections') AS max_connections
+  master: true
+  metrics:
+    - connections_in_use:
+        usage: "GAUGE"
+        description: "Open connections to this Postgres (all roles, all databases)."
+    - max_connections:
+        usage: "GAUGE"
+        description: "The server's max_connections setting — the hard ceiling of the connection budget."
+
 retention_backlog:
   # The retention prune's *liveness* signal, same doctrine as the reaper's: a
   # prune that never runs deletes nothing, so its counter stays silent — the

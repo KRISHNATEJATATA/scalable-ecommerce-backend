@@ -1,0 +1,68 @@
+# Prometheus alerting rules for the DB connection budget — add to `rule_files:`.
+#
+# Every ECS process builds its own pool against one shared RDS max_connections
+# (formula in docs/DEPLOYMENT.md), so two layers are watched:
+#   * server-wide — pg_stat_activity vs max_connections, sourced from the
+#     postgres_exporter query (`db_connections` in postgres-exporter-queries.yaml)
+#     so it fires even when every app process is down. This is the autoscaling
+#     signal: at 80% the documented API-task ceiling is *reached*, not approached.
+#   * per-pool — the app's own db_pool_connections_* gauges (scrape-time, see
+#     src/shared/observability/db_pool_metrics.py), which say *which* process
+#     kind is holding the connections and whether a single task is saturating
+#     its own pool before the server limit matters.
+# Runbook: docs/RUNBOOK.md §16.
+
+groups:
+  - name: db-connection-budget
+    rules:
+      - alert: DatabaseConnectionsNearLimit
+        # The documented example (10 API tasks + 4 workers on db.t3.medium ≈ 340)
+        # sits at ~90% — 80% is the "stop scaling out" line, not an emergency.
+        expr: db_connections_connections_in_use / db_connections_max_connections > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Postgres connection budget 80% consumed"
+          description: >-
+            {{ $value | humanizePercentage }} of max_connections in use for 10m. Autoscaling
+            has reached the DB ceiling: do not raise the API task count — shrink
+            DB_POOL_SIZE/WEB_CONCURRENCY or front RDS with RDS Proxy/PgBouncer.
+            Runbook: docs/RUNBOOK.md §16.
+
+      - alert: DatabaseConnectionsExhaustionImminent
+        # Past this the next connection attempt gets FATAL: too many connections —
+        # which readiness probes also hit, so the failure mode is a fleet-wide 503.
+        expr: db_connections_connections_in_use / db_connections_max_connections > 0.95
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Postgres about to refuse connections"
+          description: >-
+            {{ $value | humanizePercentage }} of max_connections in use. Scale the API
+            service in NOW and find the connection holder (per-pool gauges,
+            pg_stat_activity by application_name). Runbook: docs/RUNBOOK.md §16.
+
+      - alert: DbPoolSaturated
+        # One process's pool is nearly fully checked out: requests are queueing
+        # on checkout even though the server may have headroom. Includes the
+        # probe pool on purpose — a probe checked out for 5m straight means
+        # Postgres itself is hung, which is exactly what we want to know.
+        # max_over_time, not `for:`: the API target is served by WEB_CONCURRENCY
+        # gunicorn workers with independent pools, so each scrape samples ONE of
+        # them — a single saturated worker only shows up in roughly every other
+        # sample, and `for: 5m` (which must hold at every evaluation) would never
+        # fire. The 5m max catches a worker that was saturated at any scrape in
+        # the window; the cost is that a momentary burst also fires, which is
+        # acceptable at >90% of capacity.
+        expr: max_over_time(db_pool_connections_checked_out[5m]) / db_pool_connections_capacity > 0.9
+        labels:
+          severity: warning
+        annotations:
+          summary: "DB pool {{ $labels.pool }} on {{ $labels.instance }} is saturated"
+          description: >-
+            Pool {{ $labels.pool }} had {{ $value | humanizePercentage }} of its
+            connections checked out at some scrape in the last 5m. Requests are
+            waiting on the pool; either the pool is undersized for this process
+            or a code path is leaking checkouts. Runbook: docs/RUNBOOK.md §16.

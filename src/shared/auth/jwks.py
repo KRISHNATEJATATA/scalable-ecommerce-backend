@@ -79,17 +79,21 @@ def _cached_kids(client: PyJWKClient) -> set[str | None] | None:
     ``None`` (no JWK-set cache — a client built with ``cache_jwk_set=False``, or a
     test double) means "can't prove this lookup hits the network", so the caller
     skips the guard rather than rejecting valid tokens.
+
+    ``JWKSetCache.get()`` returns an already-parsed :class:`~jwt.PyJWKSet` (``.keys``
+    is a list of :class:`~jwt.PyJWK`, each exposing ``.key_id``) or ``None`` if
+    nothing is cached yet — never a raw dict.
     """
     cache = getattr(client, "jwk_set_cache", None)
     if cache is None:
         return None
     data = cache.get()
-    if not isinstance(data, dict):
+    if data is None:
         return set()  # nothing cached yet → any lookup will fetch
-    keys = data.get("keys")
+    keys = getattr(data, "keys", None)
     if not isinstance(keys, list):
-        return set()  # cached body is unusable (e.g. ``"keys": null``) → treat as uncached
-    return {key.get("kid") for key in keys if isinstance(key, dict)}
+        return set()  # cached body is unusable (e.g. malformed/empty) → treat as uncached
+    return {getattr(key, "key_id", None) for key in keys}
 
 
 def _would_fetch(client: PyJWKClient, kid: str | None) -> bool:
