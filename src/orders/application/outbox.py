@@ -14,16 +14,17 @@ an empty string.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from decimal import Decimal
-from typing import Any
 
 from src.events.models import OrderPlaced, OrderPlacedData, OrderPlacedLine
+from src.orders.domain.order import OrderItem
 from src.shared.config.logging import current_trace_id
 from src.shared.db.outbox import OutboxMessage
 
 
 def order_placed_outbox(
-    *, order_id: uuid.UUID, user_id: uuid.UUID, total: Decimal, items: list[Any], user_email: str = ""
+    *, order_id: uuid.UUID, user_id: uuid.UUID, total: Decimal, items: Sequence[OrderItem], user_email: str = ""
 ) -> OutboxMessage:
     """Build the ``OrderPlaced`` message from the paid transition's row + lines.
 

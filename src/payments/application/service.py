@@ -33,9 +33,8 @@ from decimal import Decimal
 from typing import Any
 
 from src.payments.application.dto import PaymentResponse
-from src.payments.application.mappers import to_domain
 from src.payments.application.outbox import payment_failed_outbox, payment_refunded_outbox, payment_succeeded_outbox
-from src.payments.domain.payment import PaymentStatus
+from src.payments.domain.payment import Payment, PaymentStatus
 from src.payments.ports.gateway import GatewayCharge, GatewayOutcome, PaymentGatewayPort
 from src.payments.ports.repository import PaymentsRepositoryPort, PaymentSucceededHook
 from src.shared.config.setting import AppSettings
@@ -125,7 +124,7 @@ class PaymentsService:
     async def list_by_order_id(self, order_id: uuid.UUID, params: PageParams) -> PageResponse[PaymentResponse]:
         """Return a keyset page of payment attempts for an order (newest first by default)."""
         page = await self._repo.list_by_order_id(order_id, params)
-        items = [PaymentResponse.model_validate(to_domain(row)) for row in page.items]
+        items = [PaymentResponse.model_validate(row) for row in page.items]
         return PageResponse(items=items, next_cursor=page.next_cursor)
 
     async def get_by_idempotency_key(self, idempotency_key: str) -> PaymentResponse | None:
@@ -171,11 +170,8 @@ class PaymentsService:
         if row.status != PaymentStatus.SUCCEEDED.value:
             log.info("refund (%s) skipped for a %s payment under %s", reason, row.status, idempotency_key)
             return row.status == PaymentStatus.REFUNDED.value
-        # Hoist the row's fields up front: ``transition`` commits, which expires
-        # the identity-map instance — a later attribute touch would be a *sync*
-        # lazy load (MissingGreenlet on asyncpg).
         payment_id, order_id, gateway_ref = row.id, row.order_id, row.gateway_ref
-        result = await gateway.refund(amount=_amount(row), idempotency_key=idempotency_key, gateway_ref=gateway_ref)
+        result = await gateway.refund(amount=row.amount, idempotency_key=idempotency_key, gateway_ref=gateway_ref)
         if result.outcome != GatewayOutcome.SUCCEEDED:
             # The row deliberately stays `succeeded`: the charge landed and the
             # money is still out — falsifying it to `failed` would break the
@@ -242,7 +238,7 @@ class PaymentsService:
             order_id=order_id, idempotency_key=idempotency_key, amount=amount
         )
         if not created:
-            if row.order_id != order_id or _amount(row) != amount:
+            if row.order_id != order_id or row.amount != amount:
                 raise PaymentIdempotencyConflictError()
             if row.status != PaymentStatus.PENDING.value:
                 log.info("charge retry under %s hits an already-%s payment", idempotency_key, row.status)
@@ -281,14 +277,10 @@ class PaymentsService:
 
         ref = payload.get("gateway_ref")
         reason = payload.get("reason")
-        # Capture the identity + pre-transition status NOW: a lost flip rolls
-        # the session back (the zero-rows path in the repo), which expires the
-        # identity map — touching ``row.id``/``row.status`` after that would be
-        # a synchronous lazy-load (MissingGreenlet on asyncpg).
         payment_id = row.id
         prior_status = row.status
         updated = await self._apply_outcome(
-            row.id,
+            payment_id,
             outcome=outcome,
             gateway_ref=ref if isinstance(ref, str) else None,
             failure_reason=reason if isinstance(reason, str) else None,
@@ -320,12 +312,6 @@ class PaymentsService:
         compensate."""
         gateway = self._require_gateway()
         resolved = 0
-        # Snapshot the two fields the loop needs BEFORE any transition: a lost
-        # guarded flip rolls the session back, which expires EVERY loaded
-        # instance in the session — touching ``row.id``/``row.idempotency_key``
-        # on a later iteration would then be a synchronous lazy-load
-        # (MissingGreenlet on asyncpg). Same discipline as the checkout saga's
-        # ``claimed_ids`` extraction.
         candidates = [
             (row.id, row.idempotency_key)
             for row in await self._repo.due_for_reconciliation(
@@ -442,7 +428,7 @@ class PaymentsService:
 
     async def _apply_outcome(
         self, payment_id: uuid.UUID, *, outcome: str, gateway_ref: str | None, failure_reason: str | None
-    ) -> Any | None:
+    ) -> Payment | None:
         """One guarded flip + its outbox row; ``None`` when no transition landed.
 
         ``None`` covers both "already final" and a ``pending`` (processing)
@@ -468,11 +454,6 @@ class PaymentsService:
         )
 
 
-def _response(row: Any) -> PaymentResponse:
-    """Map an ORM/domain payment row to the response schema (never leak the ORM)."""
-    return PaymentResponse.model_validate(to_domain(row))
-
-
-def _amount(row: Any) -> Decimal:
-    amount = row.amount
-    return amount if isinstance(amount, Decimal) else Decimal(str(amount))
+def _response(row: Payment) -> PaymentResponse:
+    """Map a payment snapshot to the response schema."""
+    return PaymentResponse.model_validate(row)

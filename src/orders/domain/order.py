@@ -37,7 +37,14 @@ class OrderItem:
 
 @dataclass(frozen=True, slots=True)
 class Order:
-    """The order aggregate mirroring the ``orders`` read model (immutable)."""
+    """The order aggregate mirroring the ``orders`` read model (immutable).
+
+    A point-in-time snapshot: the repository hands these out instead of live ORM
+    rows, so nothing above the adapter can touch session state (identity map,
+    expiry, lazy loads). ``idempotency_key``/``idempotency_body_hash`` and
+    ``user_email`` are the checkout saga's replay + notification inputs; "" means
+    unknown (legacy rows / fixtures).
+    """
 
     id: uuid.UUID
     user_id: uuid.UUID
@@ -46,3 +53,15 @@ class Order:
     items: tuple[OrderItem, ...]
     created_at: datetime
     updated_at: datetime
+    idempotency_key: str = ""
+    idempotency_body_hash: str = ""
+    user_email: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class SagaStep:
+    """One journaled checkout-saga step attempt (immutable snapshot of a ``saga_log`` row)."""
+
+    step: str
+    status: str
+    created_at: datetime

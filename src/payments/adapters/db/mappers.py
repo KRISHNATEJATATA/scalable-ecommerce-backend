@@ -1,16 +1,16 @@
-"""Payments mapper: ORM ``Payment`` row → domain ``Payment``.
+"""Payments ORM → domain mapper.
 
-Typed ``Any`` to avoid an application → adapters import (the row is duck-typed).
+The repository maps every row it returns, so the application layer only ever sees
+frozen snapshots, never a live ORM row.
 """
 
 from __future__ import annotations
 
-from typing import Any
-
+from src.payments.adapters.db.models import Payment as PaymentRow
 from src.payments.domain.payment import Payment
 
 
-def to_domain(row: Any) -> Payment:
+def to_domain(row: PaymentRow) -> Payment:
     """Map an ORM ``Payment`` row to a domain ``Payment``."""
     return Payment(
         id=row.id,
@@ -20,5 +20,6 @@ def to_domain(row: Any) -> Payment:
         gateway_ref=row.gateway_ref,
         created_at=row.created_at,
         updated_at=row.updated_at,
-        failure_reason=getattr(row, "failure_reason", None),
+        failure_reason=row.failure_reason,
+        idempotency_key=row.idempotency_key,
     )

@@ -44,10 +44,8 @@ import uuid
 from collections import Counter
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
 
-from src.orders.application.dto import OrderResponse
-from src.orders.application.mappers import to_domain
+from src.orders.application.dto import OrderItemResponse, OrderResponse
 from src.orders.application.metrics import (
     checkout_attempts_total,
     checkout_compensation_total,
@@ -56,7 +54,7 @@ from src.orders.application.metrics import (
     checkout_recovery_total,
 )
 from src.orders.application.outbox import order_placed_outbox
-from src.orders.domain.order import OrderStatus
+from src.orders.domain.order import Order, OrderStatus
 from src.orders.ports.checkout import (
     BasketPort,
     ChargePort,
@@ -110,9 +108,9 @@ def body_hash_for(payment_token: str) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def _response(row: Any) -> OrderResponse:
-    """Map an ORM order (with lines) to the wire shape."""
-    return OrderResponse.model_validate(to_domain(row))
+def _response(order: Order) -> OrderResponse:
+    """Map an order snapshot (with lines) to the wire shape."""
+    return OrderResponse.model_validate(order)
 
 
 class CheckoutSaga:
@@ -272,7 +270,7 @@ class CheckoutSaga:
         idempotency_key: str,
         payment_token: str,
         body_hash: str,
-        order: Any,
+        order: Order,
     ) -> tuple[OrderResponse, bool]:
         """A pre-existing order under ``(user_id, key)``: replay, resume, or refuse it.
 
@@ -469,8 +467,7 @@ class CheckoutSaga:
                 # holds). The pending-order poller claim never settles a
                 # terminal row, so this frame starts the refund itself — and
                 # journals the intent, so the poller's refund claim retries a
-                # raise. Ask the row, not the identity map: the flip
-                # happened on the canceller's session.
+                # raise.
                 if await self._orders.get_order_status(order_id) == OrderStatus.CANCELLED:
                     refund = await self._refund_orphaned_charge(
                         order_id, user_id, idempotency_key, reason="order_cancelled_after_charge"
@@ -734,9 +731,8 @@ class CheckoutSaga:
         """
         stuck = await self._orders.claim_stuck_pending(cutoff=cutoff, batch_size=batch_size)
         outcome = {"completed": 0, "compensated": 0, "deferred": 0, "refunded": 0, "refund_failed": 0}
-        # Ids as plain values up front: a rollback anywhere in the batch expires
-        # every loaded instance, so the loop re-reads each order fresh instead
-        # of trusting claim-time attributes (lazy loads have no greenlet here).
+        # Ids up front: the loop re-reads each order fresh instead of trusting
+        # the claim-time snapshot, which a slow batch may have outlived.
         claimed_ids = [order.id for order in stuck]
         for order_id in claimed_ids:
             try:
@@ -793,7 +789,7 @@ class CheckoutSaga:
             log.info("saga recovery retried %d journaled refund(s): %s", len(refund_ids), outcome)
         return outcome
 
-    async def _retry_journaled_refund(self, order: Any) -> str:
+    async def _retry_journaled_refund(self, order: Order) -> str:
         """Retry (or close out) one cancelled order's journaled refund intent.
 
         The terminal-order counterpart of the pending claim: the drive that
@@ -837,7 +833,7 @@ class CheckoutSaga:
         log.error("checkout order %s: refund marker without a succeeded charge row", order.id)
         return "deferred"
 
-    async def _settle_crashed(self, order: Any) -> str:
+    async def _settle_crashed(self, order: Order) -> str:
         """Settle one crashed order; returns which counter to bump."""
         payment = await self._charges.find_by_idempotency_key(payment_key_for(order.user_id, order.idempotency_key))
         if payment is not None and payment.succeeded:
@@ -992,7 +988,7 @@ class CheckoutSaga:
         except Exception:  # boundary: cleanup, not correctness
             log.warning("basket consume failed after terminal checkout; cart survives", exc_info=True)
 
-    async def _clear_basket_if_replay_mop_up(self, user_id: uuid.UUID, order_items: Any) -> None:
+    async def _clear_basket_if_replay_mop_up(self, user_id: uuid.UUID, order_items: list[OrderItemResponse]) -> None:
         """Replay-side basket mop-up: clear ONLY a basket that still matches the order.
 
         The drive's success path already clears the basket *before* the replay
@@ -1020,7 +1016,7 @@ def _total(lines: list[CheckoutLine]) -> Decimal:
     return sum((line.unit_price * line.quantity for line in lines), Decimal("0"))
 
 
-def _lines_of(order: Any) -> list[CheckoutLine]:
+def _lines_of(order: Order) -> list[CheckoutLine]:
     """Rebuild checkout lines from the order's own stored snapshots.
 
     A crashed checkout resumes from what it already persisted — never from the
@@ -1030,7 +1026,7 @@ def _lines_of(order: Any) -> list[CheckoutLine]:
         CheckoutLine(
             product_id=item.product_id,
             name=item.product_name,
-            unit_price=item.unit_price if isinstance(item.unit_price, Decimal) else Decimal(str(item.unit_price)),
+            unit_price=item.unit_price,
             quantity=item.quantity,
         )
         for item in order.items

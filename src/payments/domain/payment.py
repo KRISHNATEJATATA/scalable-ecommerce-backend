@@ -56,3 +56,4 @@ class Payment:
     created_at: datetime
     updated_at: datetime
     failure_reason: str | None = None
+    idempotency_key: str = ""

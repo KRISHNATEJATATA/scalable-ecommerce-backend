@@ -33,12 +33,12 @@ from src.inventory.api.schemas import InventoryResponse
 from src.inventory.application.mappers import to_domain as inventory_to_domain
 from src.inventory.application.service import InventoryService
 from src.inventory.domain.inventory import Inventory
+from src.orders.adapters.db.mappers import to_domain as order_to_domain
 from src.orders.api.schemas import OrderResponse
-from src.orders.application.mappers import to_domain as order_to_domain
 from src.orders.application.service import OrdersService
 from src.orders.domain.order import Order, OrderItem, OrderStatus
+from src.payments.adapters.db.mappers import to_domain as payment_to_domain
 from src.payments.api.schemas import PaymentResponse
-from src.payments.application.mappers import to_domain as payment_to_domain
 from src.payments.application.service import PaymentsService
 from src.payments.domain.payment import Payment
 from src.shared.db.pagination import Page, PageParams, PageResponse
@@ -136,6 +136,9 @@ def _order_row(item_count=2):
         items=items,
         created_at=_NOW,
         updated_at=_NOW,
+        idempotency_key="key-1",
+        idempotency_body_hash="hash-1",
+        user_email="user@example.com",
     )
 
 
@@ -226,6 +229,8 @@ def _payment_row():
         status="succeeded",
         amount=Decimal("10.00"),
         gateway_ref="ref-1",
+        failure_reason=None,
+        idempotency_key="key-1",
         created_at=_NOW,
         updated_at=_NOW,
     )

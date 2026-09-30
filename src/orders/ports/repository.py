@@ -5,6 +5,10 @@ side serves the checkout saga: ``create_pending_order`` deduplicates on the
 composite ``(user_id, idempotency_key)`` UNIQUE, ``transition_status`` is a
 guarded lifecycle flip, and ``claim_stuck_pending`` leases crashed sagas to the
 recovery poller.
+
+Every read returns a frozen domain :class:`Order` snapshot of the *committed*
+row, never a live ORM instance — callers hold no session state and need no
+knowledge of SQLAlchemy's identity map or expiry rules.
 """
 
 from __future__ import annotations
@@ -12,26 +16,27 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Protocol
+from typing import Protocol
 
+from src.orders.domain.order import Order, OrderStatus, SagaStep
 from src.shared.db.outbox import OutboxMessage
+from src.shared.db.pagination import Page, PageParams
 
 
 class OrdersRepositoryPort(Protocol):
-    async def list_orders(self, user_id: uuid.UUID, params: Any, status: Any | None = None) -> Any: ...
+    async def list_orders(
+        self, user_id: uuid.UUID, params: PageParams, status: OrderStatus | None = None
+    ) -> Page[Order]: ...
 
-    async def get_order(self, order_id: uuid.UUID) -> Any | None: ...
-
-    async def get_order_status(self, order_id: uuid.UUID) -> Any | None:
-        """The order's committed status, bypassing the session's identity map.
-
-        Callers ask this *after* a concurrent actor may have flipped the row on
-        its own session (a cancel racing the drive): a ``select(Order)`` re-read
-        would answer from the identity map's older copy.
-        """
+    async def get_order(self, order_id: uuid.UUID) -> Order | None:
+        """The order's committed state with lines, or ``None`` — always fresh from the DB."""
         ...
 
-    async def get_by_idempotency(self, user_id: uuid.UUID, idempotency_key: str) -> Any | None:
+    async def get_order_status(self, order_id: uuid.UUID) -> OrderStatus | None:
+        """The order's committed status alone (a single-column read), or ``None`` if it never existed."""
+        ...
+
+    async def get_by_idempotency(self, user_id: uuid.UUID, idempotency_key: str) -> Order | None:
         """The order already placed under ``(user_id, key)``, with lines, or ``None``."""
         ...
 
@@ -44,7 +49,7 @@ class OrdersRepositoryPort(Protocol):
         total: Decimal,
         lines: list[tuple[uuid.UUID, str, Decimal, int]],
         user_email: str = "",
-    ) -> tuple[Any, bool]:
+    ) -> tuple[Order, bool]:
         """Insert the ``pending`` order + lines; a key replay returns ``(winner, False)``.
 
         ``user_email`` is the buyer's checkout-time address, snapshotted onto
@@ -58,10 +63,10 @@ class OrdersRepositoryPort(Protocol):
         self,
         order_id: uuid.UUID,
         *,
-        expect: list[Any],
-        to_status: Any,
+        expect: list[OrderStatus],
+        to_status: OrderStatus,
         outbox: OutboxMessage | None = None,
-    ) -> Any | None:
+    ) -> Order | None:
         """Guarded lifecycle flip; ``None`` when the current status wasn't in ``expect``."""
         ...
 
@@ -73,7 +78,7 @@ class OrdersRepositoryPort(Protocol):
         """The most recent journal status for one step, or ``None`` if never attempted."""
         ...
 
-    async def list_saga_steps(self, order_id: uuid.UUID) -> Any:
+    async def list_saga_steps(self, order_id: uuid.UUID) -> list[SagaStep]:
         """The order's full journal in execution order (oldest first)."""
         ...
 
@@ -85,11 +90,11 @@ class OrdersRepositoryPort(Protocol):
         """Drop any half-finished transaction on the underlying session."""
         ...
 
-    async def claim_stuck_pending(self, *, cutoff: datetime, batch_size: int) -> list[Any]:
+    async def claim_stuck_pending(self, *, cutoff: datetime, batch_size: int) -> list[Order]:
         """Lease quiet ``pending`` orders older than ``cutoff`` (SKIP LOCKED, heartbeat-guarded)."""
         ...
 
-    async def claim_cancelled_with_pending_refund(self, *, cutoff: datetime, batch_size: int) -> list[Any]:
+    async def claim_cancelled_with_pending_refund(self, *, cutoff: datetime, batch_size: int) -> list[Order]:
         """Cancelled orders whose journaled refund intent has no terminal marker yet.
 
         The recovery poller's refund-retry claim: a refund that raised on a

@@ -14,12 +14,15 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import ColumnElement, Select, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.payments.adapters.db.mappers import to_domain
 from src.payments.adapters.db.models import Outbox, Payment
+from src.payments.domain.payment import Payment as DomainPayment
 from src.payments.domain.payment import PaymentStatus
 from src.payments.ports.repository import PaymentOutboxFactory, PaymentSucceededHook
 from src.shared.db.outbox import OutboxMessage
@@ -27,6 +30,11 @@ from src.shared.db.pagination import Page, PageParams, apply_keyset, build_page,
 from src.shared.errors.exceptions import InvalidQueryParamError
 
 _SORT_COLUMNS = {"created_at": Payment.created_at}
+
+
+def _payment_select(*where: ColumnElement[bool]) -> Select[Any]:
+    """``select(Payment)`` that refreshes rows from the DB instead of answering from the identity map."""
+    return select(Payment).where(*where).execution_options(populate_existing=True)
 
 
 class PaymentsRepository:
@@ -37,25 +45,29 @@ class PaymentsRepository:
 
     # --- reads ------------------------------------------------------
 
-    async def list_by_order_id(self, order_id: uuid.UUID, params: PageParams) -> Page[Payment]:
+    async def list_by_order_id(self, order_id: uuid.UUID, params: PageParams) -> Page[DomainPayment]:
         """Every payment attempt for an order, keyset-paginated (newest first by default)."""
         if params.sort_field not in _SORT_COLUMNS:
             raise InvalidQueryParamError("sort", params.sort_field)
         sort_col = _SORT_COLUMNS[params.sort_field]
 
-        stmt = select(Payment).where(Payment.order_id == order_id)
+        stmt = _payment_select(Payment.order_id == order_id)
         cursor = decode_cursor(params.cursor, "timestamptz") if params.cursor else None
         stmt = apply_keyset(stmt, sort_col, Payment.id, params, cursor)
 
-        rows = list((await self._session.execute(stmt)).scalars().all())
+        rows = [to_domain(row) for row in (await self._session.execute(stmt)).scalars().all()]
         return build_page(rows, params, key_of=lambda payment: (getattr(payment, params.sort_field), payment.id))
 
-    async def get(self, payment_id: uuid.UUID) -> Payment | None:
-        return await self._session.get(Payment, payment_id)
+    async def get(self, payment_id: uuid.UUID) -> DomainPayment | None:
+        """The payment as committed in the DB, or ``None``."""
+        row = (await self._session.execute(_payment_select(Payment.id == payment_id))).scalar_one_or_none()
+        return to_domain(row) if row is not None else None
 
-    async def get_by_idempotency_key(self, idempotency_key: str) -> Payment | None:
-        stmt = select(Payment).where(Payment.idempotency_key == idempotency_key)
-        return (await self._session.execute(stmt)).scalar_one_or_none()
+    async def get_by_idempotency_key(self, idempotency_key: str) -> DomainPayment | None:
+        """The payment minted under this key as committed in the DB, or ``None``."""
+        stmt = _payment_select(Payment.idempotency_key == idempotency_key)
+        row = (await self._session.execute(stmt)).scalar_one_or_none()
+        return to_domain(row) if row is not None else None
 
     async def has_succeeded_for_order(self, order_id: uuid.UUID) -> bool:
         """Read the committed payment outcome without taking a payment-row lock."""
@@ -66,7 +78,7 @@ class PaymentsRepository:
 
     async def create_pending(
         self, *, order_id: uuid.UUID, idempotency_key: str, amount: Decimal
-    ) -> tuple[Payment, bool]:
+    ) -> tuple[DomainPayment, bool]:
         """Insert a ``pending`` attempt; a replay of the key returns the existing row.
 
         ``ON CONFLICT DO NOTHING`` + re-select keeps the uniqueness race in the DB:
@@ -105,7 +117,7 @@ class PaymentsRepository:
         outbox_factory: PaymentOutboxFactory | None = None,
         expect: str | None = None,
         on_succeeded: PaymentSucceededHook | None = None,
-    ) -> Payment | None:
+    ) -> DomainPayment | None:
         """Apply an outcome once; ``None`` when the payment was no longer in ``expect``.
 
         Raw guarded UPDATE (not the ORM unit-of-work) so a concurrent webhook,
@@ -121,21 +133,15 @@ class PaymentsRepository:
             .where(Payment.id == payment_id, Payment.status == (expect or PaymentStatus.PENDING.value))
             .values(status=to_status, gateway_ref=gateway_ref, failure_reason=failure_reason)
             .returning(Payment.id, Payment.order_id, Payment.amount, Payment.gateway_ref, Payment.failure_reason)
-            # The caller re-reads the row explicitly after the commit; in-session
-            # synchronization would just expire the identity-map instance and turn
-            # that read into a synchronous lazy-load (MissingGreenlet on asyncpg).
+            # The caller re-reads the row after the commit (populate_existing), so
+            # in-session synchronization of the identity map is redundant work.
             .execution_options(synchronize_session=False)
         )
         row = (await self._session.execute(stmt)).mappings().first()
         if row is None:
             # Lost the guarded flip — the payment was already final (a concurrent
             # webhook/charge landed first). Roll back while the transaction is
-            # still open, mirroring the orders repo's ``transition_status``: the
-            # rollback expires the identity map, so the caller's re-read
-            # (``_apply`` after a lost charge race) sees the *committed* state —
-            # a stale pre-UPDATE instance (the raw statement bypassed the ORM
-            # unit of work) would otherwise answer "payment outcome unknown"
-            # for a payment that actually succeeded.
+            # still open, mirroring the orders repo's ``transition_status``.
             await self._session.rollback()
             return None
         if outbox_factory is not None:
@@ -147,17 +153,11 @@ class PaymentsRepository:
                 await self._session.rollback()
                 raise
         await self._session.commit()
-        # Re-read, then refresh: ``get`` may hand back the identity-map instance
-        # holding pre-UPDATE attribute values (the raw statement bypassed the ORM
-        # unit of work), so the caller must see the committed state.
-        payment = await self.get(payment_id)
-        if payment is not None:
-            await self._session.refresh(payment)
-        return payment
+        return await self.get(payment_id)
 
     async def due_for_reconciliation(
         self, *, grace_seconds: int, max_age_seconds: int, batch_size: int
-    ) -> list[Payment]:
+    ) -> list[DomainPayment]:
         """Oldest still-``pending`` payments inside the ``[grace, max_age]`` window.
 
         The upper bound is what keeps one orphaned row from consuming a batch slot
@@ -169,8 +169,7 @@ class PaymentsRepository:
         computed app-side; the poll interval dwarfs any tolerable clock skew."""
         now = datetime.now(UTC)
         stmt = (
-            select(Payment)
-            .where(
+            _payment_select(
                 Payment.status == PaymentStatus.PENDING.value,
                 Payment.created_at <= now - timedelta(seconds=grace_seconds),
                 Payment.created_at > now - timedelta(seconds=max_age_seconds),
@@ -178,9 +177,9 @@ class PaymentsRepository:
             .order_by(Payment.created_at)
             .limit(batch_size)
         )
-        return list((await self._session.execute(stmt)).scalars().all())
+        return [to_domain(row) for row in (await self._session.execute(stmt)).scalars().all()]
 
-    async def abandonable(self, *, max_age_seconds: int, batch_size: int) -> list[Payment]:
+    async def abandonable(self, *, max_age_seconds: int, batch_size: int) -> list[DomainPayment]:
         """Oldest still-``pending`` payments past ``max_age``: abandonment candidates.
 
         Same plain-read shape as :meth:`due_for_reconciliation` — listing a row
@@ -189,12 +188,11 @@ class PaymentsRepository:
         nothing and concurrent pollers stay safe."""
         cutoff = datetime.now(UTC) - timedelta(seconds=max_age_seconds)
         stmt = (
-            select(Payment)
-            .where(Payment.status == PaymentStatus.PENDING.value, Payment.created_at <= cutoff)
+            _payment_select(Payment.status == PaymentStatus.PENDING.value, Payment.created_at <= cutoff)
             .order_by(Payment.created_at)
             .limit(batch_size)
         )
-        return list((await self._session.execute(stmt)).scalars().all())
+        return [to_domain(row) for row in (await self._session.execute(stmt)).scalars().all()]
 
     @staticmethod
     def _outbox_row(outbox: OutboxMessage) -> Outbox:

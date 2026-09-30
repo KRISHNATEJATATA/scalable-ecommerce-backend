@@ -15,6 +15,7 @@ string — an untraceable event is still traceable to *one* poller pass.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any
 
@@ -30,7 +31,7 @@ from src.shared.config.logging import current_trace_id
 from src.shared.db.outbox import OutboxMessage
 
 
-def payment_succeeded_outbox(row: Any) -> OutboxMessage:
+def payment_succeeded_outbox(row: Mapping[str, Any]) -> OutboxMessage:
     """Build the ``PaymentSucceeded`` message from the applied transition's row."""
     event = PaymentSucceeded.new(
         trace_id=current_trace_id(),
@@ -41,7 +42,7 @@ def payment_succeeded_outbox(row: Any) -> OutboxMessage:
     return OutboxMessage(event.type, event.model_dump_json())
 
 
-def payment_failed_outbox(row: Any) -> OutboxMessage:
+def payment_failed_outbox(row: Mapping[str, Any]) -> OutboxMessage:
     """Build the ``PaymentFailed`` message from the applied transition's row."""
     event = PaymentFailed.new(
         trace_id=current_trace_id(),
@@ -55,7 +56,7 @@ def payment_failed_outbox(row: Any) -> OutboxMessage:
     return OutboxMessage(event.type, event.model_dump_json())
 
 
-def payment_refunded_outbox(row: Any) -> OutboxMessage:
+def payment_refunded_outbox(row: Mapping[str, Any]) -> OutboxMessage:
     """Build the ``PaymentRefunded`` message from the applied transition's row.
 
     Fed the ``succeeded → refunded`` flip's own RETURNING values: the amount and
@@ -71,6 +72,6 @@ def payment_refunded_outbox(row: Any) -> OutboxMessage:
     return OutboxMessage(event.type, event.model_dump_json())
 
 
-def _amount(row: Any) -> Decimal:
+def _amount(row: Mapping[str, Any]) -> Decimal:
     amount = row["amount"]
     return amount if isinstance(amount, Decimal) else Decimal(str(amount))

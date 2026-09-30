@@ -3,9 +3,9 @@
 ``list_orders`` is always scoped to ``user_id`` by the repo. Single-order reads
 and cancel verify ``order.user_id == caller`` in this layer (never the route),
 with ``admin`` bypassing ownership but never the role gate — the same shape as
-catalog's ``_assert_owner``. ORM rows never cross the boundary: everything
-returns a Pydantic response schema, and a missing row is ``None`` (the route
-maps it to 404).
+catalog's ``_assert_owner``. The repository hands back frozen domain snapshots, and
+everything here returns a Pydantic response schema; a missing row is ``None`` (the
+route maps it to 404).
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from __future__ import annotations
 import uuid
 
 from src.orders.application.dto import OrderExecutionResponse, OrderResponse, SagaStepResponse
-from src.orders.application.mappers import to_domain
 from src.orders.domain.order import OrderStatus
 from src.orders.ports.checkout import StockHoldsPort
 from src.orders.ports.repository import OrdersRepositoryPort
@@ -36,7 +35,7 @@ class OrdersService:
         row = await self._repo.get_order(order_id)
         if row is None:
             return None
-        return OrderResponse.model_validate(to_domain(row))
+        return OrderResponse.model_validate(row)
 
     async def get_order_detail(
         self, *, user_id: uuid.UUID, order_id: uuid.UUID, is_admin: bool
@@ -46,7 +45,7 @@ class OrdersService:
         if row is None:
             return None
         self._assert_owner(row.user_id, user_id, is_admin)
-        return OrderResponse.model_validate(to_domain(row))
+        return OrderResponse.model_validate(row)
 
     async def get_execution(
         self, *, user_id: uuid.UUID, order_id: uuid.UUID, is_admin: bool
@@ -76,7 +75,7 @@ class OrdersService:
     ) -> PageResponse[OrderResponse]:
         """Return a keyset page of a user's orders, optionally filtered by status."""
         page = await self._repo.list_orders(user_id, params, status)
-        items = [OrderResponse.model_validate(to_domain(row)) for row in page.items]
+        items = [OrderResponse.model_validate(row) for row in page.items]
         return PageResponse(items=items, next_cursor=page.next_cursor)
 
     async def cancel_order(self, *, user_id: uuid.UUID, order_id: uuid.UUID, is_admin: bool) -> OrderResponse | None:
@@ -101,7 +100,7 @@ class OrdersService:
         self._assert_owner(row.user_id, user_id, is_admin)
         if row.status == OrderStatus.CANCELLED:
             await self._holds.release_for_order(order_id)  # finish a crash between flip and release
-            return OrderResponse.model_validate(to_domain(row))
+            return OrderResponse.model_validate(row)
         if row.status != OrderStatus.PENDING:
             raise OrderStateConflictError(f"only pending orders can be cancelled (order is {row.status})")
         # A charge may be in flight, already landed, or undecided (``unknown``:
@@ -122,13 +121,13 @@ class OrdersService:
             final = await self._repo.get_order(order_id)
             if final is None or final.status != OrderStatus.CANCELLED:
                 raise OrderStateConflictError("the order settled while cancelling; re-read it")
-            return OrderResponse.model_validate(to_domain(final))
+            return OrderResponse.model_validate(final)
         await self._holds.release_for_order(order_id)
         await self._repo.log_saga_step(order_id, "cancel", "completed")
         final = await self._repo.get_order(order_id)
         if final is None:  # defensive: the row we just cancelled must re-read
             raise RuntimeError(f"cancelled order {order_id} not found after flip")
-        return OrderResponse.model_validate(to_domain(final))
+        return OrderResponse.model_validate(final)
 
     @staticmethod
     def _assert_owner(owner_id: uuid.UUID, caller_id: uuid.UUID, is_admin: bool) -> None:

@@ -16,7 +16,10 @@ Writes serve the checkout saga, each step **one transaction**:
   ``FOR UPDATE SKIP LOCKED`` and returned, so concurrent poller replicas split
   the batch instead of double-settling a saga.
 
-Returns ORM rows, never response schemas — services map them.
+Returns frozen domain snapshots (:mod:`src.orders.adapters.db.mappers`), never ORM
+rows, and every read uses ``populate_existing`` so a snapshot always reflects the
+database — not an identity-map copy left over from an earlier read on this session
+(the guarded UPDATEs bypass the ORM unit of work, so that copy goes stale).
 """
 
 from __future__ import annotations
@@ -25,14 +28,18 @@ import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import ColumnElement, Select, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.sql import text
 
+from src.orders.adapters.db.mappers import saga_step_to_domain, to_domain
 from src.orders.adapters.db.models import SCHEMA, Order, OrderItem, OrderStatus, Outbox, SagaLog
+from src.orders.domain.order import Order as DomainOrder
+from src.orders.domain.order import SagaStep
 from src.shared.db.outbox import OutboxMessage
 from src.shared.db.pagination import Page, PageParams, apply_keyset, build_page, decode_cursor
 from src.shared.errors.exceptions import InvalidQueryParamError
@@ -41,6 +48,11 @@ _SORT_COLUMNS = {"created_at": Order.created_at}
 
 # SQLSTATEs, not constraint names: names drift with migrations, these are standard.
 _UNIQUE_VIOLATION = "23505"
+
+
+def _order_select(*where: ColumnElement[bool]) -> Select[Any]:
+    """``select(Order)`` with lines eager-loaded and rows refreshed from the DB, never the identity map."""
+    return select(Order).where(*where).options(selectinload(Order.items)).execution_options(populate_existing=True)
 
 
 def _sqlstate(exc: IntegrityError) -> str | None:
@@ -117,45 +129,40 @@ class OrdersRepository:
 
     async def list_orders(
         self, user_id: uuid.UUID, params: PageParams, status: OrderStatus | None = None
-    ) -> Page[Order]:
+    ) -> Page[DomainOrder]:
         if params.sort_field not in _SORT_COLUMNS:
             raise InvalidQueryParamError("sort", params.sort_field)
         sort_col = _SORT_COLUMNS[params.sort_field]
 
-        stmt = select(Order).where(Order.user_id == user_id).options(selectinload(Order.items))
+        stmt = _order_select(Order.user_id == user_id)
         if status is not None:
             stmt = stmt.where(Order.status == status)
 
         cursor = decode_cursor(params.cursor, "timestamptz") if params.cursor else None
         stmt = apply_keyset(stmt, sort_col, Order.id, params, cursor)
 
-        rows = list((await self._session.execute(stmt)).scalars().all())
+        rows = [to_domain(row) for row in (await self._session.execute(stmt)).scalars().all()]
         return build_page(rows, params, key_of=lambda order: (getattr(order, params.sort_field), order.id))
 
-    async def get_order(self, order_id: uuid.UUID) -> Order | None:
-        stmt = select(Order).where(Order.id == order_id).options(selectinload(Order.items))
-        return (await self._session.execute(stmt)).scalar_one_or_none()
+    async def get_order(self, order_id: uuid.UUID) -> DomainOrder | None:
+        """The order with its lines as committed in the DB, or ``None``."""
+        row = (await self._session.execute(_order_select(Order.id == order_id))).scalar_one_or_none()
+        return to_domain(row) if row is not None else None
 
     async def get_order_status(self, order_id: uuid.UUID) -> OrderStatus | None:
         """The order's **committed** status, straight from the row — or ``None`` if it never existed.
 
-        A Core column select, deliberately not ``select(Order)``: the ORM answers
-        an attribute read from the identity map, so a caller asking *after*
-        another actor flipped the row on its own session (a cancel racing the
-        drive) would be handed the stale status. That answer decides whether a
-        refunded shortfall still has a poller to settle it, so it must be the DB's.
+        A single-column Core select: a cheaper answer than :meth:`get_order` for
+        the callers that only need to know whether a concurrent cancel won.
         """
         stmt = select(Order.__table__.c.status).where(Order.__table__.c.id == order_id)
         return (await self._session.execute(stmt)).scalar_one_or_none()
 
-    async def get_by_idempotency(self, user_id: uuid.UUID, idempotency_key: str) -> Order | None:
+    async def get_by_idempotency(self, user_id: uuid.UUID, idempotency_key: str) -> DomainOrder | None:
         """The order already placed under ``(user_id, key)``, with lines, or ``None``."""
-        stmt = (
-            select(Order)
-            .where(Order.user_id == user_id, Order.idempotency_key == idempotency_key)
-            .options(selectinload(Order.items))
-        )
-        return (await self._session.execute(stmt)).scalar_one_or_none()
+        stmt = _order_select(Order.user_id == user_id, Order.idempotency_key == idempotency_key)
+        row = (await self._session.execute(stmt)).scalar_one_or_none()
+        return to_domain(row) if row is not None else None
 
     # --- checkout writes --------------------------------------------
 
@@ -168,7 +175,7 @@ class OrdersRepository:
         total: Decimal,
         lines: list[tuple[uuid.UUID, str, Decimal, int]],
         user_email: str = "",
-    ) -> tuple[Order, bool]:
+    ) -> tuple[DomainOrder, bool]:
         """Insert the ``pending`` order + snapshotted lines; a key replay returns the winner.
 
         Returns ``(order, created)``: exactly one row per ``(user_id, key)``
@@ -210,10 +217,7 @@ class OrdersRepository:
                 )
             )
         self._session.add(SagaLog(order_id=order.id, step="create", status="completed"))
-        # Snapshot the id BEFORE the commit: reading ``order.id`` afterwards is
-        # safe only because every sessionmaker sets ``expire_on_commit=False`` —
-        # a default sessionmaker would expire the instance and turn the read
-        # into a synchronous lazy-load (MissingGreenlet on asyncpg).
+        # Snapshot the id before the commit so nothing below reads an ORM attribute.
         order_id = order.id
         try:
             await self._session.commit()
@@ -232,7 +236,7 @@ class OrdersRepository:
 
     async def _loser_reads_winner(
         self, user_id: uuid.UUID, idempotency_key: str, exc: IntegrityError
-    ) -> tuple[Order, bool]:
+    ) -> tuple[DomainOrder, bool]:
         """Translate a lost idempotency race into the winner's row.
 
         Runs after the rollback: a fresh transaction re-reads the committed
@@ -252,7 +256,7 @@ class OrdersRepository:
         expect: list[OrderStatus],
         to_status: OrderStatus,
         outbox: OutboxMessage | None = None,
-    ) -> Order | None:
+    ) -> DomainOrder | None:
         """Guarded ``status IN expect → to`` flip; ``None`` when the lifecycle refused.
 
         Raw UPDATE (not the ORM unit-of-work) so a crash-recovery replay racing a
@@ -267,8 +271,8 @@ class OrdersRepository:
                 .where(Order.id == order_id, Order.status.in_(expect))
                 .values(status=to_status)
                 .returning(Order.id)
-                # Bypassed-ORM read afterwards (see below), so don't expire the
-                # identity map into a synchronous lazy-load (MissingGreenlet).
+                # The re-read below uses populate_existing, so in-session
+                # synchronization of the identity map is redundant work.
                 .execution_options(synchronize_session=False)
             )
         ).first()
@@ -285,15 +289,7 @@ class OrdersRepository:
                 await self._session.rollback()
                 raise
         await self._session.commit()
-        # Re-read, then refresh the mutated columns: ``get_order`` may hand back
-        # the identity-map instance holding pre-UPDATE values (the raw statement
-        # bypassed the ORM unit of work). Only columns are refreshed — the items
-        # collection stays as ``selectinload`` loaded it (``lazy="raise"`` would
-        # reject a lazily re-fetched relationship).
-        updated = await self.get_order(order_id)
-        if updated is not None:
-            await self._session.refresh(updated, attribute_names=["status", "updated_at"])
-        return updated
+        return await self.get_order(order_id)
 
     async def log_saga_step(self, order_id: uuid.UUID, step: str, status: str) -> None:
         """Journal one saga step attempt (recovery + compensation read this, not the code path)."""
@@ -350,7 +346,7 @@ class OrdersRepository:
         stmt = select(SagaLog.id).where(SagaLog.order_id == order_id, SagaLog.updated_at >= since).limit(1)
         return (await self._session.execute(stmt)).scalar_one_or_none() is not None
 
-    async def list_saga_steps(self, order_id: uuid.UUID) -> list[SagaLog]:
+    async def list_saga_steps(self, order_id: uuid.UUID) -> list[SagaStep]:
         """The order's full journal, oldest first (the execution-trace read).
 
         Each journal row is written in its own transaction, so ``created_at``
@@ -358,7 +354,7 @@ class OrdersRepository:
         stable in the (theoretical) same-microsecond case.
         """
         stmt = select(SagaLog).where(SagaLog.order_id == order_id).order_by(SagaLog.created_at.asc(), SagaLog.id.asc())
-        return list((await self._session.execute(stmt)).scalars().all())
+        return [saga_step_to_domain(row) for row in (await self._session.execute(stmt)).scalars().all()]
 
     async def rollback(self) -> None:
         """Drop any half-finished transaction (recovery's per-order error boundary).
@@ -369,7 +365,7 @@ class OrdersRepository:
         """
         await self._session.rollback()
 
-    async def claim_stuck_pending(self, *, cutoff: datetime, batch_size: int) -> list[Order]:
+    async def claim_stuck_pending(self, *, cutoff: datetime, batch_size: int) -> list[DomainOrder]:
         """Lease ``pending`` orders older than ``cutoff`` for the recovery poller.
 
         The ``updated_at = now()`` touch *is* the lease: a replica that runs
@@ -381,14 +377,14 @@ class OrdersRepository:
         """
         ids = (await self._session.execute(_CLAIM_STUCK_SQL, {"cutoff": cutoff, "batch": batch_size})).scalars().all()
         await self._session.commit()
-        claimed: list[Order] = []
+        claimed: list[DomainOrder] = []
         for order_id in ids:
             row = await self.get_order(order_id)
             if row is not None:
                 claimed.append(row)
         return claimed
 
-    async def claim_cancelled_with_pending_refund(self, *, cutoff: datetime, batch_size: int) -> list[Order]:
+    async def claim_cancelled_with_pending_refund(self, *, cutoff: datetime, batch_size: int) -> list[DomainOrder]:
         """Lease cancelled orders with an open refund intent in the journal (the poller's refund-retry claim).
 
         Same lease shape as :meth:`claim_stuck_pending` — an ``updated_at``
@@ -405,7 +401,7 @@ class OrdersRepository:
             .all()
         )
         await self._session.commit()
-        claimed: list[Order] = []
+        claimed: list[DomainOrder] = []
         for order_id in ids:
             row = await self.get_order(order_id)
             if row is not None:
