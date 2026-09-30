@@ -201,16 +201,28 @@ class InventoryService:
         """
         return await self._repo.release_for_order(order_id, stock_released_outbox)
 
-    async def commit_for_order(self, order_id: uuid.UUID) -> int:
-        """Consume every still-``held`` reservation of one order (saga success).
+    async def restock_for_order(self, order_id: uuid.UUID) -> int:
+        """Give back the stock of an order's ``committed`` reservations (saga compensation).
+
+        For an order that was cancelled after its holds were consumed — the
+        ``held``-only :meth:`release_for_order` cannot reach them. Returns how
+        many were reversed; a replay reverses nothing. Must only be called for
+        an order that is terminally not ``paid``.
+        """
+        return await self._repo.restock_for_order(order_id, stock_released_outbox)
+
+    async def commit_for_order(self, order_id: uuid.UUID, *, expected: int) -> int:
+        """Consume the order's still-``held`` reservations, all-or-nothing (saga success).
 
         The recovery poller's finish for a checkout whose payment succeeded but
-        whose per-line commits never ran. Returns how many of the order's
-        reservations are in ``committed`` status after the call — the end-state
-        count (not the per-call rowcount) so a replay of an already-committed
-        order reports its lines instead of a false shortfall.
+        whose per-line commits never ran. ``expected`` is the order's line count;
+        a shortfall consumes nothing so the caller's compensation can release the
+        survivors. Returns how many of the order's reservations are in
+        ``committed`` status after the call — the end-state count (not the
+        per-call rowcount) so a replay of an already-committed order reports its
+        lines instead of a false shortfall.
         """
-        return await self._repo.commit_for_order(order_id)
+        return await self._repo.commit_for_order(order_id, expected=expected)
 
     async def commit_reservation(self, reservation_id: uuid.UUID) -> bool:
         """Consume a held reservation on payment success; ``False`` on replay."""

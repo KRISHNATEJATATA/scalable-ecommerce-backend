@@ -293,12 +293,25 @@ the exceptional path, not the routine race outcome.
   composes four modules, and only shared code may do that.
 - **Paid-implies-consumed.** Every commit site (drive and poller alike) checks
   `commit_for_order`'s answer — the order's committed hold total, retry-safe —
-  against the order's line count before marking `paid`. A shortfall means the
-  reaper released the holds before the payment confirmed (
-  paid-without-consume window): the order is compensated instead of paid and the
-  charge is refunded— the refund's own failure is the alertable case
+  against the order's line count before marking `paid`. The commit itself is
+  **all-or-nothing**: the saga passes the line count as `expected`, and when the
+  committed + still-`held` reservations fall short of it (the reaper released a
+  hold before the payment confirmed), **nothing is consumed** — the surviving
+  holds stay `held` so the compensation's `release_for_order` returns them to
+  the pool (it only claims `held` rows, so a half-consumed order would lose the
+  survivors' stock for good). The order is then compensated instead of paid and the
+  charge is refunded — the refund's own failure is the alertable case
   (`checkout_paid_without_consume_total` beside
   `checkout_orphaned_paid_payments_total`, RUNBOOK §9).
+- **Cancelled after a full commit.** If every hold was committed and a cancel
+  then wins the guarded `pending → paid` flip (the drive's orphan arm, or the
+  poller's `mark_paid`), `release_for_order` cannot help — it only claims
+  `held` rows. The refund path therefore also calls `restock_for_order`: one
+  transaction that claims the order's `committed` reservations, does
+  `on_hand += qty`, flips them `released` and emits `StockReleased`. It is
+  idempotent (a replay finds no `committed` rows) and guarded by the order being
+  `cancelled` — never run for a `paid` order. A failed restock leaves
+  `refund: requested` open, so the poller's refund-retry claim retries it.
 - **Timeouts are relationships, enforced at startup**: the per-step saga
   timeout (`CHECKOUT_SAGA_STEP_TIMEOUT_SECONDS`) must stay below
   `RESERVATION_TTL_SECONDS`, so a live checkout can't lose its stock to the

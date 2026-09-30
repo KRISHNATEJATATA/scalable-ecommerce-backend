@@ -441,6 +441,15 @@ SELECT p.id, p.order_id, p.amount FROM payments.payments p
 -- Refunded charges — the saga's automatic undo landing.
 -- Informational: a refunded payment needs no action and never leaves this set.
 SELECT count(*) FROM payments.payments WHERE status = 'refunded' AND updated_at >= now() - interval '1 day';
+-- Cancelled orders that still own consumed stock. Healthy = 0 rows. The saga's
+-- refund arm restocks `committed` reservations of an order a cancel won after
+-- a full commit; a row here means that restock failed and its open
+-- `refund: requested` marker (below) is still being retried — or, with no open
+-- marker, needs `UPDATE inventory.inventory SET on_hand = on_hand + qty` per
+-- reservation plus flipping it to `released` by hand.
+SELECT r.order_id, r.sku, r.qty FROM inventory.reservations r
+  JOIN orders.orders o ON o.id = r.order_id
+  WHERE r.status = 'committed' AND o.status = 'cancelled';
 -- Open refund intents the recovery poller is still retrying:
 -- cancelled orders whose `refund: requested` marker has no terminal marker yet.
 -- Healthy = 0 rows (or only very fresh ones); rows older than a day mean the

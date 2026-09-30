@@ -139,8 +139,11 @@ class _WorkerHolds:
     async def release_for_order(self, order_id: uuid.UUID) -> int:
         return await self._inventory.release_for_order(order_id)
 
-    async def commit_for_order(self, order_id: uuid.UUID) -> int:
-        return await self._inventory.commit_for_order(order_id)
+    async def restock_for_order(self, order_id: uuid.UUID) -> int:
+        return await self._inventory.restock_for_order(order_id)
+
+    async def commit_for_order(self, order_id: uuid.UUID, *, expected: int) -> int:
+        return await self._inventory.commit_for_order(order_id, expected=expected)
 
 
 class SagaRecovery:

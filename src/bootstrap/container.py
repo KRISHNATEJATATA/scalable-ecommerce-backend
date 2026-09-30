@@ -254,14 +254,19 @@ class OrderStockHolds(StockHoldsPort):
         """Release every still-held reservation of one order (compensation)."""
         return await self._inventory.release_for_order(order_id)
 
-    async def commit_for_order(self, order_id: uuid.UUID) -> int:
-        """Consume every still-held reservation of one order (success).
+    async def restock_for_order(self, order_id: uuid.UUID) -> int:
+        """Reverse the order's committed reservations (cancelled after a full commit)."""
+        return await self._inventory.restock_for_order(order_id)
+
+    async def commit_for_order(self, order_id: uuid.UUID, *, expected: int) -> int:
+        """Consume the order's still-held reservations, all-or-nothing (success).
 
         Returns the order's committed total after the call — the retry-safe
         end-state the saga's paid-implies-consumed invariant checks against,
-        not the per-call row count.
+        not the per-call row count. A shortfall against ``expected`` consumes
+        nothing.
         """
-        return await self._inventory.commit_for_order(order_id)
+        return await self._inventory.commit_for_order(order_id, expected=expected)
 
 
 class OrderCharges(ChargePort):

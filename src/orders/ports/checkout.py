@@ -109,8 +109,21 @@ class StockHoldsPort(Protocol):
         """Release every still-``held`` reservation of one order (compensation); returns how many."""
         ...
 
-    async def commit_for_order(self, order_id: uuid.UUID) -> int:
-        """Consume every still-``held`` reservation of one order (success).
+    async def restock_for_order(self, order_id: uuid.UUID) -> int:
+        """Reverse the order's ``committed`` reservations, returning the stock; returns how many.
+
+        For an order that was cancelled after its holds were consumed
+        (``release_for_order`` only reaches ``held`` rows). Idempotent. Never
+        call it for a ``paid`` order.
+        """
+        ...
+
+    async def commit_for_order(self, order_id: uuid.UUID, *, expected: int) -> int:
+        """Consume the order's still-``held`` reservations, all-or-nothing (success).
+
+        ``expected`` is the order's line count. When the committed + held rows
+        fall short of it nothing is consumed — the survivors stay ``held`` so the
+        caller's compensation releases them instead of leaving them deducted.
 
         Returns how many of the order's reservations are in ``committed`` status
         after the call — the retry-safe end-state, not the per-call row count

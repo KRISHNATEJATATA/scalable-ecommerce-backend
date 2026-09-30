@@ -431,6 +431,64 @@ async def test_commit_turns_a_hold_into_a_deduction_and_survives_the_reaper(sess
     assert await _reaper(sessionmaker_factory).sweep_once() == 0
 
 
+async def test_commit_for_order_consumes_every_hold_and_replays_the_committed_total(session):
+    await _seed(session, "sku-whole-a", 5)
+    await _seed(session, "sku-whole-b", 5)
+    order_id = uuid.uuid4()
+    service = _service(session)
+    await service.reserve_many([("sku-whole-a", 2), ("sku-whole-b", 1)], order_id)
+
+    assert await service.commit_for_order(order_id, expected=2) == 2
+    assert await _stock(session, "sku-whole-a") == (3, 0)
+    assert await _stock(session, "sku-whole-b") == (4, 0)
+
+    # A retry whose first attempt landed reports the end-state, not a false 0.
+    assert await service.commit_for_order(order_id, expected=2) == 2
+    assert await _stock(session, "sku-whole-a") == (3, 0)
+
+
+async def test_restock_for_order_returns_committed_stock_once(session):
+    """A full commit followed by the order dying: ``release_for_order`` cannot
+    reach the ``committed`` rows, ``restock_for_order`` gives the units back —
+    idempotently, with one ``StockReleased`` per line."""
+    await _seed(session, "sku-restock-a", 5)
+    await _seed(session, "sku-restock-b", 5)
+    order_id = uuid.uuid4()
+    service = _service(session)
+    await service.reserve_many([("sku-restock-a", 2), ("sku-restock-b", 1)], order_id)
+    assert await service.commit_for_order(order_id, expected=2) == 2
+    assert await service.release_for_order(order_id) == 0  # committed rows are out of its reach
+    assert await _stock(session, "sku-restock-a") == (3, 0)
+
+    assert await service.restock_for_order(order_id) == 2
+    assert await _stock(session, "sku-restock-a") == (5, 0)
+    assert await _stock(session, "sku-restock-b") == (5, 0)
+
+    assert await service.restock_for_order(order_id) == 0  # replay: nothing left to reverse
+    assert await _stock(session, "sku-restock-a") == (5, 0)
+    assert await _outbox_types(session) == ["StockReserved", "StockReserved", "StockReleased", "StockReleased"]
+
+
+async def test_commit_for_order_consumes_nothing_when_a_hold_was_released_first(session):
+    """All-or-nothing: the surviving hold must stay ``held`` so the compensation
+    can give it back — consuming it would deduct stock on an order that gets cancelled."""
+    await _seed(session, "sku-short-a", 5)
+    await _seed(session, "sku-short-b", 5)
+    order_id = uuid.uuid4()
+    service = _service(session)
+    reserved = await service.reserve_many([("sku-short-a", 2), ("sku-short-b", 1)], order_id)
+    reaped = next(r for r in reserved if r.sku == "sku-short-b")
+    assert await service.release(reaped.id) is True  # what the reaper does to an expired hold
+
+    assert await service.commit_for_order(order_id, expected=2) == 0  # shortfall: nothing consumed
+    assert await _stock(session, "sku-short-a") == (5, 2)  # still held, on_hand untouched
+    assert await _stock(session, "sku-short-b") == (5, 0)
+
+    # The caller's compensation now returns the survivor to the pool.
+    assert await service.release_for_order(order_id) == 1
+    assert await _stock(session, "sku-short-a") == (5, 0)
+
+
 async def test_two_concurrent_reapers_split_the_expired_batch_without_double_release(
     async_engine, session, sessionmaker_factory
 ):

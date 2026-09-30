@@ -137,6 +137,18 @@ _CLAIM_ORDER_SQL = text(
     "WHERE order_id = :order_id AND status = :held FOR UPDATE"
 )
 
+_CLAIM_ORDER_COMMITTED_SQL = text(
+    f"SELECT id, sku, qty, order_id FROM {SCHEMA}.reservations "  # noqa: S608
+    "WHERE order_id = :order_id AND status = :committed FOR UPDATE"
+)
+
+# The inverse of ``_CONSUME_SQL``: a consumed unit goes back on the shelf.
+_RESTOCK_SQL = text(
+    f"UPDATE {SCHEMA}.inventory "  # noqa: S608
+    "SET on_hand = on_hand + :qty, version = version + 1 "
+    "WHERE sku = :sku"
+)
+
 _MARK_COMMITTED_BATCH_SQL = text(
     f"UPDATE {SCHEMA}.reservations SET status = :committed, updated_at = now() "  # noqa: S608
     "WHERE id = ANY(:ids)"
@@ -491,13 +503,53 @@ class InventoryRepository:
         await self._session.commit()
         return len(rows)
 
-    async def commit_for_order(self, order_id: uuid.UUID) -> int:
-        """Consume every still-``held`` reservation of one order; returns the order's committed total.
+    async def restock_for_order(self, order_id: uuid.UUID, outbox_factory: OutboxFactory) -> int:
+        """Reverse every ``committed`` reservation of one order; returns how many.
+
+        The counterpart of :meth:`commit_for_order` for an order that died *after*
+        its holds were consumed (a cancel won the guarded ``pending → paid`` flip
+        following a full commit). ``release_for_order`` only claims ``held`` rows,
+        so without this the units stay deducted on a cancelled, refunded order.
+        Claim + ``on_hand += qty`` + ``committed → released`` flip + ``StockReleased``
+        outbox rows are one transaction; a replay finds no ``committed`` rows and
+        does nothing — idempotent, emits nothing. The caller must only invoke it
+        for an order that is terminally not ``paid``: the inventory module cannot
+        see order status, so that guard lives in the saga.
+        """
+        rows = (
+            await self._session.execute(
+                _CLAIM_ORDER_COMMITTED_SQL, {"order_id": order_id, "committed": ReservationStatus.COMMITTED.value}
+            )
+        ).all()
+        if not rows:
+            # Same no-rollback empty replay as release_for_order (see there).
+            return 0
+        for row in rows:
+            await self._require_one(_RESTOCK_SQL, {"sku": row.sku, "qty": row.qty}, what="order restock")
+            self._session.add(self._outbox_row(outbox_factory(row.sku, row.order_id, row.qty)))
+        await self._session.execute(
+            _MARK_RELEASED_BATCH_SQL,
+            {"released": ReservationStatus.RELEASED.value, "ids": [row.id for row in rows]},
+        )
+        await self._session.commit()
+        return len(rows)
+
+    async def commit_for_order(self, order_id: uuid.UUID, *, expected: int) -> int:
+        """Consume the order's ``held`` reservations, all-or-nothing; returns the order's committed total.
 
         The saga's success path when the payment already succeeded but the crash
         came before the per-line commits (or the recovery poller finishing a
         crashed checkout). No event: the order/payment events announce the
         outcome. A replay finds no ``held`` rows — idempotent.
+
+        ``expected`` is the order's line count. Consumption is **all-or-nothing**:
+        when the already-``committed`` rows plus the still-``held`` ones fall
+        short of it (a hold was reaped or released before the payment
+        confirmed), nothing is consumed. The caller reacts to that shortfall by
+        refunding and compensating, and compensation only gives back ``held``
+        rows — a ``committed`` row would have its stock deducted for good on an
+        order that ends up cancelled. The surviving holds stay ``held`` so the
+        compensation's release returns them to the pool.
 
         The return is **how many of the order's reservations are in ``committed``
         status after this call**, not how many rows this call itself moved. The
@@ -505,34 +557,42 @@ class InventoryRepository:
         attempt may have committed server-side after its caller gave up, so a
         replay's zero-rows claim would otherwise read as "nothing consumed" —
         a false shortfall the caller would compensate a fully-consumed order
-        over. Counting the end-state (inside the same transaction, own uncommitted
-        marks visible) makes every attempt agree. A concurrent committer is not a
-        hazard: the ``FOR UPDATE`` claim serializes same-order work — the second
-        claimant blocks on the row locks, then re-checks the ``held`` predicate
-        and matches nothing, so its count sees the first's committed rows.
+        over. Counting the end-state (after the claim, so a concurrent committer's
+        landed rows are visible) makes every attempt agree. A concurrent committer
+        is not a hazard: the ``FOR UPDATE`` claim serializes same-order work — the
+        second claimant blocks on the row locks, then re-checks the ``held``
+        predicate and matches nothing, so its count sees the first's committed rows.
         """
         rows = (
             await self._session.execute(_CLAIM_ORDER_SQL, {"order_id": order_id, "held": ReservationStatus.HELD.value})
         ).all()
-        if rows:
-            for row in rows:
-                await self._require_one(_CONSUME_SQL, {"sku": row.sku, "qty": row.qty}, what="order commit consume")
-            await self._session.execute(
-                _MARK_COMMITTED_BATCH_SQL,
-                {"committed": ReservationStatus.COMMITTED.value, "ids": [row.id for row in rows]},
-            )
+        # Read after the claim, in the same transaction: READ COMMITTED gives a
+        # fresh snapshot per statement, so another committer's landed rows count.
+        already_committed = int(
+            (
+                await self._session.execute(
+                    select(func.count())
+                    .select_from(Reservation)
+                    .where(Reservation.order_id == order_id, Reservation.status == ReservationStatus.COMMITTED.value)
+                )
+            ).scalar_one()
+        )
+        if not rows:
+            return already_committed
+        if already_committed + len(rows) < expected:
+            # Nothing was written: ending the transaction only drops the claim's
+            # row locks. commit(), not rollback() — rollback would expire the
+            # caller's loaded rows (the release path avoids it for the same reason).
             await self._session.commit()
-        # Zero-rows replay: a read-only count in the session's implicit
-        # transaction — READ COMMITTED sees a fresh snapshot per statement, so
-        # another committer's landed rows are visible. Nothing to commit.
-        committed = (
-            await self._session.execute(
-                select(func.count())
-                .select_from(Reservation)
-                .where(Reservation.order_id == order_id, Reservation.status == ReservationStatus.COMMITTED.value)
-            )
-        ).scalar_one()
-        return int(committed)
+            return already_committed
+        for row in rows:
+            await self._require_one(_CONSUME_SQL, {"sku": row.sku, "qty": row.qty}, what="order commit consume")
+        await self._session.execute(
+            _MARK_COMMITTED_BATCH_SQL,
+            {"committed": ReservationStatus.COMMITTED.value, "ids": [row.id for row in rows]},
+        )
+        await self._session.commit()
+        return already_committed + len(rows)
 
     async def _active_map(self, order_id: uuid.UUID, skus: list[str]) -> dict[str, Reservation]:
         """This order's existing non-released reservations for ``skus``, as ``{sku: row}``.

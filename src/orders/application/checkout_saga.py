@@ -437,7 +437,7 @@ class CheckoutSaga:
             await self._log(order_id, "commit", "started")
             try:
                 async with asyncio.timeout(self._step_timeout):
-                    await self._holds.commit_for_order(order_id)
+                    await self._holds.commit_for_order(order_id, expected=len(lines))
             except TimeoutError:
                 # Commits are idempotent per order: finish what the timeout
                 # interrupted rather than compensating a paid checkout. Still
@@ -446,7 +446,7 @@ class CheckoutSaga:
                 # poller (see below) — never a cancel after money moved.
                 try:
                     async with asyncio.timeout(self._step_timeout):
-                        await self._holds.commit_for_order(order_id)
+                        await self._holds.commit_for_order(order_id, expected=len(lines))
                 except TimeoutError as exc:
                     raise OrderStateConflictError(
                         "checkout commit timed out; it will be settled automatically"
@@ -582,6 +582,10 @@ class CheckoutSaga:
           reconciliation stays the exceptional path, never the routine one.
         """
         intent = await self._journal_refund(order_id, "requested")
+        # Stock first: the committed units of a dead order go back on the shelf
+        # (idempotent). A failure leaves the `requested` marker open below, so the
+        # poller's refund claim retries the restock alongside the refund.
+        restocked = await self._restock_cancelled_order(order_id)
         try:
             refunded = await self._charges.refund(
                 idempotency_key=payment_key_for(user_id, idempotency_key), reason=reason
@@ -611,8 +615,10 @@ class CheckoutSaga:
         if refunded:
             # Best-effort close: losing this marker leaves `requested` standing,
             # which the poller settles idempotently (a refunded row re-answers
-            # success) — the money is already safe, only the journal lags.
-            await self._journal_refund(order_id, "completed")
+            # success) — the money is already safe, only the journal lags. A
+            # failed restock deliberately leaves it open for the same retry.
+            if restocked:
+                await self._journal_refund(order_id, "completed")
             return "refunded"
         if intent:
             # The definitive-no marker makes the refusal terminal — and the
@@ -646,6 +652,31 @@ class CheckoutSaga:
             reason,
         )
         return "refused"
+
+    async def _restock_cancelled_order(self, order_id: uuid.UUID) -> bool:
+        """Give back the stock a full commit consumed on an order that then died; ``False`` on failure.
+
+        ``release_for_order`` only reaches ``held`` rows, so an order cancelled
+        *after* every hold was committed (a cancel won the guarded ``mark_paid``
+        flip) would keep its units deducted. The order's own status is the
+        guard — never restock unless it is ``cancelled`` (a ``paid`` order owns
+        its consumed stock). Idempotent; a raise is logged and reported, not
+        propagated, so the money-side refund still runs.
+        """
+        try:
+            if await self._orders.get_order_status(order_id) != OrderStatus.CANCELLED:
+                return True
+            restocked = await self._holds.restock_for_order(order_id)
+        except Exception:  # boundary: never block the refund; the journal marker keeps the retry
+            log.error(
+                "checkout order %s: could not restock the committed stock of a cancelled order", order_id, exc_info=True
+            )
+            return False
+        if restocked:
+            log.info(
+                "checkout order %s was cancelled after its holds were committed; restocked %d", order_id, restocked
+            )
+        return True
 
     async def _journal_refund(self, order_id: uuid.UUID, status: str) -> bool:
         """Best-effort refund marker; ``False`` means no durable intent exists.
@@ -777,6 +808,8 @@ class CheckoutSaga:
         boundary: the marker stands and the next pass retries, so a transient
         fault is never counted as an orphan.
         """
+        if not await self._restock_cancelled_order(order.id):
+            return "deferred"  # the marker stays open: the next pass retries the restock too
         payment = await self._charges.find_by_idempotency_key(payment_key_for(order.user_id, order.idempotency_key))
         if payment is not None and payment.refunded:
             await self._log(order.id, "refund", "completed")
@@ -872,6 +905,14 @@ class CheckoutSaga:
             if paid is not None and paid.status == OrderStatus.PAID:
                 await self._orders.log_saga_step(order.id, "mark_paid", "completed")
                 await self._consume_basket(order.user_id, _lines_of(order))
+            elif paid is None and await self._orders.get_order_status(order.id) == OrderStatus.CANCELLED:
+                # A cancel won the flip after every hold was committed: the
+                # money is out and the consumed stock is stranded on a dead
+                # order. Same undo as the drive's orphan arm (restock + refund).
+                refund = await self._refund_orphaned_charge(
+                    order.id, order.user_id, order.idempotency_key, reason="order_cancelled_after_charge"
+                )
+                return {"refunded": "refunded", "deferred": "deferred"}.get(refund, "refund_failed")
             return "completed"
         if payment is not None and payment.refunded:
             # The charge was already reversed (a previous pass's refund, or the
@@ -892,12 +933,13 @@ class CheckoutSaga:
         Returns ``True`` when every one of the order's lines was consumed
         (``commit_for_order`` reports the order's committed total, so this is
         retry-idempotent). On shortfall — stock released before the payment
-        confirmed — bumps ``checkout_paid_without_consume_total`` and returns
-        ``False``; the caller decides the terminal move (the drive refunds a
-        cancelled order or leaves a pending one for the poller, which refunds +
-        compensates).
+        confirmed — nothing is consumed (the commit is all-or-nothing, so the
+        surviving holds stay ``held`` for the compensation's release), bumps
+        ``checkout_paid_without_consume_total`` and returns ``False``; the caller
+        decides the terminal move (the drive refunds a cancelled order or leaves
+        a pending one for the poller, which refunds + compensates).
         """
-        committed = await self._holds.commit_for_order(order_id)
+        committed = await self._holds.commit_for_order(order_id, expected=expected)
         if committed >= expected:
             return True
         checkout_paid_without_consume_total.inc()

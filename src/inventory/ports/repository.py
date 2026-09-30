@@ -154,8 +154,23 @@ class InventoryRepositoryPort(Protocol):
         """
         ...
 
-    async def commit_for_order(self, order_id: uuid.UUID) -> int:
-        """Consume every still-``held`` reservation of one order (saga success).
+    async def restock_for_order(self, order_id: uuid.UUID, outbox_factory: OutboxFactory) -> int:
+        """Reverse every ``committed`` reservation of one order (``on_hand += qty``).
+
+        For an order that died after its holds were consumed. One transaction,
+        emits ``StockReleased`` per row; returns how many were reversed, ``0`` on
+        replay (nothing was ``committed``). Callers must never invoke it for a
+        ``paid`` order.
+        """
+        ...
+
+    async def commit_for_order(self, order_id: uuid.UUID, *, expected: int) -> int:
+        """Consume the order's still-``held`` reservations, all-or-nothing (saga success).
+
+        ``expected`` is the order's line count: when the committed + held rows
+        fall short of it, **nothing is consumed** (the survivors stay ``held``
+        for the compensation's release — consuming them would deduct stock on an
+        order that is about to be cancelled).
 
         Returns how many of the order's reservations are in ``committed`` status
         after the call — the retry-safe end-state, not the per-call rowcount

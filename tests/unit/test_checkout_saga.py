@@ -222,6 +222,16 @@ async def _stock(session, sku: str) -> tuple[int, int]:
     return row.on_hand, row.reserved
 
 
+async def _reservation_statuses(session, order_id: uuid.UUID) -> dict[str, str]:
+    """The order's reservation status per SKU."""
+    rows = (
+        await session.execute(
+            text("SELECT sku, status FROM inventory.reservations WHERE order_id = :id"), {"id": order_id}
+        )
+    ).all()
+    return {row.sku: row.status for row in rows}
+
+
 async def _orders_count(session) -> int:
     return (await session.execute(text("SELECT count(*) FROM orders.orders"))).scalar_one()
 
@@ -1231,7 +1241,7 @@ async def test_failure_after_payment_never_compensates(session):
     payments = PaymentsService(PaymentsRepository(session), StubPaymentGateway(), webhook_secret="test-secret")
 
     class _BreakingCommitHolds(OrderStockHolds):
-        async def commit_for_order(self, order_id):
+        async def commit_for_order(self, order_id, *, expected):
             raise RuntimeError("commit transport blew up")
 
     saga = CheckoutSaga(
@@ -1509,6 +1519,129 @@ class _CancelWinsAfterCharge(OrdersRepository):
             await super().transition_status(order_id, expect=[OrderStatus.PENDING], to_status=OrderStatus.CANCELLED)
             return None
         return await super().transition_status(order_id, expect=expect, to_status=to_status, outbox=outbox)
+
+
+async def test_cancel_after_a_full_commit_restocks_the_consumed_units(session):
+    """The cancel wins the ``mark_paid`` flip *after* every hold was committed:
+    the compensation's ``held``-only release cannot reach the consumed rows, so
+    the refund arm must restock them — ``on_hand`` returns to its seed value and
+    no ``committed`` reservation survives a cancelled, refunded order."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    inventory = InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)
+    payments = PaymentsService(PaymentsRepository(session), StubPaymentGateway(), webhook_secret="test-secret")
+    saga = CheckoutSaga(
+        _CancelWinsAfterCharge(session),
+        basket,
+        OrderStockHolds(inventory),
+        OrderCharges(payments),
+        _Idempotency(),
+        prices=_BasketTruth(basket),
+        step_timeout_seconds=60,
+    )
+
+    with pytest.raises(OrderStateConflictError):
+        await saga.checkout(user_id=USER_A, idempotency_key="key-restock", payment_token="tok_visa")
+
+    order_id = (await session.execute(text("SELECT id FROM orders.orders"))).scalar_one()
+    assert await _order_status(session, order_id) == "cancelled"
+    assert await _payment_status(session, order_id) == "refunded"
+    assert await _stock(session, str(line.product_id)) == (5, 0)  # the consumed unit is back on the shelf
+    assert set((await _reservation_statuses(session, order_id)).values()) == {"released"}
+    released = (
+        await session.execute(text("SELECT count(*) FROM inventory.outbox WHERE event_type = 'StockReleased'"))
+    ).scalar_one()
+    assert released == 1
+
+
+async def test_a_failed_restock_keeps_the_refund_marker_open_for_the_poller(session):
+    """A restock that raises must not block the refund, and must leave
+    ``refund: requested`` open so the poller's refund claim retries it."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    inventory = InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)
+    payments = PaymentsService(PaymentsRepository(session), StubPaymentGateway(), webhook_secret="test-secret")
+
+    class _FlakyRestockHolds(OrderStockHolds):
+        def __init__(self, inventory: InventoryService) -> None:
+            super().__init__(inventory)
+            self.restock_calls = 0
+
+        async def restock_for_order(self, order_id: uuid.UUID) -> int:
+            self.restock_calls += 1
+            if self.restock_calls == 1:
+                raise RuntimeError("inventory unavailable")
+            return await super().restock_for_order(order_id)
+
+    saga = CheckoutSaga(
+        _CancelWinsAfterCharge(session),
+        basket,
+        _FlakyRestockHolds(inventory),
+        OrderCharges(payments),
+        _Idempotency(),
+        prices=_BasketTruth(basket),
+        step_timeout_seconds=60,
+    )
+
+    with pytest.raises(OrderStateConflictError):
+        await saga.checkout(user_id=USER_A, idempotency_key="key-restock-retry", payment_token="tok_visa")
+
+    order_id = (await session.execute(text("SELECT id FROM orders.orders"))).scalar_one()
+    assert await _payment_status(session, order_id) == "refunded"  # the money side still ran
+    assert await _refund_markers(session, order_id) == ["requested"]  # not closed: the restock is owed
+    assert await _stock(session, str(line.product_id)) == (4, 0)
+
+    await _backdate_pending(session, order_id)
+    outcome = await saga.recover_stuck(cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50)
+
+    assert outcome == {"completed": 0, "compensated": 0, "deferred": 0, "refunded": 1, "refund_failed": 0}
+    assert await _stock(session, str(line.product_id)) == (5, 0)
+    assert await _refund_markers(session, order_id) == ["requested", "completed"]
+
+
+async def test_recovery_restocks_when_a_cancel_wins_the_poller_flip(session):
+    """The poller's ``mark_paid`` loses to a cancel after committing every hold:
+    it refunds the charge and restocks the consumed units instead of reporting
+    the order completed."""
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    repo = OrdersRepository(session)
+    inventory = InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)
+    payments = PaymentsService(PaymentsRepository(session), StubPaymentGateway(), webhook_secret="test-secret")
+    order, _ = await repo.create_pending_order(
+        user_id=USER_A,
+        idempotency_key="key-poller-cancel",
+        body_hash="hash",
+        total=Decimal("19.99"),
+        lines=[(line.product_id, line.name, line.unit_price, line.quantity)],
+    )
+    await inventory.reserve(str(line.product_id), line.quantity, order.id)
+    await payments.charge(
+        order_id=order.id,
+        idempotency_key=payment_key_for(USER_A, "key-poller-cancel"),
+        amount=Decimal("19.99"),
+        payment_method_token="tok_visa",
+    )
+    await _backdate_pending(session, order.id)
+
+    outcome = await CheckoutSaga(
+        _CancelWinsAfterCharge(session),
+        _Basket(),
+        OrderStockHolds(inventory),
+        OrderCharges(payments),
+        _Idempotency(),
+        prices=_FixedTruth({}),
+        step_timeout_seconds=60,
+    ).recover_stuck(cutoff=datetime.now(UTC) - timedelta(seconds=60), batch_size=50)
+
+    assert outcome == {"completed": 0, "compensated": 0, "deferred": 0, "refunded": 1, "refund_failed": 0}
+    assert await _order_status(session, order.id) == "cancelled"
+    assert await _payment_status(session, order.id) == "refunded"
+    assert await _stock(session, str(line.product_id)) == (5, 0)
 
 
 async def test_drive_refund_raise_journals_intent_and_the_poller_retries(session):
@@ -2279,7 +2412,11 @@ async def test_recovery_compensates_when_only_some_holds_survive_until_confirm(s
     assert _counter("checkout_paid_without_consume_total") == before + 1
     assert await _order_status(session, order.id) == "cancelled"
     assert await _stock(session, str(line_a.product_id)) == (5, 0)  # was already in the pool
-    assert await _stock(session, str(line_b.product_id)) == (4, 0)  # committed once, not released again
+    assert await _stock(session, str(line_b.product_id)) == (5, 0)  # survivor released, never consumed
+    assert await _reservation_statuses(session, order.id) == {
+        str(line_a.product_id): "released",
+        str(line_b.product_id): "released",
+    }
 
 
 async def test_drive_commit_shortfall_leaves_pending_for_recovery(session):
@@ -2297,7 +2434,7 @@ async def test_drive_commit_shortfall_leaves_pending_for_recovery(session):
         """Reports nothing to consume — the holds were reaped out from under
         the drive between reserve and commit."""
 
-        async def commit_for_order(self, order_id):
+        async def commit_for_order(self, order_id, *, expected):
             return 0
 
     saga = CheckoutSaga(
@@ -2321,6 +2458,57 @@ async def test_drive_commit_shortfall_leaves_pending_for_recovery(session):
     order_id = (await session.execute(text("SELECT id FROM orders.orders"))).scalar_one()
     assert await _order_status(session, order_id) == "pending"  # left for recovery, not paid
     assert await _stock(session, str(line.product_id)) == (5, 1)  # hold kept, nothing consumed
+
+
+async def test_drive_partial_shortfall_consumes_no_surviving_hold(session):
+    """Live-path variant of the paid-without-consume guard: with two lines and
+    one hold reaped before the commit, the surviving line must stay ``held`` —
+    consuming it would deduct stock permanently once the poller refunds and
+    cancels the order (compensation only releases ``held`` rows)."""
+    line_a = _line(product_no=1, qty=2)
+    line_b = _line(product_no=2)
+    await _seed(session, str(line_a.product_id), 10)
+    await _seed(session, str(line_b.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line_a, line_b)
+    inventory = InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)
+    payments = PaymentsService(PaymentsRepository(session), StubPaymentGateway(), webhook_secret="test-secret")
+
+    class _ReapedLineHolds(OrderStockHolds):
+        """The reaper releases line B's hold between the charge and the commit."""
+
+        async def commit_for_order(self, order_id, *, expected):
+            await session.execute(
+                text("UPDATE inventory.reservations SET expires_at = now() - interval '1 hour' WHERE sku = :sku"),
+                {"sku": str(line_b.product_id)},
+            )
+            await InventoryRepository(session).release_expired(batch_size=10, outbox_factory=stock_released_outbox)
+            return await super().commit_for_order(order_id, expected=expected)
+
+    saga = CheckoutSaga(
+        OrdersRepository(session),
+        basket,
+        _ReapedLineHolds(inventory),
+        OrderCharges(payments),
+        _Idempotency(),
+        prices=_BasketTruth(basket),
+        step_timeout_seconds=60,
+    )
+    try:
+        await saga.checkout(user_id=USER_A, idempotency_key="key-partial-drive", payment_token="tok_visa")
+    except OrderStateConflictError as exc:
+        assert "settled automatically" in exc.detail
+    else:
+        raise AssertionError("expected OrderStateConflictError on commit shortfall")
+
+    order_id = (await session.execute(text("SELECT id FROM orders.orders"))).scalar_one()
+    assert await _order_status(session, order_id) == "pending"  # left for recovery, not paid
+    assert await _stock(session, str(line_a.product_id)) == (10, 2)  # still held, on_hand untouched
+    assert await _stock(session, str(line_b.product_id)) == (5, 0)  # the reaped line is back in the pool
+    assert await _reservation_statuses(session, order_id) == {
+        str(line_a.product_id): "held",
+        str(line_b.product_id): "released",
+    }
 
 
 async def test_recovery_defers_while_payment_is_pending(session):
