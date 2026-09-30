@@ -35,13 +35,13 @@ depth):
 
 | Worker | Command | Drains | Purpose |
 |---|---|---|---|
-| Relay | `python -m src.shared.bus.relay` | Postgres `outbox` | ships unpublished rows → SNS (SKIP LOCKED) |
+| Relay | `python -m src.bootstrap.relay` | Postgres `outbox` | ships unpublished rows → SNS (SKIP LOCKED) |
 | Image worker | `python -m src.catalog.adapters.image_worker` | `image-uploads` | sniff · re-encode · thumbnails → `image_status` |
 | Cache worker | `python -m src.catalog.adapters.cache_worker` | `catalog-cache` | invalidate Valkey read-cache on `ProductUpdated`/`ProductDeleted` |
 | Cart consumer | `python -m src.cart.adapters.cart_consumer` | `cart-events` | record one durable product projection/tombstone per `ProductUpdated`/`ProductDeleted`; cart reads reconcile their own lines |
 | Notification consumer | `python -m src.notifications.adapters.notification_worker` | `notifications` | send the order-confirmation email on `OrderPlaced` (recipient from the event's checkout-time `user_email`; the `UserCreated`-materialized recipients table is the fallback); SMTP locally, SES in prod |
 | Reservation reaper | `python -m src.inventory.adapters.reaper` | Postgres `reservations` | release holds past `expires_at` (SKIP LOCKED) so a stalled saga can't leak stock |
-| Payment reconciler | `python -m src.shared.payment_reconciler` | Postgres `payments` | resolve charges still `pending` past their grace window by asking the gateway (missed-webhook backstop) |
+| Payment reconciler | `python -m src.bootstrap.payment_reconciler` | Postgres `payments` | resolve charges still `pending` past their grace window by asking the gateway (missed-webhook backstop) |
 | Retention prune | `python -m scripts.retention_prune` | Postgres `outbox`×5 + `reservations` + `saga_log` | batched deletes of terminal history past its retention (published outbox rows, released/committed reservations, saga_log of terminal orders) — see RUNBOOK §14 |
 
 The reaper polls Postgres, not a queue: run it as a small always-on service, or as

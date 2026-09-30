@@ -1,6 +1,6 @@
 """Port (Protocol) for the product snapshots a cart line carries.
 
-Implemented at the composition root (``src/shared/container.py``) over the
+Implemented at the composition root (``src/bootstrap/container.py``) over the
 catalog service — cart never names catalog (the ``module-independence``
 contract forbids even application-layer imports between modules). Read-only:
 ``None`` means unknown or soft-deleted, and the caller answers 404.

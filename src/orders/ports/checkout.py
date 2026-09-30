@@ -1,6 +1,6 @@
 """Ports for the checkout saga's cross-module calls.
 
-Implemented at the composition root (``src/shared/container.py``) over the
+Implemented at the composition root (``src/bootstrap/container.py``) over the
 inventory/payments/cart services — orders never names another module (the
 ``module-independence`` contract forbids even application-layer imports between
 modules). Each port speaks the saga's language:

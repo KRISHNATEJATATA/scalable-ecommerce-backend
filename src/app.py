@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
+from src.bootstrap.outbox import OUTBOX_SCHEMAS
 from src.cart.api import routes as cart_routes
 from src.catalog.api import routes as catalog_routes
 from src.identity.adapters.keycloak.admin_client import KeycloakIdentityAdmin
@@ -76,7 +77,9 @@ async def _lifespan(app: FastAPI):
     # reporting the alarm signal even while the relay is down (a dead relay
     # increments nothing — the DB is the source of truth). One query per tick;
     # cancelled promptly on shutdown.
-    lag_task = asyncio.create_task(poll_outbox_lag(app.state.db_sessionmaker, settings.outbox_lag_poll_seconds))
+    lag_task = asyncio.create_task(
+        poll_outbox_lag(app.state.db_sessionmaker, settings.outbox_lag_poll_seconds, schemas=OUTBOX_SCHEMAS)
+    )
     try:
         yield
     finally:

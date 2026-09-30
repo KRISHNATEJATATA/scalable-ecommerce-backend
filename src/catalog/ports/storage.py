@@ -1,7 +1,7 @@
 """Port (Protocol) for catalog image object storage.
 
 Implemented by ``adapters/s3_images.ImageStore`` (aioboto3 over S3/LocalStack)
-and wired in ``src/shared/container.py``. Typed as a structural contract so the
+and wired in ``src/bootstrap/container.py``. Typed as a structural contract so the
 presign use-case and the image worker depend on the abstraction, not aioboto3 —
 and tests can inject an in-memory fake.
 """

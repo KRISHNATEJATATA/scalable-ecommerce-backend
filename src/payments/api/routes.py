@@ -16,8 +16,8 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
+from src.bootstrap.container import get_payments_service
 from src.payments.application.service import WEBHOOK_TIMESTAMP_HEADER, PaymentsService
-from src.shared.container import get_payments_service
 
 router = APIRouter(prefix="/payments", tags=["payments"])
 

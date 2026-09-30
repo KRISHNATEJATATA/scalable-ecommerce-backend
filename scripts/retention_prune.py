@@ -43,14 +43,12 @@ from prometheus_client import Counter
 from sqlalchemy import CursorResult, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from src.bootstrap.outbox import OUTBOX_SCHEMAS
 from src.inventory.domain.reservation import ReservationStatus
 from src.orders.domain.order import OrderStatus
 from src.shared.config.setting import AppSettings, get_settings
 
 log = logging.getLogger("retention_prune")
-
-#: Every schema that owns an ``outbox`` table (one per event-publishing module).
-_OUTBOX_SCHEMAS = ("catalog", "inventory", "orders", "payments", "identity")
 
 #: Terminal = everything but the one live status. Derived from the domain enums
 #: (the single source of truth) so a new status can't silently become prunable.
@@ -112,7 +110,7 @@ async def prune_once(sessionmaker: async_sessionmaker, settings: AppSettings) ->
     batch = settings.retention_prune_batch_size
     counts: dict[str, int] = {}
     async with sessionmaker() as session:
-        for schema in _OUTBOX_SCHEMAS:
+        for schema in OUTBOX_SCHEMAS:
             counts[f"{schema}.outbox"] = await _prune_batched(
                 session,
                 _OUTBOX_SQL.format(schema=schema),

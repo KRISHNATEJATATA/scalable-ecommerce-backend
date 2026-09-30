@@ -349,7 +349,7 @@ whose signed timestamp drifts more than `PAYMENT_WEBHOOK_TOLERANCE_SECONDS` (def
 300) from now, past or future, is refused as a replay). A missed webhook would strand
 a paid charge in
 `pending` forever, so the `service`-role **payment reconciler**
-(`python -m src.shared.payment_reconciler`) polls in two sweeps: every pass takes
+(`python -m src.bootstrap.payment_reconciler`) polls in two sweeps: every pass takes
 the oldest still-`pending` charges inside the
 `[PAYMENT_RECONCILIATION_GRACE_SECONDS, PAYMENT_RECONCILIATION_MAX_AGE_SECONDS]`
 window, asks the gateway what happened (`lookup` by idempotency key), and applies
@@ -414,7 +414,7 @@ never refunds: it only scans still-`pending` charges.
 ```bash
 # Manual one-shot sweep (same image, service role)
 aws ecs run-task --cluster ecommerce --task-definition ecommerce-reconciler \
-  --overrides '{"containerOverrides":[{"name":"app","command":["python","-m","src.shared.payment_reconciler","--once"]}]}'
+  --overrides '{"containerOverrides":[{"name":"app","command":["python","-m","src.bootstrap.payment_reconciler","--once"]}]}'
 ```
 
 ```sql

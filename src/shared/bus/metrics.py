@@ -16,9 +16,9 @@ Two writers share the one gauge:
 * the relay stamps it inline at claim time (its claim query already returns
   the rows ordered by ``occurred_at``), free, for its own scrape port.
 
-Schema names are interpolated into identifier positions (validated against the
-``OUTBOX_SCHEMAS`` allow-list inside :func:`update_outbox_lag`), never taken
-from user input.
+Schema names are interpolated into identifier positions (shape-checked as plain
+SQL identifiers inside :func:`update_outbox_lag`; the list itself comes from the
+composition root), never taken from user input.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from prometheus_client import Gauge
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from src.shared.bus.constants import OUTBOX_SCHEMAS
+from src.shared.db.outbox import checked_outbox_schemas
 
 log = logging.getLogger(__name__)
 
@@ -42,17 +42,16 @@ outbox_lag_seconds = Gauge(
 )
 
 
-async def update_outbox_lag(sessionmaker: async_sessionmaker, *, schemas: Sequence[str] = OUTBOX_SCHEMAS) -> None:
+async def update_outbox_lag(sessionmaker: async_sessionmaker, *, schemas: Sequence[str]) -> None:
     """Measure every schema's lag straight from the DB and set the gauge.
 
     One session, one ``UNION ALL`` query; ``MIN`` over ``published_at IS NULL``
     rides each schema's partial index. An empty (fully drained) schema has a
     ``NULL`` age, which means **0** — no lag is not an unknown lag.
     """
-    # Schema names are interpolated into identifier positions, so anything
-    # outside the trusted constant is refused here, not trusted at the f-string.
-    if any(schema not in OUTBOX_SCHEMAS for schema in schemas):
-        raise ValueError(f"schemas must be a subset of OUTBOX_SCHEMAS, got {tuple(schemas)}")
+    # Schema names are interpolated into identifier positions, so anything that
+    # is not a plain SQL identifier is refused here, not trusted at the f-string.
+    schemas = checked_outbox_schemas(schemas)
     unions = " UNION ALL ".join(
         f"SELECT '{schema}' AS schema_name, "  # noqa: S608
         f"EXTRACT(EPOCH FROM (now() - MIN(occurred_at))) AS lag_seconds "
@@ -65,9 +64,7 @@ async def update_outbox_lag(sessionmaker: async_sessionmaker, *, schemas: Sequen
         outbox_lag_seconds.labels(schema_name).set(float(lag_seconds or 0.0))
 
 
-async def poll_outbox_lag(
-    sessionmaker: async_sessionmaker, poll_seconds: float, *, schemas: Sequence[str] = OUTBOX_SCHEMAS
-) -> None:
+async def poll_outbox_lag(sessionmaker: async_sessionmaker, poll_seconds: float, *, schemas: Sequence[str]) -> None:
     """Refresh the gauge every ``poll_seconds`` until the task is cancelled.
 
     A failed pass keeps the last values and retries: losing one sample must

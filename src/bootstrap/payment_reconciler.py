@@ -9,7 +9,7 @@ answer through the **same guarded transition a webhook uses** — so a late webh
 racing the poller is still safe, whichever arrives second updates zero rows.
 
 Same shape as the reservation reaper: a TTL plus a sweep, not a hope. Run
-continuously (``python -m src.shared.payment_reconciler``, as in
+continuously (``python -m src.bootstrap.payment_reconciler``, as in
 docker-compose) or as a scheduled one-shot in prod (EventBridge → ECS task with
 ``--once``).
 
@@ -29,6 +29,7 @@ import signal
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from valkey.asyncio import Valkey
 
+from src.bootstrap.payment_refund import cancelled_order_refund_hook
 from src.payments.adapters.db.repository import PaymentsRepository
 from src.payments.adapters.resilient_gateway import ResilientPaymentGateway
 from src.payments.adapters.stub_gateway import stub_gateway_from_settings
@@ -36,7 +37,6 @@ from src.payments.application.service import PaymentsService
 from src.payments.ports.gateway import PaymentGatewayPort
 from src.shared.clients import valkey_client
 from src.shared.config.setting import AppSettings, get_settings
-from src.shared.payment_refund import cancelled_order_refund_hook
 
 log = logging.getLogger(__name__)
 
@@ -136,7 +136,7 @@ async def run_reconciler(
 
 
 def main() -> None:  # pragma: no cover - process entrypoint
-    """`python -m src.shared.payment_reconciler [--once]` — the `service`-role poller."""
+    """`python -m src.bootstrap.payment_reconciler [--once]` — the `service`-role poller."""
     from src.shared.clients.postgres_client import create_engine, create_sessionmaker
     from src.shared.config.logging import setup_logging
     from src.shared.observability.worker_metrics import push_worker_metrics, serve_worker_metrics

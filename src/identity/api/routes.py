@@ -15,12 +15,12 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Path, Query, Request, status
 
+from src.bootstrap.container import CurrentUserDep, get_identity_admin_service
 from src.identity.api.schemas import AdminUserResponse, CreateUserRequest, CreateUserResponse, UserResponse
 from src.identity.application.service import IdentityAdminService
 from src.shared.api.query import reject_unknown_query_params
 from src.shared.auth.dependencies import require_role
 from src.shared.auth.principal import Principal
-from src.shared.container import CurrentUserDep, get_identity_admin_service
 from src.shared.db.pagination import DEFAULT_LIMIT, MAX_LIMIT, PageResponse
 
 router = APIRouter(tags=["identity"])

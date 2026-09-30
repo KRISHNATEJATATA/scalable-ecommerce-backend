@@ -14,11 +14,11 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Path, status
 
+from src.bootstrap.container import CurrentUserDep, get_inventory_service
 from src.inventory.api.schemas import InventoryResponse, StockUpsertRequest
 from src.inventory.application.service import InventoryService
 from src.shared.auth.dependencies import require_role
 from src.shared.auth.principal import Principal
-from src.shared.container import CurrentUserDep, get_inventory_service
 
 router = APIRouter(prefix="/admin/inventory", tags=["inventory"])
 

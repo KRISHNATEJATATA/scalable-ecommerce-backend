@@ -29,7 +29,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from testcontainers.postgres import PostgresContainer
 
-from src.shared.bus.constants import OUTBOX_SCHEMAS
+from src.bootstrap.outbox import OUTBOX_SCHEMAS
 from src.shared.bus.metrics import outbox_lag_seconds, update_outbox_lag
 from src.shared.bus.relay import OutboxRelay
 from src.shared.config.setting import get_settings
@@ -207,7 +207,7 @@ async def test_every_outbox_schema_actually_drains(sessionmaker) -> None:
     for schema in EXPECTED_OUTBOX_SCHEMAS:
         await _seed(sessionmaker, 2, schema)
     publisher = RecordingPublisher()
-    relay = OutboxRelay(sessionmaker, publisher, batch_size=100)  # default = OUTBOX_SCHEMAS
+    relay = OutboxRelay(sessionmaker, publisher, batch_size=100, schemas=OUTBOX_SCHEMAS)
 
     assert await relay.drain_once() == 2 * len(EXPECTED_OUTBOX_SCHEMAS)
     for schema in EXPECTED_OUTBOX_SCHEMAS:
@@ -296,6 +296,17 @@ async def test_update_outbox_lag_measures_the_database(sessionmaker) -> None:
     assert _lag_value("orders") > 0
     assert _lag_value("catalog") > 0
     assert _lag_value("identity") == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["orders; DROP TABLE x", "Orders", "1orders", "or-ders", ""])
+async def test_kernel_refuses_schema_names_that_are_not_plain_identifiers(sessionmaker, bad) -> None:
+    """Schema names are f-stringed into SQL; the kernel no longer holds a module
+    allow-list (the composition root passes it), so the shape check is the guard."""
+    with pytest.raises(ValueError):
+        OutboxRelay(sessionmaker, RecordingPublisher(), batch_size=1, schemas=("orders", bad))
+    with pytest.raises(ValueError):
+        await update_outbox_lag(sessionmaker, schemas=(bad,))
 
 
 @pytest.mark.asyncio

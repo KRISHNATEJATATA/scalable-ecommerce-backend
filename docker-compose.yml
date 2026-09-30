@@ -206,7 +206,7 @@ services:
     ports:
       # Range for the multi-replica proof (`make compose-up-multi`, --scale relay=2).
       - "9101-9102:9100"
-    command: ["python", "-m", "src.shared.bus.relay"]
+    command: ["python", "-m", "src.bootstrap.relay"]
 
   # The `service`-role image worker: drains S3 ObjectCreated events → sniff +
   # re-encode + thumbnails → marks the product image usable.
@@ -375,7 +375,7 @@ services:
       WORKER_METRICS_PORT: "9100"
     ports:
       - "9105:9100"
-    command: ["python", "-m", "src.shared.payment_reconciler"]
+    command: ["python", "-m", "src.bootstrap.payment_reconciler"]
 
   # The `service`-role saga recovery poller: settles checkout orders still
   # `pending` past the step timeout (a crashed saga must not leave stock held
@@ -399,7 +399,7 @@ services:
       WORKER_METRICS_PORT: "9100"
     ports:
       - "9107:9100"
-    command: ["python", "-m", "src.shared.saga_recovery"]
+    command: ["python", "-m", "src.bootstrap.saga_recovery"]
 
   # The shared retention prune: one batched sweep deleting terminal history
   # nobody reads after the settlement window — published outbox rows (five

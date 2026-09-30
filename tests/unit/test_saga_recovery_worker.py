@@ -12,8 +12,8 @@ from typing import cast
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from src.bootstrap.saga_recovery import SagaRecovery, run_recovery
 from src.shared.config.setting import AppSettings
-from src.shared.saga_recovery import SagaRecovery, run_recovery
 
 _DSN = "postgresql+asyncpg://u:p@localhost:5432/db"
 
@@ -60,7 +60,7 @@ async def test_failure_log_says_interval_not_backoff():
     records: list[logging.LogRecord] = []
     handler = logging.Handler()
     handler.emit = records.append  # type: ignore[method-assign]
-    logger = logging.getLogger("src.shared.saga_recovery")
+    logger = logging.getLogger("src.bootstrap.saga_recovery")
     logger.addHandler(handler)
     logger.setLevel(logging.DEBUG)
     try:

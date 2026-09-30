@@ -43,7 +43,7 @@ migrate: ## Run every module's independent Alembic chain to head (portable: one 
 	python -m alembic -c src/notifications/alembic.ini upgrade head
 
 relay: ## Run the transactional-outbox relay worker (service role; outbox → SNS)
-	python -m src.shared.bus.relay
+	python -m src.bootstrap.relay
 
 bus-setup: ## Create local SNS topics + consumer queues/DLQs/subscriptions on LocalStack
 	python -m scripts.bus_bootstrap

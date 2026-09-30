@@ -28,6 +28,9 @@ import yaml
 from prometheus_client import REGISTRY
 from sqlalchemy import text
 
+from src.bootstrap.container import OrderCharges, OrderStockHolds
+from src.bootstrap.payment_refund import orders_repository_with_payment_guard
+from src.bootstrap.saga_recovery import _WorkerBasket
 from src.cart.adapters.valkey.repository import ValkeyCartRepository
 from src.inventory.adapters.db.repository import InventoryRepository
 from src.inventory.application.outbox import stock_released_outbox
@@ -41,7 +44,6 @@ from src.payments.adapters.db.repository import PaymentsRepository
 from src.payments.adapters.resilient_gateway import ResilientPaymentGateway
 from src.payments.adapters.stub_gateway import DeferredChargeWindow, StubPaymentGateway
 from src.payments.application.service import PaymentsService, sign_webhook
-from src.shared.container import OrderCharges, OrderStockHolds
 from src.shared.errors.exceptions import (
     AuthorizationError,
     CartChangedError,
@@ -49,9 +51,7 @@ from src.shared.errors.exceptions import (
     InsufficientStockError,
     OrderStateConflictError,
 )
-from src.shared.payment_refund import orders_repository_with_payment_guard
 from src.shared.resilience import CircuitOpenError, DependencyBudgetExhaustedError
-from src.shared.saga_recovery import _WorkerBasket
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 

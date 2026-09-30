@@ -31,11 +31,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from testcontainers.postgres import PostgresContainer
 
 from src.app import create_app
+from src.bootstrap.container import get_image_store
 from src.catalog.adapters.db.repository import CatalogRepository
 from src.catalog.application.outbox import product_updated_outbox
 from src.catalog.ports.repository import PendingUpload, ProductRecord
 from src.shared.config.setting import AppSettings, get_settings
-from src.shared.container import get_image_store
 from src.shared.errors.exceptions import ConcurrentUpdateError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]

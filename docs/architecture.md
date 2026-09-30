@@ -15,9 +15,12 @@ later; extraction to microservices is documented in an ADR, not built.
 
 ```
 src/
-├── shared/        # thin shared kernel: config (pydantic-settings) + ECS JSON logging,
-│                  #   RFC 9457 errors, middleware, auth (JWKS/Principal), db/valkey/s3
-│                  #   clients, outbox bus + relay, container.py (DI composition root)
+├── shared/        # the kernel — imports no module: config (pydantic-settings) + ECS JSON
+│                  #   logging, RFC 9457 errors, middleware, auth (JWKS/Principal), db/valkey/s3
+│                  #   clients, outbox bus primitives (relay, consumer, lag poller)
+├── bootstrap/     # composition root — the only package that imports every module:
+│                  #   container.py (DI), saga recovery + payment reconciler + relay entrypoints,
+│                  #   payment-gateway factory, outbox-schema list
 ├── catalog/       # api/ application/ domain/ ports/ adapters/ — schema: catalog
 ├── inventory/     # reservations, atomic decrement, reaper — schema: inventory
 ├── orders/        # order aggregate + checkout saga + saga_log — schema: orders
@@ -34,7 +37,15 @@ layers:** `Route → Schema → Service → Repository → Model`. Services retu
 Pydantic schemas, never ORM models; all DB queries live in the module's
 `adapters/db`. Cross-module calls (the saga → inventory/payments/cart) go
 through the calling module's **own ports**, implemented at the composition root
-(`src/shared/container.py`) — never a sibling import.
+(`src/bootstrap/container.py`) — never a sibling import.
+
+Import-linter (`.importlinter`) enforces the seams: modules are independent of
+each other; the **kernel (`src.shared`) imports no module and not `src.bootstrap`**;
+modules import `src.bootstrap` only via `api.routes → bootstrap.container`
+(and `tests/unit/test_bootstrap_boundary.py` checks routes take only names the
+container *defines*, not re-exported module internals); `application` never
+imports `adapters`; `adapters` never import `api`; `domain` never imports
+`ports`/`adapters`.
 
 ```mermaid
 flowchart TD
@@ -267,7 +278,7 @@ the exceptional path, not the routine race outcome.
   the token itself is never stored.
 - **Recovery, not re-presentation.** A crash between steps leaves a `pending`
   order with holds against it. The `service`-role **saga recovery poller**
-  (`src/shared/saga_recovery.py`) claims `pending` orders older than the saga
+  (`src/bootstrap/saga_recovery.py`) claims `pending` orders older than the saga
   step timeout (`FOR UPDATE SKIP LOCKED`, so N replicas split the batch) and
   settles each from its **payment row's terminal state** — commit + mark paid
   when the charge succeeded, release + cancel otherwise (a `succeeded` charge whose
@@ -353,7 +364,8 @@ version"; recovery if it's violated: `docs/RUNBOOK.md` § 4.
 All long-running workers are separate `service`-role processes — ECS tasks in
 prod, compose services locally — never `BackgroundTasks`:
 
-- **Outbox relay** (`src.shared.bus.relay`): claims unpublished outbox rows
+- **Outbox relay** (`src.bootstrap.relay`; the loop is kernel code in
+  `src.shared.bus.relay`, handed the schema list from `src.bootstrap.outbox`): claims unpublished outbox rows
   (`FOR UPDATE SKIP LOCKED`) → publishes to SNS.
 - **Image worker** (`src.catalog.adapters.image_worker`): S3 ObjectCreated →
   sniff / re-encode / thumbnails → marks the image ready/failed (emitting
@@ -367,10 +379,10 @@ prod, compose services locally — never `BackgroundTasks`:
 - **Reservation reaper** (`src.inventory.adapters.reaper`): releases stock
   holds past `expires_at`. Cron-style loop locally; EventBridge-scheduled
   `--once` ECS task in prod.
-- **Payment reconciler** (`src.shared.payment_reconciler`): charges still
+- **Payment reconciler** (`src.bootstrap.payment_reconciler`): charges still
   `pending` past their grace window are asked about at the gateway directly
   (the missed-webhook backstop; same guarded transitions as the webhook).
-- **Saga recovery poller** (`src.shared.saga_recovery`): settles checkout
+- **Saga recovery poller** (`src.bootstrap.saga_recovery`): settles checkout
   orders still `pending` past the saga step timeout (see Checkout saga).
 - **Retention prune** (`scripts.retention_prune`): one shared batched sweep
   deleting terminal history past its retention — published outbox rows,
@@ -436,7 +448,7 @@ prod, compose services locally — never `BackgroundTasks`:
 ## Extension points
 
 - New resource = add model → repository → service → router inside its module,
-  wired in `src/shared/container.py`. Layers keep the change local.
+  wired in `src/bootstrap/container.py`. Layers keep the change local.
 - Auth-service split: identity already lives in Keycloak and the app only
   validates tokens against JWKS, so a separate issuer is a non-event.
 - Read cache / search / additional workers are additive behind the existing

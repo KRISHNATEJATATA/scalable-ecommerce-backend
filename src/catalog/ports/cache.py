@@ -1,7 +1,7 @@
 """Port (Protocol) for the catalog product read-cache.
 
 Implemented by ``adapters/cache.ValkeyProductCache`` and wired in
-``src/shared/container.py``. Typed as a structural contract so the cache-aside
+``src/bootstrap/container.py``. Typed as a structural contract so the cache-aside
 use-case in ``application/service`` and the cache-invalidation consumer depend on
 the abstraction, not on Valkey — and tests inject an in-memory fake.
 

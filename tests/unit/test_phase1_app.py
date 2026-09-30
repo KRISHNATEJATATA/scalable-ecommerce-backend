@@ -155,6 +155,7 @@ async def test_app_runs_with_no_prometheus_and_no_database():
     from prometheus_client import generate_latest
     from starlette.testclient import TestClient
 
+    from src.bootstrap.outbox import OUTBOX_SCHEMAS
     from src.shared.bus.metrics import poll_outbox_lag, update_outbox_lag
 
     settings = SETTINGS.model_copy(
@@ -177,9 +178,9 @@ async def test_app_runs_with_no_prometheus_and_no_database():
             raise RuntimeError("db unreachable")
 
     with pytest.raises(RuntimeError):
-        await update_outbox_lag(_BrokenMaker())  # the raw refresh propagates
+        await update_outbox_lag(_BrokenMaker(), schemas=OUTBOX_SCHEMAS)  # the raw refresh propagates
 
-    poll = asyncio.create_task(poll_outbox_lag(_BrokenMaker(), 0.01))
+    poll = asyncio.create_task(poll_outbox_lag(_BrokenMaker(), 0.01, schemas=OUTBOX_SCHEMAS))
     await asyncio.sleep(0.05)  # several failed passes
     poll.cancel()
     with suppress(asyncio.CancelledError):

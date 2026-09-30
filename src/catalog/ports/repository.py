@@ -1,7 +1,7 @@
 """Port (Protocol) for the catalog repository.
 
 Structural contract implemented by ``adapters/db/repository.CatalogRepository``
-and wired in ``src/shared/container.py`` . Reads and write methods (``create``/``update``/``soft_delete``)
+and wired in ``src/bootstrap/container.py`` . Reads and write methods (``create``/``update``/``soft_delete``)
 land here with the product-CRUD feature, each persisting an outbox row in the same txn.
 """
 

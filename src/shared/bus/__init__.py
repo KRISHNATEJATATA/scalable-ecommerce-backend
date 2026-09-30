@@ -13,19 +13,20 @@ this package is everything that happens *after* that commit:
   queue hop. Poison messages land in a per-subscription DLQ via SQS redrive.
 
 The relay talks to the outbox with **raw SQL against schema-qualified tables**
-(never a cross-module ORM import), keeping module-independence intact.
+(never a cross-module ORM import), keeping module-independence intact. Which
+schemas exist is composition knowledge: the relay and lag poller are handed the
+list (``src.bootstrap.outbox.OUTBOX_SCHEMAS``) and never name a module.
 """
 
 from __future__ import annotations
 
-from src.shared.bus.constants import OUTBOX_SCHEMAS, topic_name
+from src.shared.bus.constants import topic_name
 from src.shared.bus.consumer import SqsConsumer
 from src.shared.bus.publisher import SnsPublisher
 from src.shared.bus.relay import OutboxRelay, run_relay
 from src.shared.bus.tracecontext import TRACEPARENT_ATTR, format_traceparent, parse_trace_id
 
 __all__ = [
-    "OUTBOX_SCHEMAS",
     "topic_name",
     "SnsPublisher",
     "OutboxRelay",

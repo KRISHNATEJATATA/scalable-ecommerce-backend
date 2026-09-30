@@ -13,9 +13,9 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, status
 
+from src.bootstrap.container import CurrentUserDep, get_cart_service
 from src.cart.api.schemas import CartAddItem, CartResponse, CartUpdateItem
 from src.cart.application.service import CartService
-from src.shared.container import CurrentUserDep, get_cart_service
 
 router = APIRouter(prefix="/cart", tags=["cart"])
 

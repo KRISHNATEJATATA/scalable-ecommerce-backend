@@ -22,13 +22,13 @@ import httpx
 import pytest
 
 from src.app import create_app
+from src.bootstrap.container import get_catalog_service
 from src.catalog.adapters.cache_worker import make_invalidation_handler
 from src.catalog.application.service import CacheOutcome, CacheRead, CatalogService
 from src.catalog.domain.image_status import ImageStatus
 from src.catalog.ports.cache import MISS
 from src.shared.auth.dependencies import get_current_user
 from src.shared.auth.principal import Principal
-from src.shared.container import get_catalog_service
 from tests.unit.test_phase1_app import SETTINGS  # AppSettings with _env_file=None (avoids re-deriving it here)
 
 

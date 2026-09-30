@@ -1,12 +1,21 @@
 ; import-linter contract: module boundaries for the modular monolith.
 ;
-; Two contract types:
+; Package roles:
+;   src.<module>   business modules (catalog, inventory, orders, payments, identity, cart, notifications)
+;   src.shared     the KERNEL — config, errors, db/auth/bus primitives. Imports no module.
+;   src.events     versioned event contracts, shared by every module — held to the same rule.
+;   src.bootstrap  the COMPOSITION ROOT — DI container, cross-module workers, gateway
+;                  factory, outbox-schema list. The only package allowed to import every module.
+;
+; Contract types:
 ; 1. independence  — no module's domain/adapters may import another module's
 ;    domain/adapters. Cross-module references are id values only, never
 ;    direct imports.
-; 2. layers        — within a module: api -> application -> domain, with
-;    domain never importing ports/adapters (ports/adapters sit at the edges,
-;    wired by src/shared/container.py).
+; 2. forbidden     — the kernel never imports a module or the composition root;
+;    modules never import the composition root (except api.routes -> container
+;    for Depends providers); application never imports adapters; adapters never
+;    import api; domain never imports ports/adapters.
+; 3. layers        — within a module: api -> application -> domain.
 ;
 ; Run: lint-imports (or `python -m importlinter.cli`).
 
@@ -25,11 +34,83 @@ modules =
     src.identity
     src.cart
     src.notifications
-; the composition root (src/shared/container.py) is the one place allowed to
-; wire every module together for DI — routes depending on it isn't a
-; cross-module import, so exclude that edge from the independence check.
+; routes -> the composition root's Depends providers isn't a cross-module
+; import, so exclude that one edge from the independence check. The
+; modules-do-not-import-bootstrap contract below re-bounds it to exactly this edge.
 ignore_imports =
-    src.*.api.routes -> src.shared.container
+    src.*.api.routes -> src.bootstrap.container
+
+[importlinter:contract:shared-kernel-is-module-free]
+name = src.shared and src.events (kernel) never import a module or src.bootstrap
+type = forbidden
+source_modules =
+    src.shared
+    src.events
+forbidden_modules =
+    src.catalog
+    src.inventory
+    src.orders
+    src.payments
+    src.identity
+    src.cart
+    src.notifications
+    src.bootstrap
+
+[importlinter:contract:modules-do-not-import-bootstrap]
+name = Modules never import src.bootstrap (api.routes -> bootstrap.container is the one allowed edge)
+type = forbidden
+source_modules =
+    src.catalog
+    src.inventory
+    src.orders
+    src.payments
+    src.identity
+    src.cart
+    src.notifications
+forbidden_modules =
+    src.bootstrap
+ignore_imports =
+    src.*.api.routes -> src.bootstrap.container
+
+[importlinter:contract:application-does-not-import-adapters]
+name = application never imports adapters (depend on ports; adapters are wired in src/bootstrap/container.py)
+type = forbidden
+source_modules =
+    src.catalog.application
+    src.inventory.application
+    src.orders.application
+    src.payments.application
+    src.identity.application
+    src.cart.application
+    src.notifications.application
+forbidden_modules =
+    src.catalog.adapters
+    src.inventory.adapters
+    src.orders.adapters
+    src.payments.adapters
+    src.identity.adapters
+    src.cart.adapters
+    src.notifications.adapters
+
+[importlinter:contract:adapters-do-not-import-api]
+name = adapters never import api (api sits above adapters in the request flow)
+type = forbidden
+source_modules =
+    src.catalog.adapters
+    src.inventory.adapters
+    src.orders.adapters
+    src.payments.adapters
+    src.identity.adapters
+    src.cart.adapters
+    src.notifications.adapters
+forbidden_modules =
+    src.catalog.api
+    src.inventory.api
+    src.orders.api
+    src.payments.api
+    src.identity.api
+    src.cart.api
+    src.notifications.api
 
 [importlinter:contract:catalog-layers]
 name = catalog: api -> application -> domain (ports/adapters at the edges only)
@@ -42,7 +123,7 @@ containers =
     src.catalog
 
 [importlinter:contract:catalog-domain-forbidden]
-name = catalog.domain never imports ports/adapters (wiring happens in src/shared/container.py)
+name = catalog.domain never imports ports/adapters (wiring happens in src/bootstrap/container.py)
 type = forbidden
 source_modules =
     src.catalog.domain
@@ -61,7 +142,7 @@ containers =
     src.inventory
 
 [importlinter:contract:inventory-domain-forbidden]
-name = inventory.domain never imports ports/adapters (wiring happens in src/shared/container.py)
+name = inventory.domain never imports ports/adapters (wiring happens in src/bootstrap/container.py)
 type = forbidden
 source_modules =
     src.inventory.domain
@@ -80,7 +161,7 @@ containers =
     src.orders
 
 [importlinter:contract:orders-domain-forbidden]
-name = orders.domain never imports ports/adapters (wiring happens in src/shared/container.py)
+name = orders.domain never imports ports/adapters (wiring happens in src/bootstrap/container.py)
 type = forbidden
 source_modules =
     src.orders.domain
@@ -99,7 +180,7 @@ containers =
     src.payments
 
 [importlinter:contract:payments-domain-forbidden]
-name = payments.domain never imports ports/adapters (wiring happens in src/shared/container.py)
+name = payments.domain never imports ports/adapters (wiring happens in src/bootstrap/container.py)
 type = forbidden
 source_modules =
     src.payments.domain
@@ -118,7 +199,7 @@ containers =
     src.identity
 
 [importlinter:contract:identity-domain-forbidden]
-name = identity.domain never imports ports/adapters (wiring happens in src/shared/container.py)
+name = identity.domain never imports ports/adapters (wiring happens in src/bootstrap/container.py)
 type = forbidden
 source_modules =
     src.identity.domain
@@ -137,7 +218,7 @@ containers =
     src.cart
 
 [importlinter:contract:cart-domain-forbidden]
-name = cart.domain never imports ports/adapters (wiring happens in src/shared/container.py)
+name = cart.domain never imports ports/adapters (wiring happens in src/bootstrap/container.py)
 type = forbidden
 source_modules =
     src.cart.domain
@@ -156,7 +237,7 @@ containers =
     src.notifications
 
 [importlinter:contract:notifications-domain-forbidden]
-name = notifications.domain never imports ports/adapters (wiring happens in src/shared/container.py)
+name = notifications.domain never imports ports/adapters (wiring happens in src/bootstrap/container.py)
 type = forbidden
 source_modules =
     src.notifications.domain

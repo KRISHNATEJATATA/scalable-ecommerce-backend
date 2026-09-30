@@ -21,10 +21,10 @@ and the sessions, and delegates settling to
 every other worker it builds repositories only to hand them to services and
 ports — Route/Worker → Service → Repository is never short-circuited.
 
-Lives in ``shared`` (not ``orders``) deliberately: settling composes four
-modules' services, and the module-independence contract lets only shared code
-do that — the same reason the outbox relay lives in ``shared.bus``. The
-saga's decision logic stays in ``orders.application``; this is transport.
+Lives in ``bootstrap`` (not ``orders``) deliberately: settling composes four
+modules' services, and the module-independence contract lets only the
+composition root do that. The saga's decision logic stays in
+``orders.application``; this is transport.
 """
 
 from __future__ import annotations
@@ -40,6 +40,8 @@ from decimal import Decimal
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from src.bootstrap.payment_gateway import make_payment_gateway
+from src.bootstrap.payment_refund import cancelled_order_refund_hook, orders_repository_with_payment_guard
 from src.cart.adapters.valkey.repository import ValkeyCartRepository
 from src.inventory.adapters.db.repository import InventoryRepository
 from src.inventory.application.service import InventoryService
@@ -49,8 +51,6 @@ from src.orders.ports.checkout import BasketPort, ChargePort, ChargeResult, Chec
 from src.payments.adapters.db.repository import PaymentsRepository
 from src.payments.application.service import PaymentsService
 from src.shared.config.setting import AppSettings, get_settings
-from src.shared.payment_gateway import make_payment_gateway
-from src.shared.payment_refund import cancelled_order_refund_hook, orders_repository_with_payment_guard
 
 log = logging.getLogger(__name__)
 
@@ -228,7 +228,7 @@ async def run_recovery(
 
 
 def main() -> None:  # pragma: no cover - process entrypoint
-    """`python -m src.shared.saga_recovery [--once]` — the `service`-role saga recovery."""
+    """`python -m src.bootstrap.saga_recovery [--once]` — the `service`-role saga recovery."""
     from src.shared.clients import valkey_client
     from src.shared.clients.postgres_client import create_engine, create_sessionmaker
     from src.shared.config.logging import setup_logging

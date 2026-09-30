@@ -1,4 +1,4 @@
-"""Dependency-injection wiring.
+"""Dependency-injection wiring — the composition root.
 
 One provider chain per DB-backed module: ``get_session`` → ``get_<m>_repository``
 → ``get_<m>_service``. Repository/service providers are annotated to the **port**
@@ -15,6 +15,8 @@ from typing import Annotated, cast
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.bootstrap.payment_gateway import make_payment_gateway
+from src.bootstrap.payment_refund import cancelled_order_refund_hook, orders_repository_with_payment_guard
 from src.cart.adapters.valkey.repository import ValkeyCartRepository
 from src.cart.application.service import CartService
 from src.cart.ports.products import CartProductPort, ProductSnapshot
@@ -60,8 +62,6 @@ from src.shared.errors.exceptions import (
     AuthorizationError,
     DependencyUnavailableError,
 )
-from src.shared.payment_gateway import make_payment_gateway
-from src.shared.payment_refund import cancelled_order_refund_hook, orders_repository_with_payment_guard
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
@@ -445,7 +445,7 @@ def get_payment_gateway(request: Request) -> PaymentGatewayPort:
     if gateway is None:
         settings = request.app.state.settings
         # The shared factory owns the concrete gateway and its resilience shell,
-        # so the worker processes build the identical one (src/shared/payment_gateway
+        # so the worker processes build the identical one (src/bootstrap/payment_gateway
         # — the recovery worker refunds charges now, so a provider swap must reach it).
         gateway = make_payment_gateway(settings, getattr(request.app.state, "valkey", None))
         request.app.state.payment_gateway = gateway

@@ -22,18 +22,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import signal
+from collections.abc import Sequence
 from datetime import UTC, datetime
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from src.shared.bus.client import sns_client
-from src.shared.bus.constants import OUTBOX_SCHEMAS
 from src.shared.bus.metrics import outbox_lag_seconds
 from src.shared.bus.polling import poll_forever
 from src.shared.bus.publisher import SnsPublisher
-from src.shared.config.setting import AppSettings, get_settings
+from src.shared.config.setting import AppSettings
+from src.shared.db.outbox import checked_outbox_schemas
 
 log = logging.getLogger(__name__)
 
@@ -41,7 +41,8 @@ log = logging.getLogger(__name__)
 class OutboxRelay:
     """Drains outbox tables into SNS. ``publisher`` may be any object with an
     ``async publish(event_type, payload)`` method (the real :class:`SnsPublisher`
-    in production; a fake in tests)."""
+    in production; a fake in tests). ``schemas`` is the composition root's list of
+    publishing schemas; only their shape is validated here."""
 
     def __init__(
         self,
@@ -49,13 +50,13 @@ class OutboxRelay:
         publisher,
         *,
         batch_size: int,
-        schemas=OUTBOX_SCHEMAS,
+        schemas: Sequence[str],
         concurrency: int = 10,
     ) -> None:
         self._sessionmaker = sessionmaker
         self._publisher = publisher
         self._batch = batch_size
-        self._schemas = tuple(schemas)
+        self._schemas = checked_outbox_schemas(schemas)
         self._sem = asyncio.Semaphore(concurrency)
 
     async def _publish(self, event_type: str, payload) -> None:
@@ -63,8 +64,9 @@ class OutboxRelay:
             await self._publisher.publish(event_type, payload)
 
     async def _drain_schema(self, session, schema: str) -> int:
-        # `schema` is a trusted constant from OUTBOX_SCHEMAS, never user input,
-        # so f-string interpolation into the identifier position is safe.
+        # `schema` was shape-checked as a plain SQL identifier in __init__ and comes
+        # from the composition root's constant list, never user input, so
+        # f-string interpolation into the identifier position is safe.
         async with session.begin():
             rows = (
                 await session.execute(
@@ -147,7 +149,7 @@ async def run_relay(
     settings: AppSettings,
     sessionmaker: async_sessionmaker,
     *,
-    schemas=OUTBOX_SCHEMAS,
+    schemas: Sequence[str],
     stop: asyncio.Event | None = None,
 ) -> None:
     """Build a real SNS-backed relay from settings and run its loop.
@@ -173,33 +175,3 @@ async def run_relay(
             concurrency=settings.relay_publish_concurrency,
         )
         await relay.run(settings.relay_poll_interval_seconds, stop=stop)
-
-
-def main() -> None:  # pragma: no cover - process entrypoint
-    """`python -m src.shared.bus.relay` — the `service`-role relay worker."""
-    from src.shared.clients.postgres_client import create_engine, create_sessionmaker
-    from src.shared.config.logging import setup_logging
-    from src.shared.observability.worker_metrics import serve_worker_metrics
-
-    settings = get_settings()
-    setup_logging(settings.log_level)
-    serve_worker_metrics(settings, job="outbox-relay")
-    engine = create_engine(settings, worker=True)
-    sessionmaker = create_sessionmaker(engine)
-    log.info("outbox relay starting (schemas=%s)", ",".join(OUTBOX_SCHEMAS))
-
-    async def _run() -> None:
-        stop = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, stop.set)
-        try:
-            await run_relay(settings, sessionmaker, stop=stop)
-        finally:
-            await engine.dispose()
-
-    asyncio.run(_run())
-
-
-if __name__ == "__main__":  # pragma: no cover
-    main()

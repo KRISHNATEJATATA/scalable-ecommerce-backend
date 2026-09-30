@@ -13,6 +13,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 
+from src.bootstrap.container import CurrentUserDep, get_checkout_saga, get_orders_service
 from src.orders.api.schemas import CheckoutRequest, OrderExecutionResponse, OrderResponse
 from src.orders.application.checkout_saga import CheckoutSaga
 from src.orders.application.service import OrdersService
@@ -20,7 +21,6 @@ from src.orders.domain.order import OrderStatus
 from src.shared.api.query import reject_unknown_query_params
 from src.shared.auth.dependencies import PrincipalDep
 from src.shared.auth.principal import Principal
-from src.shared.container import CurrentUserDep, get_checkout_saga, get_orders_service
 from src.shared.db.pagination import DEFAULT_LIMIT, MAX_LIMIT, PageParams, PageResponse
 from src.shared.errors.exceptions import InvalidQueryParamError
 from src.shared.ratelimit import BUCKET_CHECKOUT, rate_limited

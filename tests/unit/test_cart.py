@@ -31,12 +31,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from testcontainers.postgres import PostgresContainer
 
 from src.app import create_app
+from src.bootstrap.container import get_cart_service
 from src.cart.adapters.cart_consumer import make_cart_handler
 from src.cart.application.service import CartService
 from src.cart.domain.cart import Cart, CartLine, ProductTombstonedError, should_apply_update
 from src.cart.ports.products import ProductSnapshot
 from src.shared.config.setting import AppSettings, get_settings
-from src.shared.container import get_cart_service
 from src.shared.errors.exceptions import InvalidCartOperationError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]

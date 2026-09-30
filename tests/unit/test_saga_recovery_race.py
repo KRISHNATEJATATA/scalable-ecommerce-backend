@@ -15,6 +15,7 @@ import uuid
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from src.bootstrap.saga_recovery import SagaRecovery
 from src.identity.adapters.db.repository import IdentityRepository
 from src.identity.application.outbox import user_created_outbox
 from src.inventory.adapters.db.repository import InventoryRepository
@@ -22,7 +23,6 @@ from src.inventory.application.service import InventoryService
 from src.orders.adapters.db.repository import OrdersRepository
 from src.orders.application.checkout_saga import payment_key_for
 from src.shared.config.setting import AppSettings, get_settings
-from src.shared.saga_recovery import SagaRecovery
 
 _BATCH_TIMEOUT = 30  # generous ceiling; a wedged claim must fail the test, not hang it
 

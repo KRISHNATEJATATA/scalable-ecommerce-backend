@@ -29,12 +29,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from testcontainers.postgres import PostgresContainer
 
 from src.app import create_app
+from src.bootstrap.container import InventoryStockAvailability
 from src.catalog.adapters.db.repository import CatalogRepository
 from src.catalog.application.service import CatalogService
 from src.inventory.adapters.db.repository import InventoryRepository
 from src.inventory.application.service import InventoryService
 from src.shared.config.setting import AppSettings, get_settings
-from src.shared.container import InventoryStockAvailability
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULES = ["identity", "catalog", "inventory"]

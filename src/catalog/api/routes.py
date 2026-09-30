@@ -21,6 +21,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 
+from src.bootstrap.container import CurrentUserDep, get_catalog_service
 from src.catalog.api.schemas import (
     ImagePresignRequest,
     ImagePresignResponse,
@@ -32,7 +33,6 @@ from src.catalog.application.service import CacheRead, CatalogService
 from src.shared.api.query import reject_unknown_query_params
 from src.shared.auth.dependencies import PrincipalDep, require_role
 from src.shared.auth.principal import Principal
-from src.shared.container import CurrentUserDep, get_catalog_service
 from src.shared.db.pagination import DEFAULT_LIMIT, MAX_LIMIT, PageParams, PageResponse
 from src.shared.ratelimit import BUCKET_UPLOAD, BUCKET_WRITE, rate_limited
 

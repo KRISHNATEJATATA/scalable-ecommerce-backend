@@ -1,6 +1,6 @@
 """Port (Protocol) for catalog-side stock availability.
 
-Implemented at the composition root (``src/shared/container.py``) over the
+Implemented at the composition root (``src/bootstrap/container.py``) over the
 inventory service — catalog never names inventory (see ``CONTEXT-MAP.md`` and
 the ``module-independence`` import-linter contract: no cross-module imports,
 not even at the application layer). The seam is batch-shaped so a 20-item
