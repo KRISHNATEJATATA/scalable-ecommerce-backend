@@ -367,7 +367,7 @@ prod, compose services locally — never `BackgroundTasks`:
 - **Reservation reaper** (`src.inventory.adapters.reaper`): releases stock
   holds past `expires_at`. Cron-style loop locally; EventBridge-scheduled
   `--once` ECS task in prod.
-- **Payment reconciler** (`src.payments.adapters.reconciler`): charges still
+- **Payment reconciler** (`src.shared.payment_reconciler`): charges still
   `pending` past their grace window are asked about at the gateway directly
   (the missed-webhook backstop; same guarded transitions as the webhook).
 - **Saga recovery poller** (`src.shared.saga_recovery`): settles checkout

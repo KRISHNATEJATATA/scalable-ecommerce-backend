@@ -69,9 +69,11 @@ from src.orders.ports.repository import OrdersRepositoryPort
 from src.shared.errors.exceptions import (
     CartChangedError,
     CheckoutIdempotencyConflictError,
+    DependencyUnavailableError,
     InsufficientStockError,
     OrderStateConflictError,
 )
+from src.shared.resilience import CircuitOpenError, DependencyBudgetExhaustedError
 
 log = logging.getLogger(__name__)
 
@@ -326,6 +328,7 @@ class CheckoutSaga:
         """
         total = _total(lines)
         charged = False
+        charge_uncertain = False
         try:
             await self._log(order_id, "reserve", "started")
             try:
@@ -374,10 +377,17 @@ class CheckoutSaga:
                         amount=total,
                         payment_token=payment_token,
                     )
-            except TimeoutError:
+            except (CircuitOpenError, DependencyBudgetExhaustedError):
+                raise  # No provider call was admitted; ordinary compensation is safe.
+            except (TimeoutError, DependencyUnavailableError):
                 # The charge may have landed without its answer returning —
                 # settle from the recorded outcome instead of guessing.
-                charge = await self._charges.find_by_idempotency_key(payment_key_for(user_id, idempotency_key))
+                charge_uncertain = True
+                try:
+                    charge = await self._charges.find_by_idempotency_key(payment_key_for(user_id, idempotency_key))
+                except Exception:
+                    log.exception("checkout order %s: charge lookup failed after an uncertain outcome", order_id)
+                    charge = None
                 if charge is None or not charge.failed:
                     # Unknown or still-pending outcome: the gateway may confirm a
                     # moment later, and compensating here could cancel an order
@@ -388,8 +398,9 @@ class CheckoutSaga:
                         "payment outcome unknown; retry with the same Idempotency-Key to settle"
                     ) from None
                 await self._log(order_id, "charge", "failed")
+                charge_uncertain = False
                 await self._compensate(order_id, "charge")
-                raise OrderStateConflictError("checkout payment timed out; the order was cancelled") from None
+                raise OrderStateConflictError("checkout payment failed; the order was cancelled") from None
             if charge.refunded:
                 # The charge under this key was already returned (a previous
                 # pass's refund — the poller's paid-without-consume leg, or this
@@ -420,6 +431,7 @@ class CheckoutSaga:
                 await self._compensate(order_id, "charge")
                 raise OrderStateConflictError("payment was declined; the order was cancelled")
             charged = True
+            charge_uncertain = False
             await self._log(order_id, "charge", "completed")
 
             await self._log(order_id, "commit", "started")
@@ -529,7 +541,7 @@ class CheckoutSaga:
         except (OrderStateConflictError, CheckoutIdempotencyConflictError):
             raise
         except Exception:
-            if charged:
+            if charged or charge_uncertain:
                 # Money already moved: unwinding would take payment without an
                 # order. Leave pending — the recovery poller completes it — and
                 # say so loudly instead of compensating. Covers the mark_paid

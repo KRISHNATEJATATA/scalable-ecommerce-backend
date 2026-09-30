@@ -9,7 +9,7 @@ answer through the **same guarded transition a webhook uses** — so a late webh
 racing the poller is still safe, whichever arrives second updates zero rows.
 
 Same shape as the reservation reaper: a TTL plus a sweep, not a hope. Run
-continuously (``python -m src.payments.adapters.reconciler``, as in
+continuously (``python -m src.shared.payment_reconciler``, as in
 docker-compose) or as a scheduled one-shot in prod (EventBridge → ECS task with
 ``--once``).
 
@@ -36,6 +36,7 @@ from src.payments.application.service import PaymentsService
 from src.payments.ports.gateway import PaymentGatewayPort
 from src.shared.clients import valkey_client
 from src.shared.config.setting import AppSettings, get_settings
+from src.shared.payment_refund import cancelled_order_refund_hook
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +73,7 @@ class PaymentReconciler:
                 webhook_tolerance_seconds=self._webhook_tolerance_seconds,
                 reconciliation_grace_seconds=self._grace_seconds,
                 reconciliation_max_age_seconds=self._max_age_seconds,
+                on_payment_succeeded=cancelled_order_refund_hook(session),
             )
             return await service.reconcile(batch_size=self._batch)
 
@@ -134,7 +136,7 @@ async def run_reconciler(
 
 
 def main() -> None:  # pragma: no cover - process entrypoint
-    """`python -m src.payments.adapters.reconciler [--once]` — the `service`-role poller."""
+    """`python -m src.shared.payment_reconciler [--once]` — the `service`-role poller."""
     from src.shared.clients.postgres_client import create_engine, create_sessionmaker
     from src.shared.config.logging import setup_logging
     from src.shared.observability.worker_metrics import push_worker_metrics, serve_worker_metrics

@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 from prometheus_client import REGISTRY
 from sqlalchemy import text
 
@@ -37,8 +38,9 @@ from src.orders.application.service import OrdersService
 from src.orders.domain.order import OrderStatus
 from src.orders.ports.checkout import ChargeResult, CheckoutLine
 from src.payments.adapters.db.repository import PaymentsRepository
+from src.payments.adapters.resilient_gateway import ResilientPaymentGateway
 from src.payments.adapters.stub_gateway import DeferredChargeWindow, StubPaymentGateway
-from src.payments.application.service import PaymentsService
+from src.payments.application.service import PaymentsService, sign_webhook
 from src.shared.container import OrderCharges, OrderStockHolds
 from src.shared.errors.exceptions import (
     AuthorizationError,
@@ -47,6 +49,8 @@ from src.shared.errors.exceptions import (
     InsufficientStockError,
     OrderStateConflictError,
 )
+from src.shared.payment_refund import orders_repository_with_payment_guard
+from src.shared.resilience import CircuitOpenError, DependencyBudgetExhaustedError
 from src.shared.saga_recovery import _WorkerBasket
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -185,6 +189,7 @@ def _saga(
         webhook_secret="test-secret",
         reconciliation_grace_seconds=30,
         reconciliation_max_age_seconds=604800,
+        on_payment_succeeded=OrdersRepository(session).journal_refund_if_cancelled,
     )
     return CheckoutSaga(
         OrdersRepository(session),
@@ -242,6 +247,13 @@ async def _refund_markers(session, order_id: uuid.UUID) -> list[str]:
         )
     ).all()
     return [row.status for row in rows]
+
+
+async def _unowned_paid(session) -> int:
+    """Run the exporter query against the test ledger, not a copy of its SQL."""
+    config = yaml.safe_load((REPO_ROOT / "ops/prometheus/postgres-exporter-queries.yaml").read_text())
+    query = config["checkout_orphaned_payments"]["query"]
+    return (await session.execute(text(query))).scalar_one()
 
 
 async def _saga_steps(session, order_id: uuid.UUID) -> list[str]:
@@ -953,6 +965,232 @@ async def test_charge_timeout_with_pending_payment_leaves_pending_not_cancelled(
     assert await _stock(session, str(line.product_id)) == (5, 1)  # hold kept, not released
 
 
+@pytest.mark.parametrize("lookup_fails", [False, True])
+async def test_transport_timeout_after_capture_keeps_order_pending(session, lookup_fails):
+    """The resilience wrapper translates a transport timeout into a 503 after capture."""
+
+    class CapturedButTimedOut(StubPaymentGateway):
+        async def charge(self, **kwargs):
+            await super().charge(**kwargs)
+            raise TimeoutError("response lost after capture")
+
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    gateway = CapturedButTimedOut()
+    resilient = ResilientPaymentGateway(gateway, max_attempts=1)
+    payments = PaymentsService(PaymentsRepository(session), resilient)
+
+    class Charges(OrderCharges):
+        async def find_by_idempotency_key(self, key: str) -> ChargeResult | None:
+            if lookup_fails:
+                raise RuntimeError("lookup unavailable")
+            return await super().find_by_idempotency_key(key)
+
+    saga = CheckoutSaga(
+        OrdersRepository(session),
+        basket,
+        OrderStockHolds(InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)),
+        Charges(payments),
+        _Idempotency(),
+        prices=_BasketTruth(basket),
+        step_timeout_seconds=60,
+    )
+    with pytest.raises(OrderStateConflictError, match="outcome unknown"):
+        await saga.checkout(user_id=USER_A, idempotency_key="key-transport-timeout", payment_token="tok_visa")
+
+    order_id = (await session.execute(text("SELECT id FROM orders.orders"))).scalar_one()
+    assert await _order_status(session, order_id) == "pending"
+    assert await _payment_status(session, order_id) == "pending"
+    assert await _stock(session, str(line.product_id)) == (5, 1)
+    assert (await OrdersRepository(session).latest_saga_step(order_id, "charge")) == "unknown"
+
+
+@pytest.mark.parametrize("error", [CircuitOpenError, DependencyBudgetExhaustedError])
+async def test_pre_provider_shed_still_compensates(session, error):
+    class ShedGateway(StubPaymentGateway):
+        async def charge(self, **kwargs):
+            raise error("provider never called")
+
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    saga = _saga(session, basket, gateway=ShedGateway())
+    with pytest.raises(error):
+        await saga.checkout(user_id=USER_A, idempotency_key="key-shed", payment_token="tok_visa")
+    order_id = (await session.execute(text("SELECT id FROM orders.orders"))).scalar_one()
+    assert await _order_status(session, order_id) == "cancelled"
+    assert await _stock(session, str(line.product_id)) == (5, 0)
+
+
+@pytest.mark.parametrize("confirmation", ["reconcile", "webhook"])
+async def test_late_capture_on_cancelled_order_journals_refund(session, confirmation):
+    """A succeeded transition and its refund intent commit together on a dead order."""
+
+    class CapturedButTimedOut(StubPaymentGateway):
+        async def charge(self, **kwargs):
+            await super().charge(**kwargs)
+            raise TimeoutError("response lost after capture")
+
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    gateway = CapturedButTimedOut()
+    saga = _saga(session, basket, gateway=ResilientPaymentGateway(gateway, max_attempts=1))
+    with pytest.raises(OrderStateConflictError, match="outcome unknown"):
+        await saga.checkout(user_id=USER_A, idempotency_key="key-late-capture", payment_token="tok_visa")
+    order_id = (await session.execute(text("SELECT id FROM orders.orders"))).scalar_one()
+    await OrdersRepository(session).transition_status(
+        order_id, expect=[OrderStatus.PENDING], to_status=OrderStatus.CANCELLED
+    )
+    key = payment_key_for(USER_A, "key-late-capture")
+    payments = PaymentsService(
+        PaymentsRepository(session),
+        gateway,
+        webhook_secret="test-secret",
+        reconciliation_grace_seconds=30,
+        on_payment_succeeded=OrdersRepository(session).journal_refund_if_cancelled,
+    )
+    if confirmation == "reconcile":
+        await session.execute(
+            text("UPDATE payments.payments SET created_at = now() - interval '60 seconds' WHERE order_id = :id"),
+            {"id": order_id},
+        )
+        await session.commit()
+
+        async def failed_journal(order_id: uuid.UUID) -> None:
+            raise RuntimeError("journal unavailable")
+
+        interrupted = PaymentsService(
+            PaymentsRepository(session),
+            gateway,
+            reconciliation_grace_seconds=30,
+            on_payment_succeeded=failed_journal,
+        )
+        with pytest.raises(RuntimeError, match="journal unavailable"):
+            await interrupted.reconcile(batch_size=10)
+        assert await _payment_status(session, order_id) == "pending"
+        assert await _refund_markers(session, order_id) == []
+        assert "PaymentSucceeded" not in await _payments_outbox(session)
+        assert await payments.reconcile(batch_size=10) == 1
+    else:
+        captured = await gateway.lookup(key)
+        assert captured is not None
+        body = json.dumps({"type": "payment.succeeded", "idempotency_key": key, "gateway_ref": captured.ref}).encode()
+        timestamp = int(datetime.now(UTC).timestamp())
+        assert await payments.handle_webhook(
+            body, sign_webhook(body, "test-secret", timestamp=timestamp), str(timestamp)
+        )
+    assert await _payment_status(session, order_id) == "succeeded"
+    assert await _refund_markers(session, order_id) == ["requested"]
+    assert await _unowned_paid(session) == 0
+    assert "PaymentSucceeded" in await _payments_outbox(session)
+
+    recovery = _saga(session, basket, gateway=gateway)
+    outcome = await recovery.recover_stuck(cutoff=datetime.now(UTC) + timedelta(seconds=1), batch_size=10)
+    assert outcome["refunded"] == 1
+    assert await _payment_status(session, order_id) == "refunded"
+    assert await _refund_markers(session, order_id) == ["requested", "completed"]
+    assert await _unowned_paid(session) == 0
+
+
+async def test_payment_confirmation_before_cancel_lock_journals_refund(session, sessionmaker_factory):
+    """The payment hook sees pending, then cancellation waits for its order lock."""
+    line = _line()
+    order, _ = await OrdersRepository(session).create_pending_order(
+        user_id=USER_A,
+        idempotency_key="key-confirm-before-cancel",
+        body_hash="test",
+        total=line.unit_price,
+        lines=[(line.product_id, line.name, line.unit_price, line.quantity)],
+    )
+    key = payment_key_for(USER_A, order.idempotency_key)
+    gateway = StubPaymentGateway()
+    await PaymentsRepository(session).create_pending(order_id=order.id, idempotency_key=key, amount=line.unit_price)
+    captured = await gateway.charge(amount=line.unit_price, idempotency_key=key, payment_method_token="tok_visa")
+    locked = asyncio.Event()
+    release = asyncio.Event()
+    cancelling_started = asyncio.Event()
+
+    class PausedOrderHook(OrdersRepository):
+        async def journal_refund_if_cancelled(self, order_id: uuid.UUID) -> None:
+            await super().journal_refund_if_cancelled(order_id)
+            locked.set()
+            await release.wait()
+
+    async def confirm() -> bool:
+        async with sessionmaker_factory() as confirming_session:
+            service = PaymentsService(
+                PaymentsRepository(confirming_session),
+                webhook_secret="test-secret",
+                on_payment_succeeded=PausedOrderHook(confirming_session).journal_refund_if_cancelled,
+            )
+            body = json.dumps(
+                {"type": "payment.succeeded", "idempotency_key": key, "gateway_ref": captured.ref}
+            ).encode()
+            timestamp = int(datetime.now(UTC).timestamp())
+            return await service.handle_webhook(
+                body, sign_webhook(body, "test-secret", timestamp=timestamp), str(timestamp)
+            )
+
+    async def cancel() -> None:
+        async with sessionmaker_factory() as cancelling_session:
+            cancelling_started.set()
+            result = await orders_repository_with_payment_guard(cancelling_session).transition_status(
+                order.id, expect=[OrderStatus.PENDING], to_status=OrderStatus.CANCELLED
+            )
+            assert result is not None
+
+    confirming = asyncio.create_task(confirm())
+    cancelling: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(locked.wait(), timeout=10)
+        cancelling = asyncio.create_task(cancel())
+        try:
+            await asyncio.wait_for(cancelling_started.wait(), timeout=10)
+            await asyncio.sleep(0.05)
+            assert not cancelling.done()  # waiting on the payment hook's order lock
+        finally:
+            release.set()
+        assert await asyncio.wait_for(confirming, timeout=10)
+        await asyncio.wait_for(cancelling, timeout=10)
+    finally:
+        release.set()
+        for task in (confirming, cancelling):
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    assert await _order_status(session, order.id) == "cancelled"
+    assert await _payment_status(session, order.id) == "succeeded"
+    assert await _refund_markers(session, order.id) == ["requested"]
+    assert await _unowned_paid(session) == 0
+    recovered = await _saga(session, _Basket(), gateway=gateway).recover_stuck(
+        cutoff=datetime.now(UTC) + timedelta(seconds=1), batch_size=10
+    )
+    assert recovered["refunded"] == 1
+    assert await _payment_status(session, order.id) == "refunded"
+
+
+async def test_failed_cancellation_refund_check_rolls_back_order(session):
+    order, _ = await OrdersRepository(session).create_pending_order(
+        user_id=USER_A, idempotency_key="key-cancel-check-failed", body_hash="test", total=Decimal("1"), lines=[]
+    )
+    order_id = order.id
+
+    async def unavailable(order_id: uuid.UUID) -> bool:
+        raise RuntimeError("payment ledger unavailable")
+
+    with pytest.raises(RuntimeError, match="payment ledger unavailable"):
+        await OrdersRepository(session, has_succeeded_payment=unavailable).transition_status(
+            order_id, expect=[OrderStatus.PENDING], to_status=OrderStatus.CANCELLED
+        )
+    assert await _order_status(session, order_id) == "pending"
+
+
 async def test_processing_payment_leaves_pending_without_compensating(session, real_valkey):
     """the stub accepts the charge but answers ``pending``
     (processing). The saga must refuse to unwind — the gateway may still settle
@@ -1381,6 +1619,7 @@ async def test_drive_refund_refusal_is_terminal_and_never_retried(session):
     assert _counter("checkout_orphaned_paid_payments_total") == orphan_before + 1
     assert await _refund_markers(session, order_id) == ["requested", "refused"]  # closed terminally
     assert await _payment_status(session, order_id) == "succeeded"  # the orphan pair, for RUNBOOK §9
+    assert await _unowned_paid(session) == 1
 
     await _backdate_pending(session, order_id)
     outcome = await _saga(session, _Basket()).recover_stuck(

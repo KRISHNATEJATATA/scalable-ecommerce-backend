@@ -36,7 +36,6 @@ from src.inventory.adapters.db.repository import InventoryRepository
 from src.inventory.application.service import InventoryService
 from src.inventory.ports.ownership import StockOwnershipPort
 from src.inventory.ports.repository import InventoryRepositoryPort
-from src.orders.adapters.db.repository import OrdersRepository
 from src.orders.adapters.idempotency import ValkeyIdempotencyStore
 from src.orders.application.checkout_saga import CheckoutSaga
 from src.orders.application.service import OrdersService
@@ -62,6 +61,7 @@ from src.shared.errors.exceptions import (
     DependencyUnavailableError,
 )
 from src.shared.payment_gateway import make_payment_gateway
+from src.shared.payment_refund import cancelled_order_refund_hook, orders_repository_with_payment_guard
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
@@ -200,7 +200,7 @@ def get_catalog_service(
 # --- orders ---------------------------------------------------------------
 def get_orders_repository(session: SessionDep) -> OrdersRepositoryPort:
     """Provide the orders repository bound to the request session (port-typed)."""
-    return OrdersRepository(session)
+    return orders_repository_with_payment_guard(session)
 
 
 class OrderBaskets(BasketPort):
@@ -455,6 +455,7 @@ def get_payment_gateway(request: Request) -> PaymentGatewayPort:
 def get_payments_service(
     repo: Annotated[PaymentsRepositoryPort, Depends(get_payments_repository)],
     request: Request,
+    session: SessionDep,
 ) -> PaymentsService:
     """Provide the payments service over its repository + gateway ports."""
     settings = request.app.state.settings
@@ -465,6 +466,7 @@ def get_payments_service(
         webhook_tolerance_seconds=settings.payment_webhook_tolerance_seconds,
         reconciliation_grace_seconds=settings.payment_reconciliation_grace_seconds,
         reconciliation_max_age_seconds=settings.payment_reconciliation_max_age_seconds,
+        on_payment_succeeded=cancelled_order_refund_hook(session),
     )
 
 

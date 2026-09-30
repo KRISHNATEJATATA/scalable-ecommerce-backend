@@ -349,7 +349,7 @@ whose signed timestamp drifts more than `PAYMENT_WEBHOOK_TOLERANCE_SECONDS` (def
 300) from now, past or future, is refused as a replay). A missed webhook would strand
 a paid charge in
 `pending` forever, so the `service`-role **payment reconciler**
-(`python -m src.payments.adapters.reconciler`) polls in two sweeps: every pass takes
+(`python -m src.shared.payment_reconciler`) polls in two sweeps: every pass takes
 the oldest still-`pending` charges inside the
 `[PAYMENT_RECONCILIATION_GRACE_SECONDS, PAYMENT_RECONCILIATION_MAX_AGE_SECONDS]`
 window, asks the gateway what happened (`lookup` by idempotency key), and applies
@@ -367,6 +367,17 @@ even if our row were lost. Card data never touches these paths — only a hosted
 checkout token (anything PAN-shaped is rejected at the boundary).
 
 **Refunds are the checkout saga's reverse leg, not this reconciler's job**.
+If a charge request fails after reaching the gateway (including a transport
+timeout translated to `DependencyUnavailableError`), checkout records
+`charge: unknown` and leaves the order pending for reconciliation/recovery.
+Only a circuit-open or concurrency-budget shed is known not to have reached
+the provider and can be compensated immediately. When a late webhook or the
+reconciler confirms a capture on an already-cancelled order, the succeeded
+payment, its outbox event and `refund: requested` are committed together;
+if confirmation wins the lock before cancellation, the cancellation instead
+journals the intent with its own guarded status flip. The saga recovery worker
+then refunds it. A failed refund stays journaled
+for retry, rather than silently becoming an unowned successful payment.
 When a charge lands on an order that is already dead — a cancel won the guarded
 `pending → paid` flip, or the reaper had released the holds — the saga (live drive
 or recovery poller) calls the payments service's refund leg, which refunds at the
@@ -396,13 +407,14 @@ never refunds: it only scans still-`pending` charges.
 | `PaymentFailed` with reason `abandoned_by_reconciler` | checkout died between row-create and gateway charge, or the provider lost it | find the order's checkout logs; the charge never landed gateway-side, so retrying checkout with a NEW idempotency key is safe |
 | Sudden `PaymentFailed` spike | upstream decline event or fail-token misconfiguration in tests | compare against gateway-side decline metrics before assuming a code fault |
 | `checkout_orphaned_paid_payments_total` incremented | the saga's automatic refund of a charge that landed on a dead order was **refused** by the provider (or raised before the refund intent could even be journaled) — money taken, order cancelled, and no automatic owner left | manual reconciliation required (below); the increments should be rare — treat any as a refund-provider incident, not routine race fallout |
+| `CheckoutOrphanedPayment` alert firing | Postgres reports a captured payment on a cancelled order with no open refund intent (or a refused refund) | reconcile the payment by hand below; check the payment provider before allowing another checkout |
 | Open `refund: requested` markers older than a day (query below) | the refund provider is down or rejecting every retry — the poller is still retrying, nothing is lost yet | fix the provider/breaker; the poller closes the markers on its own once refunds land. If the provider's answer is a permanent no, reconcile by hand and the next pass records `refused` |
 | `checkout_paid_without_consume_total` incremented | payment confirmed after the reaper released the order's holds (paid-without-consume) — the saga refunded that charge and compensated the order, so nothing is owed | usually nothing to do; if it comes with `checkout_orphaned_paid_payments_total`, the refund failed — refund by hand (below). The customer was never given the goods, so refund, never fulfil |
 
 ```bash
 # Manual one-shot sweep (same image, service role)
 aws ecs run-task --cluster ecommerce --task-definition ecommerce-reconciler \
-  --overrides '{"containerOverrides":[{"name":"app","command":["python","-m","src.payments.adapters.reconciler","--once"]}]}'
+  --overrides '{"containerOverrides":[{"name":"app","command":["python","-m","src.shared.payment_reconciler","--once"]}]}'
 ```
 
 ```sql
@@ -444,6 +456,10 @@ SELECT o.id, s.created_at AS refund_requested_at FROM orders.orders o
 (looping) or Pushgateway (`--once`). Liveness signal is the stuck-pending query above
 — a sustained non-zero count means it is down or falling behind (postgres_exporter
 keeps answering when the worker is dead).
+`ops/prometheus/checkout-payment-alerts.yaml` alerts on the ledger-backed
+`checkout_orphaned_payments_unowned_paid` gauge, including captures missed by
+the process-local `checkout_orphaned_paid_payments_total` counter. Open refund
+intents are excluded while recovery still owns them.
 
 ### 10. Cart events worker (cart snapshot projection)
 

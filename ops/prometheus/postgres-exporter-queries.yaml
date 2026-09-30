@@ -21,6 +21,24 @@ inventory_reservations:
         usage: "GAUGE"
         description: "Reservations past expires_at still held — the reaper's backlog. Healthy = near zero."
 
+checkout_orphaned_payments:
+  # A provider refusal or a missing refund intent needs a human. Exclude open
+  # requested intents: the recovery worker still owns those refunds.
+  query: >-
+    SELECT count(*) AS unowned_paid
+    FROM payments.payments p
+    JOIN orders.orders o ON o.id = p.order_id
+    WHERE p.status = 'succeeded' AND o.status = 'cancelled'
+      AND (NOT EXISTS (SELECT 1 FROM orders.saga_log s
+                       WHERE s.order_id = o.id AND s.step = 'refund' AND s.status = 'requested')
+           OR EXISTS (SELECT 1 FROM orders.saga_log s
+                      WHERE s.order_id = o.id AND s.step = 'refund' AND s.status = 'refused'))
+  master: true
+  metrics:
+    - unowned_paid:
+        usage: "GAUGE"
+        description: "Captured payments on cancelled orders with no pending automatic refund."
+
 db_connections:
   # Server-wide connection pressure — the total every process's pool draws
   # against (budget formula in docs/DEPLOYMENT.md). Sourced from Postgres

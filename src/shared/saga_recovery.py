@@ -43,7 +43,6 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from src.cart.adapters.valkey.repository import ValkeyCartRepository
 from src.inventory.adapters.db.repository import InventoryRepository
 from src.inventory.application.service import InventoryService
-from src.orders.adapters.db.repository import OrdersRepository
 from src.orders.adapters.idempotency import ValkeyIdempotencyStore
 from src.orders.application.checkout_saga import CheckoutSaga
 from src.orders.ports.checkout import BasketPort, ChargePort, ChargeResult, CheckoutLine, PriceTruthPort
@@ -51,6 +50,7 @@ from src.payments.adapters.db.repository import PaymentsRepository
 from src.payments.application.service import PaymentsService
 from src.shared.config.setting import AppSettings, get_settings
 from src.shared.payment_gateway import make_payment_gateway
+from src.shared.payment_refund import cancelled_order_refund_hook, orders_repository_with_payment_guard
 
 log = logging.getLogger(__name__)
 
@@ -171,9 +171,10 @@ class SagaRecovery:
             webhook_tolerance_seconds=self._settings.payment_webhook_tolerance_seconds,
             reconciliation_grace_seconds=self._settings.payment_reconciliation_grace_seconds,
             reconciliation_max_age_seconds=self._settings.payment_reconciliation_max_age_seconds,
+            on_payment_succeeded=cancelled_order_refund_hook(session),
         )
         return CheckoutSaga(
-            OrdersRepository(session),
+            orders_repository_with_payment_guard(session),
             _WorkerBasket(self._valkey, ttl_seconds=self._settings.cart_ttl_seconds),
             _WorkerHolds(inventory),
             _WorkerCharges(payments),

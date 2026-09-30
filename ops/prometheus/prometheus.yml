@@ -14,6 +14,7 @@ rule_files:
   - /etc/prometheus/inventory-reaper-alerts.yaml
   - /etc/prometheus/retention-prune-alerts.yaml
   - /etc/prometheus/db-connection-budget-alerts.yaml
+  - /etc/prometheus/checkout-payment-alerts.yaml
 
 scrape_configs:
   # The API's /metrics: RED per endpoint (http_requests_total,

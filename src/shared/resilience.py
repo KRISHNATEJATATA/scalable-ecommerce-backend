@@ -72,6 +72,10 @@ class CircuitOpenError(DependencyUnavailableError):
     """The breaker is open: the dependency is known-down — fail fast (503)."""
 
 
+class DependencyBudgetExhaustedError(DependencyUnavailableError):
+    """The concurrency budget shed the call before it reached the dependency."""
+
+
 def is_transient_exception(exc: BaseException) -> bool:
     """Classify a fault as worth retrying / breaker-counting.
 

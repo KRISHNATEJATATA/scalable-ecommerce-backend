@@ -37,7 +37,7 @@ from src.payments.application.mappers import to_domain
 from src.payments.application.outbox import payment_failed_outbox, payment_refunded_outbox, payment_succeeded_outbox
 from src.payments.domain.payment import PaymentStatus
 from src.payments.ports.gateway import GatewayCharge, GatewayOutcome, PaymentGatewayPort
-from src.payments.ports.repository import PaymentsRepositoryPort
+from src.payments.ports.repository import PaymentsRepositoryPort, PaymentSucceededHook
 from src.shared.config.setting import AppSettings
 from src.shared.db.pagination import PageParams, PageResponse
 from src.shared.errors.exceptions import (
@@ -95,9 +95,11 @@ class PaymentsService:
         webhook_tolerance_seconds: int | None = None,
         reconciliation_grace_seconds: int | None = None,
         reconciliation_max_age_seconds: int | None = None,
+        on_payment_succeeded: PaymentSucceededHook | None = None,
     ) -> None:
         self._repo = repo
         self._gateway = gateway
+        self._on_payment_succeeded = on_payment_succeeded
         self._webhook_secret = webhook_secret
         # The fields' declared defaults, not ``get_settings()``: every real call
         # site injects the configured values, so building a service must not
@@ -455,6 +457,7 @@ class PaymentsService:
                 to_status=PaymentStatus.SUCCEEDED.value,
                 gateway_ref=gateway_ref,
                 outbox_factory=payment_succeeded_outbox,
+                on_succeeded=self._on_payment_succeeded,
             )
         return await self._repo.transition(
             payment_id,

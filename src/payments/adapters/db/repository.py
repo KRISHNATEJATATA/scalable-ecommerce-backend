@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.payments.adapters.db.models import Outbox, Payment
 from src.payments.domain.payment import PaymentStatus
-from src.payments.ports.repository import PaymentOutboxFactory
+from src.payments.ports.repository import PaymentOutboxFactory, PaymentSucceededHook
 from src.shared.db.outbox import OutboxMessage
 from src.shared.db.pagination import Page, PageParams, apply_keyset, build_page, decode_cursor
 from src.shared.errors.exceptions import InvalidQueryParamError
@@ -56,6 +56,11 @@ class PaymentsRepository:
     async def get_by_idempotency_key(self, idempotency_key: str) -> Payment | None:
         stmt = select(Payment).where(Payment.idempotency_key == idempotency_key)
         return (await self._session.execute(stmt)).scalar_one_or_none()
+
+    async def has_succeeded_for_order(self, order_id: uuid.UUID) -> bool:
+        """Read the committed payment outcome without taking a payment-row lock."""
+        stmt = select(Payment.id).where(Payment.order_id == order_id, Payment.status == PaymentStatus.SUCCEEDED.value)
+        return (await self._session.execute(stmt.limit(1))).scalar_one_or_none() is not None
 
     # --- writes -----------------------------------------------------
 
@@ -99,6 +104,7 @@ class PaymentsRepository:
         failure_reason: str | None = None,
         outbox_factory: PaymentOutboxFactory | None = None,
         expect: str | None = None,
+        on_succeeded: PaymentSucceededHook | None = None,
     ) -> Payment | None:
         """Apply an outcome once; ``None`` when the payment was no longer in ``expect``.
 
@@ -134,6 +140,12 @@ class PaymentsRepository:
             return None
         if outbox_factory is not None:
             self._session.add(self._outbox_row(outbox_factory(row)))
+        if on_succeeded is not None:
+            try:
+                await on_succeeded(row["order_id"])
+            except Exception:
+                await self._session.rollback()
+                raise
         await self._session.commit()
         # Re-read, then refresh: ``get`` may hand back the identity-map instance
         # holding pre-UPDATE attribute values (the raw statement bypassed the ORM

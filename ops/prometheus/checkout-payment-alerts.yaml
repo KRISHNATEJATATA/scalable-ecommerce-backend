@@ -1,0 +1,13 @@
+# Ledger-backed orphan signal, including captures whose refund intent was never
+# journaled. Scraped from Postgres even if the API and recovery worker are down.
+groups:
+  - name: checkout-payments
+    rules:
+      - alert: CheckoutOrphanedPayment
+        expr: checkout_orphaned_payments_unowned_paid > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Captured payment on a cancelled order has no automatic refund owner"
+          description: "Reconcile the orphaned payment(s) using docs/RUNBOOK.md §9."

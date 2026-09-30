@@ -29,6 +29,7 @@ from src.shared.errors.exceptions import DependencyUnavailableError
 from src.shared.resilience import (
     CircuitBreaker,
     CircuitOpenError,
+    DependencyBudgetExhaustedError,
     ValkeyConcurrencyBudget,
     is_transient_exception,
     retry_transient,
@@ -125,7 +126,7 @@ class ResilientPaymentGateway:
                 raise
             if permit is None:
                 self._breaker.record_abandoned()  # a shed is no health signal; free any probe slot
-                raise DependencyUnavailableError("payment gateway is saturated (concurrency budget exhausted)")
+                raise DependencyBudgetExhaustedError("payment gateway is saturated (concurrency budget exhausted)")
         try:
             result = await retry_transient(
                 operation,

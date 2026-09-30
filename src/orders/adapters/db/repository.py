@@ -22,6 +22,7 @@ Returns ORM rows, never response schemas — services map them.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from decimal import Decimal
 
@@ -103,8 +104,14 @@ _CLAIM_PENDING_REFUND_SQL = text(
 class OrdersRepository:
     """Implements :class:`src.orders.ports.repository.OrdersRepositoryPort`."""
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        *,
+        has_succeeded_payment: Callable[[uuid.UUID], Awaitable[bool]] | None = None,
+    ) -> None:
         self._session = session
+        self._has_succeeded_payment = has_succeeded_payment
 
     # --- reads ------------------------------------------------------
 
@@ -270,6 +277,13 @@ class OrdersRepository:
             return None
         if outbox is not None:
             self._session.add(Outbox(event_type=outbox.event_type, payload=outbox.payload))
+        if to_status == OrderStatus.CANCELLED and self._has_succeeded_payment is not None:
+            try:
+                if await self._has_succeeded_payment(order_id):
+                    await self._request_refund_once(order_id)
+            except Exception:
+                await self._session.rollback()
+                raise
         await self._session.commit()
         # Re-read, then refresh the mutated columns: ``get_order`` may hand back
         # the identity-map instance holding pre-UPDATE values (the raw statement
@@ -285,6 +299,30 @@ class OrdersRepository:
         """Journal one saga step attempt (recovery + compensation read this, not the code path)."""
         self._session.add(SagaLog(order_id=order_id, step=step, status=status))
         await self._session.commit()
+
+    async def journal_refund_if_cancelled(self, order_id: uuid.UUID) -> None:
+        """Journal a refund intent in the caller's payment-transition transaction.
+
+        Locking the order serializes this check against a concurrent cancellation;
+        the caller commits the payment outcome, outbox event and intent together.
+        """
+        status = (
+            await self._session.execute(
+                select(Order.__table__.c.status).where(Order.__table__.c.id == order_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+        if status == OrderStatus.CANCELLED:
+            await self._request_refund_once(order_id)
+
+    async def _request_refund_once(self, order_id: uuid.UUID) -> None:
+        """Avoid reopening a completed/refused intent while holding the order lock."""
+        existing = (
+            await self._session.execute(
+                select(SagaLog.id).where(SagaLog.order_id == order_id, SagaLog.step == "refund").limit(1)
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            self._session.add(SagaLog(order_id=order_id, step="refund", status="requested"))
 
     async def latest_saga_step(self, order_id: uuid.UUID, step: str) -> str | None:
         """The most recent journal status for one step (``None`` if never attempted).

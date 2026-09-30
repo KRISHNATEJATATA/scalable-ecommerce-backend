@@ -375,7 +375,7 @@ services:
       WORKER_METRICS_PORT: "9100"
     ports:
       - "9105:9100"
-    command: ["python", "-m", "src.payments.adapters.reconciler"]
+    command: ["python", "-m", "src.shared.payment_reconciler"]
 
   # The `service`-role saga recovery poller: settles checkout orders still
   # `pending` past the step timeout (a crashed saga must not leave stock held
@@ -438,6 +438,7 @@ services:
       - ./ops/prometheus/inventory-reaper-alerts.yaml:/etc/prometheus/inventory-reaper-alerts.yaml:ro
       - ./ops/prometheus/retention-prune-alerts.yaml:/etc/prometheus/retention-prune-alerts.yaml:ro
       - ./ops/prometheus/db-connection-budget-alerts.yaml:/etc/prometheus/db-connection-budget-alerts.yaml:ro
+      - ./ops/prometheus/checkout-payment-alerts.yaml:/etc/prometheus/checkout-payment-alerts.yaml:ro
       - ./ops/prometheus/postgres-exporter-queries.yaml:/etc/prometheus/postgres-exporter-queries.yaml:ro
 
   # Same profile, second half: the DB-side exporter whose queries (expired-hold
