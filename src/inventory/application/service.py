@@ -31,8 +31,10 @@ from src.inventory.application.metrics import (
     reservation_conflict_total,
 )
 from src.inventory.application.outbox import stock_released_outbox, stock_reserved_outbox
+from src.inventory.ports.ownership import StockOwnershipPort
 from src.inventory.ports.repository import InventoryRepositoryPort, StockRejection
 from src.shared.errors.exceptions import (
+    AuthorizationError,
     InsufficientStockError,
     InvalidReservationError,
     ReservationConflictError,
@@ -45,9 +47,19 @@ log = logging.getLogger(__name__)
 class InventoryService:
     """Read + reservation use-cases over the inventory stock model."""
 
-    def __init__(self, repo: InventoryRepositoryPort, *, reservation_ttl_seconds: int) -> None:
+    def __init__(
+        self,
+        repo: InventoryRepositoryPort,
+        *,
+        reservation_ttl_seconds: int,
+        ownership: StockOwnershipPort | None = None,
+    ) -> None:
         self._repo = repo
         self._ttl = timedelta(seconds=reservation_ttl_seconds)
+        # Wired only on the HTTP path (the container); direct constructions —
+        # seed script, reaper, saga recovery — are operator/internal paths that
+        # never serve an external caller, so they skip the ownership gate.
+        self._ownership = ownership
 
     async def get_by_sku(self, sku: str) -> InventoryResponse | None:
         """Resolve a stock row by SKU, or ``None`` if absent."""
@@ -65,7 +77,9 @@ class InventoryService:
         rows = await self._repo.get_many_by_skus(skus)
         return {sku: InventoryResponse.model_validate(to_domain(row)) for sku, row in rows.items()}
 
-    async def upsert_stock(self, sku: str, on_hand: int) -> InventoryResponse:
+    async def upsert_stock(
+        self, sku: str, on_hand: int, *, caller_id: uuid.UUID | None = None, is_admin: bool = False
+    ) -> InventoryResponse | None:
         """Seed or re-point a SKU's ``on_hand`` (the merchant/admin stock upsert).
 
         Idempotent per value: re-PUT with the same ``on_hand`` lands the same
@@ -75,7 +89,20 @@ class InventoryService:
         stock *levels* (``StockReserved``/``StockReleased`` announce lifecycle
         transitions), and the catalog composes ``available`` fresh on every
         read, so there is nothing to invalidate.
+
+        Ownership gate (only when the port is wired — always on the HTTP path):
+        the SKU must resolve to a live catalog product, and a merchant may only
+        re-point their *own* product's stock — ``admin`` bypasses ownership,
+        never the route's role gate. An unresolvable SKU (unknown, soft-deleted,
+        or not a product id) returns ``None`` (route → 404); a cross-merchant
+        write raises :class:`AuthorizationError` (403) before any state moves.
         """
+        if self._ownership is not None:
+            owner_id = await self._ownership.merchant_id_for_sku(sku)
+            if owner_id is None:
+                return None
+            if owner_id != caller_id and not is_admin:
+                raise AuthorizationError("not the owner of this product")
         row = await self._repo.upsert_stock(sku, on_hand)
         if row is None:
             # The guard refused, so the row exists — but re-read it for the held

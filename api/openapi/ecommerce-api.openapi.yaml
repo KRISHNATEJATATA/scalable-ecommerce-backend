@@ -66,7 +66,7 @@ paths:
             Case-insensitive substring match over `name` and `description`;
             the characters `%`, `_` and `\` match literally. Composes (AND)
             with the other filters; result order stays the keyset `sort`
-            order — no relevance ranking (ADR 0017).
+            order — no relevance ranking.
       responses:
         "200":
           description: One keyset page of products.
@@ -752,7 +752,7 @@ paths:
         `{items, next_cursor}` pages of `{sub, email, merchant_role,
         disabled}`. `search` matches any part of username/email (substring,
         implemented as Keycloak's `*term*` infix — a `*` inside the term is
-        still a Keycloak wildcard, ADR 0015). No `sort` param — Keycloak's
+        still a Keycloak wildcard). No `sort` param — Keycloak's
         users endpoint has none (documented deviation).
       security:
         - bearerAuth: []
@@ -828,7 +828,10 @@ paths:
       summary: Declare a SKU's on-hand stock (merchant or admin)
       description: >-
         Creates the SKU's stock row or re-points its `on_hand`. Idempotent per
-        value: re-PUT with the same `on_hand` lands the same state. Answers
+        value: re-PUT with the same `on_hand` lands the same state. A SKU is
+        the product's id: a merchant may only write stock for their *own*
+        product (`403` cross-merchant; `admin` bypasses ownership), and a SKU
+        resolving to no live product answers `404`. Answers
         `409` when the row's currently-reserved units (live checkout holds)
         would exceed the new `on_hand` — reserved units may not be erased; raise
         `on_hand` or wait for the holds to release. No response event: consumers
@@ -854,6 +857,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "409":
           description: The new `on_hand` is below the units currently reserved.
           content:
@@ -1140,7 +1145,7 @@ components:
           description: >-
             The product's optimistic-lock counter — the value the `ETag`
             response header carries (quoted). Echo it back as `If-Match` on
-            PATCH/DELETE to reject stale writes with 412 (ADR 0018).
+            PATCH/DELETE to reject stale writes with 412.
       required: [id, merchant_id, name, description, category, price, image_key, image_status, image_url, image_thumbnail_urls, available, version, created_at, updated_at]
     ProductCreate:
       description: Merchant create payload. `merchant_id` is bound from the caller, never from input. `image_key`/`image_status` are worker-owned and not accepted here.

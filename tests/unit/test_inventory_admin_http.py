@@ -257,6 +257,41 @@ async def test_upsert_below_reserved_is_409(app_ctx, rsa_key):
         assert raised.status_code == 200
 
 
+async def test_cross_merchant_upsert_is_403_and_changes_nothing(app_ctx, rsa_key):
+    """Merchant B may not re-point merchant A's stock (cross-tenant IDOR guard)."""
+    app, _sessionmaker = app_ctx
+    sku, merchant_a = await _create_product(app, rsa_key)
+    merchant_b = _make_token(rsa_key, roles=["merchant"])
+
+    async with _client(app) as client:
+        seeded = await client.put(f"/v1/admin/inventory/{sku}", headers=_auth(merchant_a), json={"on_hand": 25})
+        assert seeded.status_code == 200, seeded.text
+
+        for hostile in (0, 10000):  # delist it, or oversell stock A doesn't have
+            resp = await client.put(f"/v1/admin/inventory/{sku}", headers=_auth(merchant_b), json={"on_hand": hostile})
+            assert resp.status_code == 403, resp.text
+            assert resp.headers["content-type"] == "application/problem+json"
+
+        # Stock is untouched, and the rightful owner still writes fine.
+        listing = await client.get(f"/v1/products/{sku}", headers=_auth(merchant_b))
+        assert listing.json()["available"] == 25
+        own = await client.put(f"/v1/admin/inventory/{sku}", headers=_auth(merchant_a), json={"on_hand": 30})
+        assert own.status_code == 200
+        assert own.json()["on_hand"] == 30
+
+
+async def test_upsert_unknown_sku_is_404(app_ctx, rsa_key):
+    """A SKU resolving to no live product — unknown id or not an id — answers 404."""
+    app, _sessionmaker = app_ctx
+    merchant = _make_token(rsa_key, roles=["merchant"])
+
+    async with _client(app) as client:
+        unknown = await client.put(f"/v1/admin/inventory/{uuid.uuid4()}", headers=_auth(merchant), json={"on_hand": 5})
+        assert unknown.status_code == 404
+        not_an_id = await client.put("/v1/admin/inventory/not-a-product", headers=_auth(merchant), json={"on_hand": 5})
+        assert not_an_id.status_code == 404
+
+
 async def test_api_only_seeded_checkout_succeeds(app_ctx, rsa_key):
     """The issue's acceptance shape: product + stock + cart + checkout, all API, zero SQL seeding."""
     app, _sessionmaker = app_ctx

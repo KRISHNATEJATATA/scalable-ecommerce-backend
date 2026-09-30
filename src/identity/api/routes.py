@@ -71,7 +71,7 @@ async def list_admin_users(
     Items carry ``{sub, email, merchant_role, disabled}`` resolved live from the
     Keycloak Admin API; ``search`` matches any part of username/email; unknown
     query params are a 400. No ``sort`` param — Keycloak's users endpoint has
-    none (deviation documented in frontend-handoff).
+    none.
     """
     reject_unknown_query_params(request, frozenset({"limit", "cursor", "search"}))
     return await service.list_users(limit=limit, cursor=cursor, search=search)

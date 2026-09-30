@@ -47,7 +47,7 @@ dev = [
     "ruff",
     "import-linter",
     # Type checkers used by `make typecheck` (advisory — both carry a known
-    # pre-existing baseline; see Makefile and AGENTS.md).
+    # pre-existing baseline; see Makefile).
     "basedpyright",
     "ty",
     # Bundles libmagic so Windows dev machines run the image-sniff tests instead

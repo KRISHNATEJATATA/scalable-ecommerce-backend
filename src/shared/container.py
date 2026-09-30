@@ -34,6 +34,7 @@ from src.identity.ports.admin import IdentityAdminPort
 from src.identity.ports.repository import IdentityRepositoryPort
 from src.inventory.adapters.db.repository import InventoryRepository
 from src.inventory.application.service import InventoryService
+from src.inventory.ports.ownership import StockOwnershipPort
 from src.inventory.ports.repository import InventoryRepositoryPort
 from src.orders.adapters.db.repository import OrdersRepository
 from src.orders.adapters.idempotency import ValkeyIdempotencyStore
@@ -65,18 +66,62 @@ from src.shared.payment_gateway import make_payment_gateway
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 
+# --- catalog repository ----------------------------------------------------
+# Defined before the inventory providers: the stock upsert's ownership gate
+# resolves SKU → product → merchant through it, and ``Depends`` binds the
+# provider at definition time, so it must exist first.
+def get_catalog_repository(session: SessionDep) -> CatalogRepositoryPort:
+    """Provide the catalog repository bound to the request session (port-typed).
+
+    The cast is structural, not a bypass: ``CatalogRepository`` satisfies
+    ``CatalogRepositoryPort`` at runtime (the catalog tests assert
+    ``isinstance`` for it), but SQLAlchemy's ``Mapped[...]`` descriptors make
+    the ORM's ``Product`` fail the checker's structural match against the
+    protocol's ``ProductRecord`` view of the same attributes.
+    """
+    return cast(CatalogRepositoryPort, CatalogRepository(session))
+
+
 # --- inventory ------------------------------------------------------------
 def get_inventory_repository(session: SessionDep) -> InventoryRepositoryPort:
     """Provide the inventory repository bound to the request session (port-typed)."""
     return InventoryRepository(session)
 
 
+class CatalogStockOwnership(StockOwnershipPort):
+    """Inventory's :class:`StockOwnershipPort` built over the catalog repository.
+
+    Lives here — the one place allowed to touch every module — so inventory
+    never names catalog. A SKU is ``str(product.id)``; an unparseable or
+    unknown/soft-deleted id resolves to ``None`` (the upsert answers 404).
+    Deliberately the **repository**, not ``CatalogService``: ownership is a
+    write-side guard and must never be served by the read cache.
+    """
+
+    def __init__(self, catalog: CatalogRepositoryPort) -> None:
+        self._catalog = catalog
+
+    async def merchant_id_for_sku(self, sku: str) -> uuid.UUID | None:
+        """The product's owning merchant, or ``None`` for an unresolvable SKU."""
+        try:
+            product_id = uuid.UUID(sku)
+        except ValueError:
+            return None
+        product = await self._catalog.get_product(product_id)
+        return product.merchant_id if product is not None else None
+
+
 def get_inventory_service(
     request: Request,
     repo: Annotated[InventoryRepositoryPort, Depends(get_inventory_repository)],
+    catalog: Annotated[CatalogRepositoryPort, Depends(get_catalog_repository)],
 ) -> InventoryService:
-    """Provide the inventory service over its repository port."""
-    return InventoryService(repo, reservation_ttl_seconds=request.app.state.settings.reservation_ttl_seconds)
+    """Provide the inventory service over its repository + ownership ports."""
+    return InventoryService(
+        repo,
+        reservation_ttl_seconds=request.app.state.settings.reservation_ttl_seconds,
+        ownership=CatalogStockOwnership(catalog),
+    )
 
 
 class InventoryStockAvailability(StockAvailabilityPort):
@@ -98,18 +143,8 @@ class InventoryStockAvailability(StockAvailabilityPort):
 
 
 # --- catalog --------------------------------------------------------------
-def get_catalog_repository(session: SessionDep) -> CatalogRepositoryPort:
-    """Provide the catalog repository bound to the request session (port-typed).
-
-    The cast is structural, not a bypass: ``CatalogRepository`` satisfies
-    ``CatalogRepositoryPort`` at runtime (the catalog tests assert
-    ``isinstance`` for it), but SQLAlchemy's ``Mapped[...]`` descriptors make
-    the ORM's ``Product`` fail the checker's structural match against the
-    protocol's ``ProductRecord`` view of the same attributes.
-    """
-    return cast(CatalogRepositoryPort, CatalogRepository(session))
-
-
+# The repository provider lives above the inventory section (the stock upsert's
+# ownership gate depends on it).
 def get_image_store(request: Request) -> ImageStorePort | None:
     """Provide the shared S3 image store (entered once in the app lifespan)."""
     s3 = getattr(request.app.state, "s3", None)

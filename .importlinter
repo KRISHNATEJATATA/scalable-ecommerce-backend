@@ -3,7 +3,7 @@
 ; Two contract types:
 ; 1. independence  — no module's domain/adapters may import another module's
 ;    domain/adapters. Cross-module references are id values only, never
-;    direct imports (see CONTEXT-MAP.md "Relationships").
+;    direct imports.
 ; 2. layers        — within a module: api -> application -> domain, with
 ;    domain never importing ports/adapters (ports/adapters sit at the edges,
 ;    wired by src/shared/container.py).

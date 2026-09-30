@@ -78,8 +78,7 @@ class SesSender(NotificationSenderPort):
     Sends RAW MIME, not ``send_email``: the structured API accepts no custom
     headers at all, so only a raw message carries the persisted id. Note
     SES **overwrites the ``Message-ID`` header even on raw sends** — the
-    reconciliation key is the preserved ``X-Notification-Message-Id`` header
-    (ADR 0024).
+    reconciliation key is the preserved ``X-Notification-Message-Id`` header.
     """
 
     def __init__(self, client: Any, from_address: str) -> None:

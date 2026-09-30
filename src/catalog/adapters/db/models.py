@@ -23,7 +23,7 @@ class Base(DeclarativeBase):
 class Product(Base, TimestampMixin, SoftDeleteMixin, VersionIdMixin):
     """A merchant's listing. ``merchant_id`` is an id-value reference to
     ``identity.users`` (a User with the ``merchant`` role) — never a
-    cross-schema FK (see CONTEXT-MAP.md relationships).
+    cross-schema FK.
     """
 
     __tablename__ = "products"

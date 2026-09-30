@@ -78,7 +78,7 @@ class NotificationService:
     async def handle_order_placed(self, event: dict[str, Any]) -> None:
         """Send the order confirmation for one ``OrderPlaced`` (at-least-once, suppression-aware).
 
-        The durable claim happens BEFORE the send (ADR 0024): a redelivery after
+        The durable claim happens BEFORE the send : a redelivery after
         a recorded send acks; a redelivery over a crashed attempt takes the claim
         over and resends with the same persisted message identifier.
         """

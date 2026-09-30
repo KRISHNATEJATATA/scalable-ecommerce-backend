@@ -47,7 +47,7 @@ jobs:
         run: make lint
 
       # Advisory typecheck: basedpyright + ty both carry a known pre-existing
-      # diagnostic baseline (AGENTS.md — "fix yours, don't chase the baseline"),
+      # diagnostic baseline ("fix yours, don't chase the baseline"),
       # so a hard gate would red every PR for zero signal. continue-on-error
       # keeps the output visible on every run without blocking merges. Flip to a
       # hard gate once the baseline is burned down.

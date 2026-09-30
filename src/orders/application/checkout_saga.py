@@ -657,8 +657,8 @@ class CheckoutSaga:
         ``crashed`` (payment failed or absent) or ``paid-without-consume``
         (payment succeeded but the holds were reaped) from the
         recovery poller — it labels ``checkout_compensation_total``. A
-        user-facing cancel is the mirror image of compensation (Orders
-        glossary) and deliberately never lands here.
+        user-facing cancel is the mirror image of compensation
+        and deliberately never lands here.
         """
         checkout_compensation_total.labels(failed_step).inc()
         await self._log(order_id, "compensate", "started")
