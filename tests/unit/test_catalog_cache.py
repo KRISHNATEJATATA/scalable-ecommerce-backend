@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -26,6 +25,7 @@ from src.bootstrap.container import get_catalog_service
 from src.catalog.adapters.cache_worker import make_invalidation_handler
 from src.catalog.application.service import CacheOutcome, CacheRead, CatalogService
 from src.catalog.domain.image_status import ImageStatus
+from src.catalog.domain.product import Product
 from src.catalog.ports.cache import MISS
 from src.shared.auth.dependencies import get_current_user
 from src.shared.auth.principal import Principal
@@ -84,40 +84,9 @@ class FakeProductCache:
         return product_id in self.locks
 
 
-@dataclass
-class _Row:
-    """Duck-typed catalog row (what ``to_domain`` reads)."""
-
-    id: uuid.UUID
-    merchant_id: uuid.UUID
-    name: str
-    description: str | None
-    category: str | None
-    price: Decimal
-    image_key: str | None
-    image_status: str
-    created_at: datetime
-    updated_at: datetime
-    version_id: int
-
-
-class CountingRepo:
-    """Repository fake that counts DB reads and can yield the loop mid-read."""
-
-    def __init__(self, row: _Row | None, *, delay: float = 0.0) -> None:
-        self._row = row
-        self._delay = delay
-        self.get_calls = 0
-
-    async def get_product(self, product_id: uuid.UUID):
-        self.get_calls += 1
-        await asyncio.sleep(self._delay)  # yield so a racing task can interleave
-        return self._row
-
-
-def _row(product_id: uuid.UUID) -> _Row:
+def _product(product_id: uuid.UUID) -> Product:
     now = datetime.now(UTC)
-    return _Row(
+    return Product(
         id=product_id,
         merchant_id=uuid.uuid4(),
         name="Widget",
@@ -125,18 +94,32 @@ def _row(product_id: uuid.UUID) -> _Row:
         category="misc",
         price=Decimal("9.99"),
         image_key=None,
-        image_status=ImageStatus.NONE.value,
+        image_status=ImageStatus.NONE,
         created_at=now,
         updated_at=now,
-        version_id=1,
+        version=1,
     )
+
+
+class CountingRepo:
+    """Repository fake that counts DB reads and can yield the loop mid-read."""
+
+    def __init__(self, product: Product | None, *, delay: float = 0.0) -> None:
+        self._product = product
+        self._delay = delay
+        self.get_calls = 0
+
+    async def get_product(self, product_id: uuid.UUID):
+        self.get_calls += 1
+        await asyncio.sleep(self._delay)  # yield so a racing task can interleave
+        return self._product
 
 
 @pytest.mark.asyncio
 async def test_read_populates_cache_then_next_read_skips_db() -> None:
     pid = uuid.uuid4()
     cache = FakeProductCache()
-    repo = CountingRepo(_row(pid))
+    repo = CountingRepo(_product(pid))
     service = CatalogService(repo, cache=cache)
 
     first = await service.get_product(pid)
@@ -158,7 +141,7 @@ async def test_read_outcome_is_miss_on_fill_then_hit_from_cache() -> None:
     miss; the next read, served by the filled entry, is a hit."""
     pid = uuid.uuid4()
     cache = FakeProductCache()
-    repo = CountingRepo(_row(pid))
+    repo = CountingRepo(_product(pid))
     service = CatalogService(repo, cache=cache)
 
     first_read, second_read = CacheRead(), CacheRead()
@@ -175,7 +158,7 @@ async def test_read_outcome_stays_unset_when_caching_is_disabled() -> None:
     recorded, so the route omits the ``X-Cache`` header entirely instead of
     claiming a hit/miss that never happened."""
     pid = uuid.uuid4()
-    repo = CountingRepo(_row(pid))
+    repo = CountingRepo(_product(pid))
     service = CatalogService(repo)  # cache is None
 
     read = CacheRead()
@@ -193,7 +176,7 @@ async def test_read_outcome_is_bypass_on_valkey_fault() -> None:
             raise ConnectionError("valkey down")
 
     pid = uuid.uuid4()
-    service = CatalogService(CountingRepo(_row(pid)), cache=BrokenCache())
+    service = CatalogService(CountingRepo(_product(pid)), cache=BrokenCache())
 
     read = CacheRead()
     assert (await service.get_product(pid, cache_read=read)) is not None
@@ -225,7 +208,7 @@ async def test_read_outcome_waiters_served_by_the_fill_report_hit() -> None:
     makes the single-filler lock visible to clients, not just the DB-read count."""
     pid = uuid.uuid4()
     cache = FakeProductCache()
-    repo = CountingRepo(_row(pid), delay=0.05)  # widen the race window like the stampede test
+    repo = CountingRepo(_product(pid), delay=0.05)  # widen the race window like the stampede test
     service = CatalogService(repo, cache=cache)
 
     reads = [CacheRead() for _ in range(20)]
@@ -244,7 +227,7 @@ async def test_read_outcome_bypass_when_fill_wedges_past_deadline() -> None:
     pid = uuid.uuid4()
     cache = FakeProductCache()
     await cache.acquire_fill_lock(pid, "wedged-holder")  # an active lock that will never produce a value
-    repo = CountingRepo(_row(pid))
+    repo = CountingRepo(_product(pid))
     service = CatalogService(repo, cache=cache, max_fill_wait_seconds=0.15)
 
     read = CacheRead()
@@ -270,7 +253,7 @@ async def test_product_get_stamps_x_cache_on_200_and_404():
     app.dependency_overrides[get_current_user] = _principal
     # One service instance across requests — a per-request lambda would rebuild the
     # (empty) cache each call and every read would be a miss.
-    live_service = CatalogService(CountingRepo(_row(pid)), cache=FakeProductCache())
+    live_service = CatalogService(CountingRepo(_product(pid)), cache=FakeProductCache())
     app.dependency_overrides[get_catalog_service] = lambda: live_service
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
@@ -301,7 +284,7 @@ async def test_concurrent_misses_hot_key_single_db_fill() -> None:
     pid = uuid.uuid4()
     cache = FakeProductCache()
     # A slow DB read widens the race window so every waiter is in-flight during the fill.
-    repo = CountingRepo(_row(pid), delay=0.05)
+    repo = CountingRepo(_product(pid), delay=0.05)
     service = CatalogService(repo, cache=cache)
 
     results = await asyncio.gather(*(service.get_product(pid) for _ in range(20)))
@@ -316,7 +299,7 @@ async def test_waiters_do_not_fall_back_to_db_while_fill_active() -> None:
     waiters keep waiting while the lock is held, never racing the DB themselves."""
     pid = uuid.uuid4()
     cache = FakeProductCache()
-    repo = CountingRepo(_row(pid), delay=1.3)  # longer than the retired 1s waiter cap
+    repo = CountingRepo(_product(pid), delay=1.3)  # longer than the retired 1s waiter cap
     service = CatalogService(repo, cache=cache)
 
     results = await asyncio.gather(*(service.get_product(pid) for _ in range(10)))
@@ -338,7 +321,7 @@ async def test_waiter_deadline_serves_from_db_when_a_fill_wedges() -> None:
     pid = uuid.uuid4()
     cache = FakeProductCache()
     await cache.acquire_fill_lock(pid, "wedged-holder")  # an active lock that will never produce a value
-    repo = CountingRepo(_row(pid))
+    repo = CountingRepo(_product(pid))
     service = CatalogService(repo, cache=cache, max_fill_wait_seconds=0.15)
 
     result = await service.get_product(pid)
@@ -352,7 +335,7 @@ async def test_waiter_deadline_serves_from_db_when_a_fill_wedges() -> None:
 @pytest.mark.asyncio
 async def test_no_cache_falls_through_to_db() -> None:
     pid = uuid.uuid4()
-    repo = CountingRepo(_row(pid))
+    repo = CountingRepo(_product(pid))
     service = CatalogService(repo)  # cache is None
 
     assert (await service.get_product(pid)) is not None
@@ -370,7 +353,7 @@ async def test_valkey_fault_degrades_to_db_read() -> None:
             raise ConnectionError("valkey down")
 
     pid = uuid.uuid4()
-    repo = CountingRepo(_row(pid))
+    repo = CountingRepo(_product(pid))
     service = CatalogService(repo, cache=BrokenCache())
 
     result = await service.get_product(pid)
@@ -416,7 +399,7 @@ async def test_corrupt_cache_entry_is_evicted_and_refilled() -> None:
     pid = uuid.uuid4()
     cache = FakeProductCache()
     cache.data[pid] = "{not valid product json"  # poison entry
-    repo = CountingRepo(_row(pid))
+    repo = CountingRepo(_product(pid))
     service = CatalogService(repo, cache=cache)
 
     result = await service.get_product(pid)
@@ -437,7 +420,7 @@ async def test_concurrent_corrupt_entry_single_db_fill() -> None:
     pid = uuid.uuid4()
     cache = FakeProductCache()
     cache.data[pid] = "{not valid product json"
-    repo = CountingRepo(_row(pid), delay=0.05)  # slow read widens the race window
+    repo = CountingRepo(_product(pid), delay=0.05)  # slow read widens the race window
     service = CatalogService(repo, cache=cache)
 
     results = await asyncio.gather(*(service.get_product(pid) for _ in range(20)))
@@ -469,7 +452,7 @@ async def test_invalidation_during_fill_is_not_overwritten() -> None:
     the stale value it read is never cached."""
     pid = uuid.uuid4()
     cache = FakeProductCache()
-    repo = CountingRepo(_row(pid), delay=0.05)
+    repo = CountingRepo(_product(pid), delay=0.05)
     service = CatalogService(repo, cache=cache)
 
     async def read():
@@ -510,7 +493,7 @@ async def test_cold_stampede_single_fills_through_the_real_valkey_adapter(real_v
 
     cache = ValkeyProductCache(real_valkey, ttl_seconds=60, ttl_jitter_seconds=0, lock_ttl_seconds=5)
     pid = uuid.uuid4()
-    repo = CountingRepo(_row(pid), delay=0.02)
+    repo = CountingRepo(_product(pid), delay=0.02)
     service = CatalogService(repo, cache=cache)
 
     results = await asyncio.gather(*(service.get_product(pid) for _ in range(25)))
@@ -529,7 +512,7 @@ async def test_real_invalidation_clears_value_and_in_flight_fill_lock(real_valke
 
     cache = ValkeyProductCache(real_valkey, ttl_seconds=60, ttl_jitter_seconds=0, lock_ttl_seconds=5)
     pid = uuid.uuid4()
-    repo = CountingRepo(_row(pid), delay=0.05)
+    repo = CountingRepo(_product(pid), delay=0.05)
     service = CatalogService(repo, cache=cache)
 
     async def read():

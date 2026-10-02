@@ -382,7 +382,7 @@ async def ensure_image(
         raise RuntimeError(f"image for product {product_id} not ready after {IMAGE_WAIT_TIMEOUT_SECONDS:.0f}s") from exc
 
 
-async def _product_status(sessionmaker: Any, product_id: Any) -> str | None:
+async def _product_status(sessionmaker: Any, product_id: Any) -> ImageStatus | None:
     """The product's current ``image_status`` (``None`` when the row is gone)."""
     async with sessionmaker() as session:
         repo = CatalogRepository(session)

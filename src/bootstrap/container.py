@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import uuid
 from decimal import Decimal
-from typing import Annotated, cast
+from typing import Annotated
 
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -73,13 +73,11 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 def get_catalog_repository(session: SessionDep) -> CatalogRepositoryPort:
     """Provide the catalog repository bound to the request session (port-typed).
 
-    The cast is structural, not a bypass: ``CatalogRepository`` satisfies
-    ``CatalogRepositoryPort`` at runtime (the catalog tests assert
-    ``isinstance`` for it), but SQLAlchemy's ``Mapped[...]`` descriptors make
-    the ORM's ``Product`` fail the checker's structural match against the
-    protocol's ``ProductRecord`` view of the same attributes.
+    The adapter structurally satisfies ``CatalogRepositoryPort``: every read
+    returns a frozen domain ``Product`` snapshot mapped in
+    ``adapters/db/mappers.py`` (never an ORM row), so no ``cast`` is needed.
     """
-    return cast(CatalogRepositoryPort, CatalogRepository(session))
+    return CatalogRepository(session)
 
 
 # --- inventory ------------------------------------------------------------

@@ -11,18 +11,19 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
+from src.catalog.domain.product import Product
 from src.shared.db.outbox import OutboxMessage
 
 if TYPE_CHECKING:
     from src.shared.db.pagination import Page, PageParams
 
-# return type is the adapter's ORM/read-model row (Product / ProductRow), typed
-# as Any because ports must not import adapters (ports <- adapters) — except for the
-# subset the application layer reads by name, which :class:`ProductRecord` below
-# declares structurally. Upgrade to a domain schema type here once catalog gets a
-# real domain layer.
+# Every read returns a frozen domain :class:`Product` snapshot (mapped by the
+# adapter in ``src/catalog/adapters/db/mappers.py``), never an ORM row or the raw
+# ``ProductRow`` read model — callers hold no session state and need no knowledge
+# of SQLAlchemy's identity map. Writes take ids, not rows, so the adapter owns
+# reloading the aggregate it mutates.
 #
 # ``outbox`` is the :class:`OutboxMessage` (event type + serialized payload) the
 # adapter INSERTs into ``catalog.outbox`` in the same transaction as the state
@@ -68,54 +69,19 @@ class ImageFlip(NamedTuple):
     previous_key: str | None
 
 
-@runtime_checkable
-class ProductRecord(Protocol):
-    """The attributes the **application layer** reads off a repository product row.
-
-    ``get_product`` used to be typed ``Any | None``, which quietly let the service
-    depend on fields no contract declared — in particular ``version_id``, which
-    exists only on the adapter's ORM model (neither the domain ``Product`` nor the
-    ``ProductRow`` read model carries it) yet every write use-case reads it to stamp
-    ``product_version`` on the event it emits. import-linter can't catch that: it's
-    an attribute, not an import, so the failure mode was a runtime ``AttributeError``
-    from a test double that looked complete.
-
-    ``@runtime_checkable`` so the claim is enforceable rather than decorative: this
-    repo runs no type checker (CI is Ruff + pytest), so a bare Protocol would be
-    IDE-and-docs only. Data-member protocols support ``isinstance`` on 3.12+, and
-    the catalog tests assert it for both the ORM ``Product`` and their stand-in
-    rows — an incomplete double now fails a test instead of production.
-
-    Deliberately minimal: the *full* row (description, image state, timestamps) is
-    still ``Any``, mapped by ``to_domain``. This is only what the use-cases touch
-    directly. Note ``isinstance`` checks attribute *presence*, not types — enough
-    to catch the omission that actually happens.
-    """
-
-    id: uuid.UUID
-    merchant_id: uuid.UUID
-    name: str
-    price: Decimal
-    category: str | None
-    #: Optimistic-lock counter; ``+ 1`` is the ``product_version`` the event carries.
-    version_id: int
-
-
 class CatalogRepositoryPort(Protocol):
     async def list_products(
         self, params: PageParams, filters: dict[str, object] | None = None, *, search: str | None = None
-    ) -> Page[Any]: ...
+    ) -> Page[Product]: ...
 
-    async def get_product(self, product_id: uuid.UUID) -> ProductRecord | None: ...
+    async def get_product(self, product_id: uuid.UUID) -> Product | None: ...
 
-    async def get_products_by_ids(self, product_ids: list[uuid.UUID]) -> Sequence[ProductRecord]:
+    async def get_products_by_ids(self, product_ids: list[uuid.UUID]) -> Sequence[Product]:
         """Every live product in ``product_ids``, in no guaranteed order.
 
         The authoritative (uncached) batch read — checkout's price revalidation
         reads here precisely because the service's cache-aside can lag the DB.
         Soft-deleted and unknown ids are simply absent from the result.
-        (``Sequence``, not ``list``: covariance lets the ORM row satisfy the
-        record protocol — ``list[Product]`` is not a ``list[ProductRecord]``.)
         """
         ...
 
@@ -130,17 +96,17 @@ class CatalogRepositoryPort(Protocol):
         price: Decimal,
         image_key: str | None,
         outbox: OutboxMessage,
-    ) -> Any: ...
+    ) -> Product: ...
 
     async def update_product(
-        self, product: ProductRecord, changes: dict[str, object], outbox: OutboxMessage
-    ) -> Any: ...
+        self, product_id: uuid.UUID, changes: dict[str, object], outbox: OutboxMessage
+    ) -> Product: ...
 
-    async def soft_delete_product(self, product: ProductRecord, outbox: OutboxMessage) -> None: ...
+    async def soft_delete_product(self, product_id: uuid.UUID, outbox: OutboxMessage) -> None: ...
 
     async def set_image_pending(
         self,
-        product: ProductRecord,
+        product_id: uuid.UUID,
         upload_token: str,
         *,
         expires_at: datetime,

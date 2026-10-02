@@ -1,38 +1,42 @@
 """Catalog read repository — the hottest read, so it drops to raw SQL.
 
 ``list_products`` hand-writes its keyset ``WHERE``/``ORDER BY`` over raw
-``text()`` SQL and maps Core rows into the lightweight :class:`ProductRow`
-read model (skips ORM hydration). It still reuses the shared cursor codec and
-:func:`build_page`. ``get_product`` is a plain soft-delete-filtered ORM fetch.
+``text()`` SQL and builds the lightweight :class:`ProductRow` read model (skips
+ORM hydration); it reuses the shared cursor codec and :func:`build_page`.
+``get_product``/``get_products_by_ids`` are soft-delete-filtered ORM fetches.
 
-ports/repos return ORM models / this read-model dataclass, not
-hand-mapped domain entities — those would be anemic pass-throughs today. Add a
-domain layer when real catalog behavior arrives. Services map these
-to Pydantic response schemas.
+Every path maps its rows through ``mappers.to_domain`` and returns frozen domain
+:class:`~src.catalog.domain.product.Product` snapshots, never an ORM instance or
+the raw read model — and every read uses ``populate_existing`` so a snapshot
+reflects the database, not an identity-map copy left from an earlier read (the
+guarded image-flip ``UPDATE``s bypass the ORM unit of work). Writes take ids and
+reload the aggregate they mutate, so the port stays snapshot-in/snapshot-out.
+Services map the snapshots to Pydantic response schemas.
 """
 
 from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, cast
+from typing import Any
 
 from sqlalchemy import Result, String, bindparam, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.sql import text
 
-from src.catalog.adapters.db.models import SCHEMA, ImageReclaim, Outbox, Product
+from src.catalog.adapters.db.mappers import ProductRow, to_domain
+from src.catalog.adapters.db.models import SCHEMA, ImageReclaim, Outbox
+from src.catalog.adapters.db.models import Product as ProductOrm
 from src.catalog.domain.image_status import ImageStatus
+from src.catalog.domain.product import Product
 from src.catalog.ports.repository import (
     ImageFlip,
     ImageOutboxFactory,
     ImageReclaimTask,
     PendingUpload,
-    ProductRecord,
 )
 from src.shared.db.outbox import OutboxMessage
 from src.shared.db.pagination import Page, PageParams, build_page, check_filters, decode_cursor
@@ -61,23 +65,6 @@ _EVENT_COLS = "id AS product_id, merchant_id, name, price, category, version_id 
 _EVENT_COLS_Q = "p.id AS product_id, p.merchant_id, p.name, p.price, p.category, p.version_id AS product_version"
 
 
-@dataclass(slots=True)
-class ProductRow:
-    """Lightweight read model for the raw catalog list (rows are not hydrated ORM)."""
-
-    id: uuid.UUID
-    merchant_id: uuid.UUID
-    name: str
-    description: str | None
-    category: str | None
-    price: Decimal
-    image_key: str | None
-    image_status: str
-    created_at: datetime
-    updated_at: datetime
-    version_id: int
-
-
 class CatalogRepository:
     """Implements :class:`src.catalog.ports.repository.CatalogRepositoryPort`."""
 
@@ -86,7 +73,7 @@ class CatalogRepository:
 
     async def list_products(
         self, params: PageParams, filters: dict[str, object] | None = None, *, search: str | None = None
-    ) -> Page[ProductRow]:
+    ) -> Page[Product]:
         """One keyset page of live products, optionally equality-filtered and/or substring-searched.
 
         ``search`` is a case-insensitive substring match over ``name`` and
@@ -137,23 +124,54 @@ class CatalogRepository:
             )
         result = await self._session.execute(sql, binds)
         rows = [ProductRow(**mapping) for mapping in result.mappings().all()]
-        return build_page(rows, params, key_of=lambda row: (getattr(row, params.sort_field), row.id))
+        page = build_page(rows, params, key_of=lambda row: (getattr(row, params.sort_field), row.id))
+        return Page(items=[to_domain(row) for row in page.items], next_cursor=page.next_cursor)
 
     async def get_product(self, product_id: uuid.UUID) -> Product | None:
-        stmt = select(Product).where(Product.id == product_id, Product.deleted_at.is_(None))
-        result = await self._session.execute(stmt)
-        return result.scalar_one_or_none()
+        """The live product as a frozen snapshot, or ``None`` if absent/soft-deleted.
+
+        ``populate_existing=True``: the snapshot must reflect the database, not an
+        identity-map copy left from an earlier read on this session (the guarded
+        raw image-flip ``UPDATE``s bypass the ORM unit of work).
+        """
+        stmt = (
+            select(ProductOrm)
+            .where(ProductOrm.id == product_id, ProductOrm.deleted_at.is_(None))
+            .execution_options(populate_existing=True)
+        )
+        row = (await self._session.execute(stmt)).scalar_one_or_none()
+        return to_domain(row) if row is not None else None
 
     async def get_products_by_ids(self, product_ids: list[uuid.UUID]) -> list[Product]:
         if not product_ids:
             return []
-        stmt = select(Product).where(Product.id.in_(product_ids), Product.deleted_at.is_(None))
-        result = await self._session.execute(stmt)
-        return list(result.scalars().all())
+        stmt = (
+            select(ProductOrm)
+            .where(ProductOrm.id.in_(product_ids), ProductOrm.deleted_at.is_(None))
+            .execution_options(populate_existing=True)
+        )
+        rows = (await self._session.execute(stmt)).scalars().all()
+        return [to_domain(row) for row in rows]
 
     # --- writes: state change + outbox row committed in ONE transaction -------
 
-    async def _commit_versioned(self, *, product: Product | None = None) -> None:
+    async def _load_aggregate(self, product_id: uuid.UUID) -> ProductOrm:
+        """The tracked live ``Product`` row the write paths mutate (via the ORM UoW).
+
+        Writes take ids (the port hands the application a domain snapshot, not the
+        aggregate), so the adapter reloads the aggregate it owns here. Deliberately
+        **not** ``populate_existing``: reloading a version a concurrent writer already
+        advanced would let this update silently clobber it — keeping the identity-map
+        version is what lets ``version_id_col`` raise ``StaleDataError`` at flush and
+        surface the retryable 409 instead.
+        """
+        stmt = select(ProductOrm).where(ProductOrm.id == product_id, ProductOrm.deleted_at.is_(None))
+        aggregate = (await self._session.execute(stmt)).scalar_one_or_none()
+        if aggregate is None:  # deleted between the service's read and this write
+            raise ConcurrentUpdateError("product")
+        return aggregate
+
+    async def _commit_versioned(self, *, product: ProductOrm | None = None) -> None:
         """Flush (+ optionally refresh) then commit the versioned ``Product`` aggregate.
 
         ``version_id_col`` turns a lost update into ``StaleDataError`` at flush.
@@ -189,7 +207,7 @@ class CatalogRepository:
         outbox: OutboxMessage,
     ) -> Product:
         """Insert a product and its ``ProductCreated`` outbox row atomically."""
-        product = Product(
+        product = ProductOrm(
             id=product_id,
             merchant_id=merchant_id,
             name=name,
@@ -201,38 +219,24 @@ class CatalogRepository:
         self._session.add(product)
         self._session.add(self._outbox_row(outbox))
         await self._commit_versioned(product=product)
-        return product
+        return to_domain(product)
 
-    @staticmethod
-    def _aggregate(product: ProductRecord) -> Product:
-        """The tracked ``Product`` row behind a port-level ``ProductRecord``.
-
-        The port types products structurally so the application layer never sees
-        the ORM, while the write paths here mutate the aggregate through the unit
-        of work — which needs the concrete row this adapter itself handed out via
-        ``get_product``/``create_product``. That round-trip is the invariant the
-        cast writes down.
-        """
-        return cast(Product, product)
-
-    async def update_product(
-        self, product: ProductRecord, changes: dict[str, object], outbox: OutboxMessage
-    ) -> Product:
-        """Apply ``changes`` to an already-loaded product + emit its outbox row.
+    async def update_product(self, product_id: uuid.UUID, changes: dict[str, object], outbox: OutboxMessage) -> Product:
+        """Reload the aggregate, apply ``changes``, and emit its outbox row.
 
         The product is mutated through the ORM so ``version_id`` auto-bumps
         (optimistic lock): a concurrent edit that already advanced the version
         makes this commit raise ``StaleDataError`` instead of silently clobbering,
         which :meth:`_commit_versioned` turns into a retryable 409.
         """
-        aggregate = self._aggregate(product)
+        aggregate = await self._load_aggregate(product_id)
         for field, value in changes.items():
             setattr(aggregate, field, value)
         self._session.add(self._outbox_row(outbox))
         await self._commit_versioned(product=aggregate)
-        return aggregate
+        return to_domain(aggregate)
 
-    async def soft_delete_product(self, product: ProductRecord, outbox: OutboxMessage) -> None:
+    async def soft_delete_product(self, product_id: uuid.UUID, outbox: OutboxMessage) -> None:
         """Soft-delete (``deleted_at``) + emit the ``ProductDeleted`` outbox row.
 
         Also queues the product's public renditions into ``catalog.image_reclaim``
@@ -249,7 +253,7 @@ class CatalogRepository:
         exactly like every other reclaim row. Idempotent under replay via the
         table's unique ``object_key`` (``ON CONFLICT DO NOTHING``).
         """
-        aggregate = self._aggregate(product)
+        aggregate = await self._load_aggregate(product_id)
         aggregate.deleted_at = datetime.now(UTC)
         self._session.add(self._outbox_row(outbox))
         if aggregate.image_key:
@@ -266,7 +270,7 @@ class CatalogRepository:
 
     async def set_image_pending(
         self,
-        product: ProductRecord,
+        product_id: uuid.UUID,
         upload_token: str,
         *,
         expires_at: datetime,
@@ -288,7 +292,7 @@ class CatalogRepository:
         written in the **same transaction** to invalidate the read-cache — otherwise
         a cached ready-image response would linger stale after a re-upload starts.
         """
-        aggregate = self._aggregate(product)
+        aggregate = await self._load_aggregate(product_id)
         aggregate.image_status = ImageStatus.PENDING.value
         aggregate.image_upload_token = upload_token
         aggregate.image_upload_expires_at = expires_at

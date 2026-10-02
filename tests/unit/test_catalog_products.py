@@ -34,7 +34,8 @@ from src.app import create_app
 from src.bootstrap.container import get_image_store
 from src.catalog.adapters.db.repository import CatalogRepository
 from src.catalog.application.outbox import product_updated_outbox
-from src.catalog.ports.repository import PendingUpload, ProductRecord
+from src.catalog.domain.product import Product
+from src.catalog.ports.repository import PendingUpload
 from src.shared.config.setting import AppSettings, get_settings
 from src.shared.errors.exceptions import ConcurrentUpdateError
 
@@ -484,16 +485,16 @@ async def test_concurrent_updates_lose_the_race_with_409_not_500(app_ctx, rsa_ke
     product_id = uuid.UUID(created["id"])
 
     async def patch(name: str):
-        # Both writers load the row at version 1 before either commits.
+        # Both writers load the snapshot at version 1 before either commits.
         async with sessionmaker() as session:
             repo = CatalogRepository(session)
             product = await repo.get_product(product_id)
-            # The real adapter row must satisfy the port the use-cases code against
-            # (`version_id` lives only on the ORM model — see ProductRecord).
-            assert isinstance(product, ProductRecord)
+            # The adapter returns the domain snapshot the port promises — no live
+            # ORM behind it — so the write path reloads the tracked aggregate.
+            assert isinstance(product, Product) and product.version == 1
             await barrier.wait()
             return await repo.update_product(
-                product,
+                product_id,
                 {"name": name},
                 product_updated_outbox(
                     product_id=product_id,
@@ -501,7 +502,7 @@ async def test_concurrent_updates_lose_the_race_with_409_not_500(app_ctx, rsa_ke
                     name=name,
                     price=product.price,
                     category=product.category,
-                    product_version=product.version_id + 1,
+                    product_version=product.version + 1,
                 ),
             )
 
@@ -857,8 +858,7 @@ async def test_soft_delete_queues_public_renditions_for_reclaim(sessionmaker):
         await CatalogRepository(s).schedule_image_reclaim(pid, "public/dead.webp")
     async with sessionmaker() as s:
         repo = CatalogRepository(s)
-        product = await repo.get_product(pid)
-        await repo.soft_delete_product(product, ("ProductDeleted", json.dumps({"type": "ProductDeleted"})))
+        await repo.soft_delete_product(pid, ("ProductDeleted", json.dumps({"type": "ProductDeleted"})))
 
     async with sessionmaker() as s:
         deleted_at = (
@@ -893,8 +893,7 @@ async def test_soft_delete_without_image_queues_nothing(sessionmaker):
     pid = await _seed_pending(sessionmaker, "tokE")  # pending, no image_key yet
     async with sessionmaker() as s:
         repo = CatalogRepository(s)
-        product = await repo.get_product(pid)
-        await repo.soft_delete_product(product, ("ProductDeleted", json.dumps({"type": "ProductDeleted"})))
+        await repo.soft_delete_product(pid, ("ProductDeleted", json.dumps({"type": "ProductDeleted"})))
 
     async with sessionmaker() as s:
         queued = (

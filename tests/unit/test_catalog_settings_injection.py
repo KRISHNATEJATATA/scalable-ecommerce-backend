@@ -9,12 +9,12 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
-from types import SimpleNamespace
 
 import pytest
 
 from src.catalog.application.service import CatalogService
-from src.catalog.ports.repository import ProductRecord
+from src.catalog.domain.image_status import ImageStatus
+from src.catalog.domain.product import Product
 from src.shared.config.setting import AppSettings
 from src.shared.errors.exceptions import InvalidUploadError
 
@@ -22,8 +22,8 @@ _NOW = datetime.now(UTC)
 _DSN = "postgresql+asyncpg://u:p@localhost:5432/test"
 
 
-def _row(image_key: str | None = "products/x.jpg", image_status: str = "ready"):
-    return SimpleNamespace(
+def _product(image_key: str | None = "products/x.jpg", image_status: ImageStatus = ImageStatus.READY) -> Product:
+    return Product(
         id=uuid.uuid4(),
         merchant_id=uuid.uuid4(),
         name="widget",
@@ -32,22 +32,21 @@ def _row(image_key: str | None = "products/x.jpg", image_status: str = "ready"):
         price=Decimal("9.99"),
         image_key=image_key,
         image_status=image_status,
-        version_id=1,  # aggregate counter the emitted ProductUpdated is ordered by
+        version=1,  # aggregate counter the emitted ProductUpdated is ordered by
         created_at=_NOW,
         updated_at=_NOW,
     )
 
 
 class _Repo:
-    def __init__(self, row):
-        self.row = row
+    def __init__(self, product: Product) -> None:
+        self.product = product
 
     async def get_product(self, product_id):
-        return self.row
+        return self.product
 
-    async def set_image_pending(self, product, token, *, expires_at, outbox):
+    async def set_image_pending(self, product_id, token, *, expires_at, outbox):
         self.expires_at = expires_at
-        return self.row
 
 
 class _ImageStore:
@@ -60,41 +59,44 @@ class _ImageStore:
 
 
 def test_stand_in_row_satisfies_the_repository_port_contract():
-    """The double must carry every field the use-cases read off a real row.
+    """The double hands back the domain snapshot the port promises.
 
-    ``ProductRecord`` is ``@runtime_checkable`` precisely so this is checkable: the
-    repo runs no type checker, so without this assert a double that drops (say)
-    ``version_id`` fails as an ``AttributeError`` deep inside a use-case — which is
-    exactly how it failed before the port declared the shape.
+    The port returns the frozen domain ``Product`` — the old stand-in ran on an
+    ORM-shaped ``SimpleNamespace`` whose drift from the real row failed as a deep
+    ``AttributeError``. Typing the seam to the domain type makes that class of
+    drift a construction-time error instead.
     """
-    assert isinstance(_row(), ProductRecord)
+    double = _product(image_key=None, image_status=ImageStatus.NONE)
+    assert isinstance(double, Product)
+    assert double.id == _Repo(double).product.id
+    assert double.version == _Repo(double).product.version
 
 
 async def test_image_url_uses_injected_base_not_global_settings():
-    row = _row()
-    svc = CatalogService(_Repo(row), image_base_url="https://cdn.injected.test/")
-    result = await svc.get_product(row.id)
+    product = _product()
+    svc = CatalogService(_Repo(product), image_base_url="https://cdn.injected.test/")
+    result = await svc.get_product(product.id)
     assert result is not None
     assert result.image_url == "https://cdn.injected.test/products/x.jpg"
 
 
 async def test_image_url_none_when_image_not_ready():
-    row = _row(image_key=None, image_status="none")
-    svc = CatalogService(_Repo(row), image_base_url="https://cdn.injected.test")
-    result = await svc.get_product(row.id)
+    product = _product(image_key=None, image_status=ImageStatus.NONE)
+    svc = CatalogService(_Repo(product), image_base_url="https://cdn.injected.test")
+    result = await svc.get_product(product.id)
     assert result is not None and result.image_url is None
 
 
 async def test_presign_enforces_injected_limit_and_ttl():
-    row = _row()
+    product = _product()
     store = _ImageStore()
     svc = CatalogService(
-        _Repo(row),
+        _Repo(product),
         store,
         image_max_upload_bytes=100,
         image_upload_ttl_seconds=42,
     )
-    args = dict(product_id=row.id, merchant_id=row.merchant_id, is_admin=False, content_type="image/jpeg")
+    args = dict(product_id=product.id, merchant_id=product.merchant_id, is_admin=False, content_type="image/jpeg")
 
     with pytest.raises(InvalidUploadError):
         await svc.presign_image_upload(**args, content_length=101)

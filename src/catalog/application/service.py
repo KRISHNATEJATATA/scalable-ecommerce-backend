@@ -33,7 +33,6 @@ from src.catalog.application.dto import (
     public_thumbnail_urls,
 )
 from src.catalog.application.image_processing import ALLOWED_MIME
-from src.catalog.application.mappers import to_domain
 from src.catalog.application.outbox import product_updated_outbox
 from src.catalog.ports.availability import StockAvailabilityPort
 from src.catalog.ports.cache import MISS, ProductCachePort
@@ -294,10 +293,10 @@ class CatalogService:
         not misread as a cache fault and silently retried against the DB.
         """
         try:
-            row = await self._repo.get_product(product_id)
-            if row is None:
+            product = await self._repo.get_product(product_id)
+            if product is None:
                 return None
-            return self._to_response(to_domain(row))
+            return self._to_response(product)
         except Exception as exc:
             raise _RepositoryFailure(str(exc)) from exc
 
@@ -429,7 +428,7 @@ class CatalogService:
         keyset ``sort`` order.
         """
         page = await self._repo.list_products(params, filters, search=search)
-        items = [self._to_response(to_domain(row)) for row in page.items]
+        items = [self._to_response(product) for product in page.items]
         await self._attach_availability(items)
         return PageResponse(items=items, next_cursor=page.next_cursor)
 
@@ -479,7 +478,7 @@ class CatalogService:
             image_key=None,  # images are attached later, only after the worker passes them
             outbox=OutboxMessage(event.type, event.model_dump_json()),
         )
-        return self._to_response(to_domain(row))
+        return self._to_response(row)
 
     async def update_product(
         self,
@@ -501,7 +500,7 @@ class CatalogService:
         if product is None:
             return None
         self._assert_owner(product.merchant_id, merchant_id, is_admin)
-        if if_match is not None and product.version_id != if_match:
+        if if_match is not None and product.version != if_match:
             raise PreconditionFailedError()
 
         changes = patch.model_dump(exclude_unset=True)
@@ -511,10 +510,10 @@ class CatalogService:
             name=changes.get("name", product.name),
             price=changes.get("price", product.price),
             category=changes.get("category", product.category),
-            product_version=product.version_id + _VERSION_STEP,
+            product_version=product.version + _VERSION_STEP,
         )
-        row = await self._repo.update_product(product, changes, outbox=outbox)
-        return self._to_response(to_domain(row))
+        row = await self._repo.update_product(product.id, changes, outbox=outbox)
+        return self._to_response(row)
 
     async def delete_product(
         self, *, product_id: uuid.UUID, merchant_id: uuid.UUID, is_admin: bool, if_match: int | None = None
@@ -528,7 +527,7 @@ class CatalogService:
         if product is None:
             return False
         self._assert_owner(product.merchant_id, merchant_id, is_admin)
-        if if_match is not None and product.version_id != if_match:
+        if if_match is not None and product.version != if_match:
             raise PreconditionFailedError()
 
         event = ProductDeletedV2.new(
@@ -538,10 +537,10 @@ class CatalogService:
                 merchant_id=product.merchant_id,
                 # Tombstones share the aggregate's counter, so a slower in-flight
                 # update can't resurrect a deleted product downstream.
-                product_version=product.version_id + _VERSION_STEP,
+                product_version=product.version + _VERSION_STEP,
             ),
         )
-        await self._repo.soft_delete_product(product, outbox=OutboxMessage(event.type, event.model_dump_json()))
+        await self._repo.soft_delete_product(product.id, outbox=OutboxMessage(event.type, event.model_dump_json()))
         return True
 
     async def presign_image_upload(
@@ -586,13 +585,13 @@ class CatalogService:
             name=product.name,
             price=product.price,
             category=product.category,
-            product_version=product.version_id + _VERSION_STEP,
+            product_version=product.version + _VERSION_STEP,
         )
         # Record when the presign dies, so an upload that never arrives is reaped
         # back to the product's previous image state instead of pinning it (and its
         # existing image) to ``pending`` forever.
         expires_at = datetime.now(UTC) + timedelta(seconds=self._image_upload_ttl_seconds)
-        await self._repo.set_image_pending(product, presigned["token"], expires_at=expires_at, outbox=outbox)
+        await self._repo.set_image_pending(product.id, presigned["token"], expires_at=expires_at, outbox=outbox)
         return ImageUploadTicket(
             url=presigned["url"],
             fields=presigned["fields"],

@@ -1,11 +1,13 @@
 """Service + mapper unit tests — DB-free, fake repos.
 
 Exercises the application seam without a database: a fake repo (a plain object
-implementing the port) returns canned ORM-shaped rows / ``ProductRow`` / a
-``Page``, and we assert the service maps them through the domain to the right
-Pydantic response schema — with no ORM/``ProductRow`` leak. Each module's
-``to_domain`` mapper is also exercised directly against an ORM-shaped row. The
-HTTP ``dependency_overrides`` round-trip rides.
+implementing the port) returns canned rows / a ``Page``, and we assert the
+service maps them to the right Pydantic response schema — with no ORM leak.
+The catalog fake returns frozen domain snapshots (the port's contract since the
+snapshot-in/snapshot-out refactor); the other modules' fakes still return
+ORM-shaped rows that Pydantic maps via ``from_attributes``. Each module's
+adapter-level ``to_domain`` mapper is also exercised directly against an
+ORM-shaped row. The HTTP ``dependency_overrides`` round-trip rides.
 """
 
 from __future__ import annotations
@@ -19,10 +21,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.catalog.adapters.db.repository import ProductRow
+from src.catalog.adapters.db.mappers import ProductRow
+from src.catalog.adapters.db.mappers import to_domain as product_to_domain
 from src.catalog.api.schemas import ProductResponse
-from src.catalog.application.mappers import to_domain as product_to_domain
 from src.catalog.application.service import CatalogService
+from src.catalog.domain.image_status import ImageStatus
 from src.catalog.domain.product import Product
 from src.identity.api.schemas import UserResponse
 from src.identity.application.dto import AdminUserResponse
@@ -102,6 +105,22 @@ class _FakePaymentsRepo:
 # --- row builders (ORM-shaped, duck-typed) --------------------------------
 
 
+def _product() -> Product:
+    return Product(
+        id=uuid.uuid4(),
+        merchant_id=uuid.uuid4(),
+        name="widget",
+        description="d",
+        category="c",
+        price=Decimal("9.99"),
+        image_key=None,
+        image_status=ImageStatus.NONE,
+        created_at=_NOW,
+        updated_at=_NOW,
+        version=1,
+    )
+
+
 def _product_row_orm():
     return SimpleNamespace(
         id=uuid.uuid4(),
@@ -147,16 +166,16 @@ def _order_row(item_count=2):
 
 
 async def test_catalog_get_returns_pydantic_no_orm_leak():
-    row = _product_row_orm()
-    svc = CatalogService(_FakeCatalogRepo(product=row))
-    result = await svc.get_product(row.id)
+    product = _product()
+    svc = CatalogService(_FakeCatalogRepo(product=product))
+    result = await svc.get_product(product.id)
     assert isinstance(result, ProductResponse)
-    assert result.id == row.id
+    assert result.id == product.id
 
 
 async def test_catalog_list_maps_items_and_passes_cursor_through():
-    rows = [_product_row_orm(), _product_row_orm()]
-    svc = CatalogService(_FakeCatalogRepo(page=Page(items=rows, next_cursor="CURSOR")))
+    products = [_product(), _product()]
+    svc = CatalogService(_FakeCatalogRepo(page=Page(items=products, next_cursor="CURSOR")))
     page = await svc.list_products(PageParams())
     assert isinstance(page, PageResponse)
     assert all(isinstance(item, ProductResponse) for item in page.items)
