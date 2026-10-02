@@ -4,6 +4,11 @@ Implemented by ``adapters/db/repository.InventoryRepository``. Covers the raw
 conditional-decrement CAS primitive plus the reservation lifecycle composed on
 top of it (hold + TTL, release, commit, expiry sweep) — each a single
 transaction that carries its own outbox row.
+
+Every read returns a frozen domain :class:`Inventory`/:class:`Reservation`
+snapshot of the committed row, never a live ORM instance — the adapter maps before
+returning, so callers hold no session state and need no knowledge of SQLAlchemy's
+identity map or expiry rules.
 """
 
 from __future__ import annotations
@@ -12,13 +17,11 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Protocol
 
+from src.inventory.domain.inventory import Inventory
+from src.inventory.domain.reservation import Reservation
 from src.shared.db.outbox import OutboxMessage
-
-# Row return types are the adapter's ORM rows, typed as Any because ports must
-# not import adapters (ports <- adapters). Upgrade to a domain type once
-# inventory grows behavior beyond the reservation status machine.
 
 #: Builds the outbox message for one released hold, from ``(sku, order_id, qty)``.
 #: Defined here (the contract), imported by the adapter — never redeclared.
@@ -42,11 +45,11 @@ class StockRejection:
 
 
 class InventoryRepositoryPort(Protocol):
-    async def get_by_sku(self, sku: str) -> Any | None:
-        """The stock row for ``sku``, or ``None`` if the SKU has no inventory."""
+    async def get_by_sku(self, sku: str) -> Inventory | None:
+        """The stock row for ``sku`` as a frozen snapshot, or ``None`` if the SKU has no inventory."""
         ...
 
-    async def upsert_stock(self, sku: str, on_hand: int) -> Any | None:
+    async def upsert_stock(self, sku: str, on_hand: int) -> Inventory | None:
         """Create the stock row for ``sku`` (or re-point an existing one's ``on_hand``).
 
         Idempotent: re-PUT with the same value lands the same state. ``None``
@@ -56,8 +59,8 @@ class InventoryRepositoryPort(Protocol):
         """
         ...
 
-    async def get_many_by_skus(self, skus: list[str]) -> dict[str, Any]:
-        """The stock rows for ``skus`` as ``{sku: row}``, in one query.
+    async def get_many_by_skus(self, skus: list[str]) -> dict[str, Inventory]:
+        """The stock rows for ``skus`` as ``{sku: snapshot}``, in one query.
 
         SKUs with no row are simply absent from the map (unknown, not zero).
         Exists so a product listing attaches availability with one stock query
@@ -83,7 +86,7 @@ class InventoryRepositoryPort(Protocol):
         order_id: uuid.UUID,
         expires_at: datetime,
         outbox: OutboxMessage,
-    ) -> Any | None:
+    ) -> Reservation | None:
         """``None`` = insufficient stock (the oversell guard's answer, counted as such).
 
         Raises ``ReservationConflictError`` when the order line already holds a
@@ -100,7 +103,7 @@ class InventoryRepositoryPort(Protocol):
         order_id: uuid.UUID,
         expires_at: datetime,
         outbox_factory: OutboxFactory,
-    ) -> Any:
+    ) -> list[Reservation] | StockRejection:
         """Hold every ``(sku, qty)`` line for ``order_id`` in ONE all-or-nothing transaction.
 
         The checkout saga's reserve step: up to a cart-full of lines placed as one

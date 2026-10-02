@@ -29,8 +29,9 @@ from src.identity.application.dto import AdminUserResponse
 from src.identity.application.mappers import to_domain as user_to_domain
 from src.identity.application.service import IdentityAdminService, IdentityService, _encode_offset_cursor
 from src.identity.domain.user import DirectoryUser, User
+from src.inventory.adapters.db.mappers import to_domain as inventory_to_domain
+from src.inventory.adapters.db.models import Inventory as InventoryRow
 from src.inventory.api.schemas import InventoryResponse
-from src.inventory.application.mappers import to_domain as inventory_to_domain
 from src.inventory.application.service import InventoryService
 from src.inventory.domain.inventory import Inventory
 from src.orders.adapters.db.mappers import to_domain as order_to_domain
@@ -280,7 +281,7 @@ def test_identity_mapper_maps_orm_row_to_domain_user():
 
 
 def test_inventory_mapper_maps_orm_row_to_domain_entity():
-    row = SimpleNamespace(sku="sku-1", on_hand=5, reserved=2, version=3)
+    row = InventoryRow(sku="sku-1", on_hand=5, reserved=2, version=3)
     result = inventory_to_domain(row)
     assert isinstance(result, Inventory)
     assert (result.sku, result.on_hand, result.reserved, result.version) == ("sku-1", 5, 2, 3)

@@ -23,8 +23,11 @@ Every path takes the same lock order — **reservation row first, inventory row
 second** — so two of them racing the same line queue behind each other instead
 of deadlocking.
 
-Returns ORM rows / rowcounts, not domain entities — added when inventory domain
-behavior beyond the status machine arrives.
+Returns frozen domain snapshots (:mod:`src.inventory.adapters.db.mappers`) plus
+bare rowcounts/flags, never ORM rows, and every read uses ``populate_existing`` so
+a snapshot always reflects the database — not an identity-map copy left over from
+an earlier read on this session (the guarded raw ``UPDATE``s bypass the ORM unit
+of work, so that copy goes stale).
 """
 
 from __future__ import annotations
@@ -34,13 +37,16 @@ import uuid
 from datetime import datetime
 from typing import Any, cast
 
-from sqlalchemy import func, select
+from sqlalchemy import ColumnElement, Select, func, select
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import text
 
+from src.inventory.adapters.db.mappers import reservation_to_domain, to_domain
 from src.inventory.adapters.db.models import SCHEMA, Inventory, Outbox, Reservation
+from src.inventory.domain.inventory import Inventory as DomainInventory
+from src.inventory.domain.reservation import Reservation as DomainReservation
 from src.inventory.domain.reservation import ReservationStatus
 from src.inventory.ports.repository import OutboxFactory, StockRejection
 from src.shared.db.outbox import OutboxMessage
@@ -75,6 +81,16 @@ def _sqlstate(exc: IntegrityError) -> str | None:
         if state:
             return str(state)
     return None
+
+
+def _inventory_select(*where: ColumnElement[bool]) -> Select[Any]:
+    """``select(Inventory)`` that refreshes rows from the DB instead of answering from the identity map."""
+    return select(Inventory).where(*where).execution_options(populate_existing=True)
+
+
+def _reservation_select(*where: ColumnElement[bool]) -> Select[Any]:
+    """``select(Reservation)`` that refreshes rows from the DB instead of answering from the identity map."""
+    return select(Reservation).where(*where).execution_options(populate_existing=True)
 
 
 # `SCHEMA` is a fixed module constant, never user input, so interpolating it into
@@ -175,12 +191,12 @@ class InventoryRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def get_by_sku(self, sku: str) -> Inventory | None:
-        """The stock row for ``sku``, or ``None`` if the SKU has no inventory."""
-        stmt = select(Inventory).where(Inventory.sku == sku)
-        return (await self._session.execute(stmt)).scalar_one_or_none()
+    async def get_by_sku(self, sku: str) -> DomainInventory | None:
+        """The stock row for ``sku`` as a frozen snapshot, or ``None`` if the SKU has no inventory."""
+        row = (await self._session.execute(_inventory_select(Inventory.sku == sku))).scalar_one_or_none()
+        return to_domain(row) if row is not None else None
 
-    async def upsert_stock(self, sku: str, on_hand: int) -> Inventory | None:
+    async def upsert_stock(self, sku: str, on_hand: int) -> DomainInventory | None:
         """Seed or re-point the stock row for ``sku``; ``None`` if live holds exceed ``on_hand``.
 
         One atomic statement: a fresh SKU inserts (``reserved = 0``), an
@@ -195,15 +211,16 @@ class InventoryRepository:
             await self._session.rollback()
             return None
         await self._session.commit()
-        return Inventory(sku=row.sku, on_hand=row.on_hand, reserved=row.reserved, version=row.version)
+        # The RETURNING row is a plain ``Row`` (text() DML), not an ORM instance, so it
+        # is built by hand — ``to_domain`` is typed to ``InventoryRow``.
+        return DomainInventory(sku=row.sku, on_hand=row.on_hand, reserved=row.reserved, version=row.version)
 
-    async def get_many_by_skus(self, skus: list[str]) -> dict[str, Inventory]:
-        """The stock rows for ``skus`` as ``{sku: row}`` (one ``WHERE sku IN`` query)."""
+    async def get_many_by_skus(self, skus: list[str]) -> dict[str, DomainInventory]:
+        """The stock rows for ``skus`` as ``{sku: snapshot}`` (one ``WHERE sku IN`` query)."""
         if not skus:
             return {}
-        stmt = select(Inventory).where(Inventory.sku.in_(skus))
-        rows = (await self._session.execute(stmt)).scalars().all()
-        return {row.sku: row for row in rows}
+        rows = (await self._session.execute(_inventory_select(Inventory.sku.in_(skus)))).scalars().all()
+        return {row.sku: to_domain(row) for row in rows}
 
     async def try_reserve_decrement(self, sku: str, qty: int) -> int:
         """The atomic conditional decrement; rowcount 1 = reserved, 0 = rejected."""
@@ -222,7 +239,7 @@ class InventoryRepository:
         order_id: uuid.UUID,
         expires_at: datetime,
         outbox: OutboxMessage,
-    ) -> Reservation | None:
+    ) -> DomainReservation | None:
         """Hold ``qty`` of ``sku`` for ``order_id``; ``None`` when stock doesn't cover it.
 
         The ``held`` reservation row, the conditional decrement and the
@@ -275,7 +292,7 @@ class InventoryRepository:
         order_id: uuid.UUID,
         expires_at: datetime,
         outbox_factory: OutboxFactory,
-    ) -> list[Reservation] | StockRejection:
+    ) -> list[DomainReservation] | StockRejection:
         """Hold every ``(sku, qty)`` line for ``order_id`` in ONE all-or-nothing transaction.
 
         The checkout saga's reserve step, batched: the per-line loop it replaces
@@ -394,7 +411,7 @@ class InventoryRepository:
             await self._session.commit()
             for reservation in placed:
                 await self._session.refresh(reservation)
-            return placed
+            return [reservation_to_domain(row) for row in placed]
         # Both attempts lost the uniqueness race: real churn on this order's
         # lines. Raised, not returned as a StockRejection — a rejection means
         # *stock* refused the request (the oversell counter's meaning), and
@@ -595,7 +612,10 @@ class InventoryRepository:
         return already_committed + len(rows)
 
     async def _active_map(self, order_id: uuid.UUID, skus: list[str]) -> dict[str, Reservation]:
-        """This order's existing non-released reservations for ``skus``, as ``{sku: row}``.
+        """This order's existing non-released reservations for ``skus``, as ``{sku: ORM row}``.
+
+        ORM-internal — this map never crosses the port (``reserve_many`` consumes it
+        and maps the rows it hands back), so the frozen-snapshot contract holds.
 
         A row present here — ``held`` (in flight) or ``committed`` (payment already
         consumed it) — is a legitimate retry answer; returning the committed one is
@@ -603,7 +623,7 @@ class InventoryRepository:
         SKU absent from the map is genuinely free: compensation or the reaper may
         have released it since any earlier attempt.
         """
-        stmt = select(Reservation).where(
+        stmt = _reservation_select(
             Reservation.order_id == order_id,
             Reservation.sku.in_(skus),
             Reservation.status.in_(_ACTIVE_STATUSES),

@@ -14,7 +14,8 @@ atomic repository transaction:
 * :meth:`commit_reservation` — payment succeeded, the hold becomes a deduction.
 * :meth:`release_expired` — the reaper's sweep.
 
-ORM rows never leave here: everything returns a Pydantic ``*Response``.
+The repository hands back frozen domain snapshots (never live ORM rows), and
+everything here returns a Pydantic ``*Response``.
 """
 
 from __future__ import annotations
@@ -24,7 +25,6 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from src.inventory.application.dto import InventoryResponse, ReservationResponse
-from src.inventory.application.mappers import reservation_to_domain, to_domain
 from src.inventory.application.metrics import (
     oversell_blocked_total,
     reaper_released_total,
@@ -66,7 +66,7 @@ class InventoryService:
         row = await self._repo.get_by_sku(sku)
         if row is None:
             return None
-        return InventoryResponse.model_validate(to_domain(row))
+        return InventoryResponse.model_validate(row)
 
     async def get_many_by_skus(self, skus: list[str]) -> dict[str, InventoryResponse]:
         """Resolve stock rows for ``skus`` as ``{sku: response}`` (one query).
@@ -75,7 +75,7 @@ class InventoryService:
         projection) reports those as unknown, never as zero.
         """
         rows = await self._repo.get_many_by_skus(skus)
-        return {sku: InventoryResponse.model_validate(to_domain(row)) for sku, row in rows.items()}
+        return {sku: InventoryResponse.model_validate(snapshot) for sku, snapshot in rows.items()}
 
     async def upsert_stock(
         self, sku: str, on_hand: int, *, caller_id: uuid.UUID | None = None, is_admin: bool = False
@@ -110,7 +110,7 @@ class InventoryService:
             # rather than dereferencing None.
             current = await self._repo.get_by_sku(sku)
             raise StockBelowReservedError(sku, on_hand, current.reserved if current else 0)
-        return InventoryResponse.model_validate(to_domain(row))
+        return InventoryResponse.model_validate(row)
 
     async def reserve(self, sku: str, qty: int, order_id: uuid.UUID) -> ReservationResponse:
         """Hold ``qty`` of ``sku`` for ``order_id`` until the TTL expires.
@@ -145,7 +145,7 @@ class InventoryService:
             oversell_blocked_total.inc()
             log.info("reservation rejected: insufficient stock for sku=%s qty=%s", sku, qty)
             raise InsufficientStockError(sku, qty)
-        return ReservationResponse.model_validate(reservation_to_domain(row))
+        return ReservationResponse.model_validate(row)
 
     async def reserve_many(self, lines: list[tuple[str, int]], order_id: uuid.UUID) -> list[ReservationResponse]:
         """Hold every ``(sku, qty)`` line for ``order_id`` in one all-or-nothing transaction.
@@ -186,7 +186,7 @@ class InventoryService:
             oversell_blocked_total.inc()
             log.info("batch reservation rejected: insufficient stock for sku=%s qty=%s", rows.sku, rows.qty)
             raise InsufficientStockError(rows.sku, rows.qty)
-        return [ReservationResponse.model_validate(reservation_to_domain(row)) for row in rows]
+        return [ReservationResponse.model_validate(snapshot) for snapshot in rows]
 
     async def release(self, reservation_id: uuid.UUID) -> bool:
         """Give a held reservation's stock back (saga compensation); ``False`` on replay."""
