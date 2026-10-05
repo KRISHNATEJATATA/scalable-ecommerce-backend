@@ -24,6 +24,7 @@ from src.shared.errors.exceptions import (
     AuthenticationError,
     AuthorizationError,
     CartChangedError,
+    CartLineNotFoundError,
     CheckoutIdempotencyConflictError,
     ConcurrentUpdateError,
     DependencyUnavailableError,
@@ -40,6 +41,7 @@ from src.shared.errors.exceptions import (
     OrderStateConflictError,
     PaymentIdempotencyConflictError,
     PreconditionFailedError,
+    ProductNotFoundError,
     RateLimitExceededError,
     ReservationConflictError,
     ReservationContendedError,
@@ -199,6 +201,19 @@ async def _keycloak_not_found_handler(_: Request, exc: KeycloakEntityNotFoundErr
     return _problem_response(404, title="Not Found", detail=exc.detail)
 
 
+async def _product_not_found_handler(_: Request, exc: ProductNotFoundError) -> JSONResponse:
+    # 404: the product is unknown or soft-deleted, so the cart must never
+    # reference it. Caller-fixable — pick a live product, not a server fault.
+    return _problem_response(404, title="Not Found", detail=exc.detail)
+
+
+async def _cart_line_not_found_handler(_: Request, exc: CartLineNotFoundError) -> JSONResponse:
+    # 404: the cart holds no line for this product — including a 0 for an
+    # absent line. Distinct from the product-gone 404 above so the client can
+    # tell "nothing to update" apart from "re-add the product".
+    return _problem_response(404, title="Not Found", detail=exc.detail)
+
+
 async def _keycloak_conflict_handler(_: Request, exc: KeycloakConflictError) -> JSONResponse:
     # 409: e.g. account creation against an email Keycloak already has. The
     # caller picks a different address; a 500 here read as "broken server" and
@@ -300,6 +315,8 @@ def register_exception_handlers(app: FastAPI) -> None:
     _register(app, StaleDataError, _stale_data_handler)
     _register(app, DependencyUnavailableError, _dependency_unavailable_handler)
     _register(app, KeycloakEntityNotFoundError, _keycloak_not_found_handler)
+    _register(app, ProductNotFoundError, _product_not_found_handler)
+    _register(app, CartLineNotFoundError, _cart_line_not_found_handler)
     _register(app, KeycloakConflictError, _keycloak_conflict_handler)
     _register(app, StarletteHTTPException, _http_exception_handler)
     _register(app, RequestValidationError, _validation_exception_handler)

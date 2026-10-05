@@ -33,12 +33,10 @@ from src.events.models import (
     StockReleased,
     StockReserved,
     UserCreated,
-    UserDeleted,
 )
 
 EVENT_MODELS: tuple[type[DomainEvent], ...] = (
     UserCreated,
-    UserDeleted,
     # Product events: v1 is frozen and no longer produced, but stays registered so
     # messages written before the v2 rollout still validate on the way out of an
     # outbox table or an SQS queue instead of being DLQ'd as unknown.
@@ -68,7 +66,6 @@ EVENT_MODELS: tuple[type[DomainEvent], ...] = (
 #: test in ``tests/unit/test_events.py`` fails if production code drifts from it.
 PRODUCED_VERSIONS: dict[str, int] = {
     "UserCreated": 1,
-    "UserDeleted": 1,
     "ProductCreated": 2,
     "ProductUpdated": 2,
     "ProductDeleted": 2,

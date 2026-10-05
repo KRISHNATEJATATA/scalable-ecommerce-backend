@@ -57,6 +57,8 @@ class DomainEvent(_Strict):
 
 
 # --- Identity -----------------------------------------------------------------
+# Only UserCreated: identity has no hard-delete path (admin disable flips
+# `is_active` and writes no event), so no UserDeleted event is produced.
 
 
 class UserCreatedData(_Strict):
@@ -68,16 +70,6 @@ class UserCreated(DomainEvent):
     type: Literal["UserCreated"] = "UserCreated"
     schema_version: Literal[1] = 1
     data: UserCreatedData
-
-
-class UserDeletedData(_Strict):
-    user_id: uuid.UUID
-
-
-class UserDeleted(DomainEvent):
-    type: Literal["UserDeleted"] = "UserDeleted"
-    schema_version: Literal[1] = 1
-    data: UserDeletedData
 
 
 # --- Catalog ------------------------------------------------------------------

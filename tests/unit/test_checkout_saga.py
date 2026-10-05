@@ -30,12 +30,14 @@ from sqlalchemy import text
 
 from src.bootstrap.container import OrderCharges, OrderStockHolds
 from src.bootstrap.payment_refund import orders_repository_with_payment_guard
-from src.bootstrap.saga_recovery import _WorkerBasket
+from src.bootstrap.saga_factory import SagaBasket, SagaCharges, SagaPriceTruth, SagaStockHolds, build_checkout_saga
+from src.bootstrap.saga_recovery import SagaRecovery
 from src.cart.adapters.valkey.repository import ValkeyCartRepository
 from src.inventory.adapters.db.repository import InventoryRepository
 from src.inventory.application.outbox import stock_released_outbox
 from src.inventory.application.service import InventoryService
 from src.orders.adapters.db.repository import OrdersRepository
+from src.orders.adapters.idempotency import ValkeyIdempotencyStore
 from src.orders.application.checkout_saga import CheckoutSaga, payment_key_for
 from src.orders.application.service import OrdersService
 from src.orders.domain.order import OrderStatus
@@ -44,10 +46,12 @@ from src.payments.adapters.db.repository import PaymentsRepository
 from src.payments.adapters.resilient_gateway import ResilientPaymentGateway
 from src.payments.adapters.stub_gateway import DeferredChargeWindow, StubPaymentGateway
 from src.payments.application.service import PaymentsService, sign_webhook
+from src.shared.config.setting import get_settings
 from src.shared.errors.exceptions import (
     AuthorizationError,
     CartChangedError,
     CheckoutIdempotencyConflictError,
+    DependencyUnavailableError,
     InsufficientStockError,
     OrderStateConflictError,
 )
@@ -590,7 +594,7 @@ async def test_concurrent_add_survives_checkout_over_the_real_cart(session, real
     inventory = InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)
     saga = CheckoutSaga(
         OrdersRepository(session),
-        _WorkerBasket(real_valkey, ttl_seconds=300),
+        SagaBasket(ValkeyCartRepository(real_valkey, ttl_seconds=300)),
         OrderStockHolds(inventory),
         charges,
         _Idempotency(),
@@ -2889,3 +2893,31 @@ async def test_orders_chain_round_trips_downgrade_base_to_head(session):
     names = [row.conname for row in constraints]
     assert "uq_orders_user_id_idempotency_key" in names
     assert "uq_orders_idempotency_key" not in names
+
+
+# --- saga factory wiring ------------------------------------------------------
+
+
+async def test_factory_is_the_single_wiring_for_request_and_recovery_paths(session, real_valkey, sessionmaker_factory):
+    """build_checkout_saga is the one wiring both composition roots share.
+
+    The request path (container.get_checkout_saga) and the recovery worker
+    (SagaRecovery._saga) must build the identical adapter graph, so a provider
+    swap in the factory reaches both (the ADR 0021 scenario). A missing Valkey
+    fails closed (503) instead of silently degrading.
+    """
+    settings = get_settings()
+    request_saga = build_checkout_saga(session, real_valkey, settings)
+    recovery_saga = SagaRecovery(sessionmaker_factory, real_valkey, settings)._saga(session)
+
+    for saga in (request_saga, recovery_saga):
+        assert isinstance(saga, CheckoutSaga)
+        assert isinstance(saga._basket, SagaBasket)
+        assert isinstance(saga._holds, SagaStockHolds)
+        assert isinstance(saga._charges, SagaCharges)
+        assert isinstance(saga._prices, SagaPriceTruth)
+        assert isinstance(saga._idempotency, ValkeyIdempotencyStore)
+        assert saga._step_timeout == settings.checkout_saga_step_timeout_seconds
+
+    with pytest.raises(DependencyUnavailableError):
+        build_checkout_saga(session, None, settings)

@@ -29,7 +29,6 @@ from src.events.models import (
     StockReleased,
     StockReserved,
     UserCreated,
-    UserDeleted,
 )
 from src.events.registry import (
     EVENT_MODELS,
@@ -42,7 +41,6 @@ from src.events.registry import (
 __all__ = [
     "DomainEvent",
     "UserCreated",
-    "UserDeleted",
     "ProductCreated",
     "ProductUpdated",
     "ProductDeleted",

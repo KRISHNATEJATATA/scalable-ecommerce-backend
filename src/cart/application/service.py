@@ -11,16 +11,11 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from fastapi import HTTPException, status
-
 from src.cart.application.dto import CartItemResponse, CartResponse
 from src.cart.domain.cart import Cart, ProductTombstonedError
 from src.cart.ports.products import CartProductPort
 from src.cart.ports.repository import CartRepositoryPort
-from src.shared.errors.exceptions import InvalidCartOperationError
-
-_NOT_FOUND = HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="product not found")
-_LINE_NOT_FOUND = HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="line not in cart")
+from src.shared.errors.exceptions import CartLineNotFoundError, InvalidCartOperationError, ProductNotFoundError
 
 
 def _to_response(cart: Cart | None) -> CartResponse:
@@ -80,7 +75,7 @@ class CartService:
         self._check_quantity(quantity)
         snapshot = await self._products.get_snapshot(product_id)
         if snapshot is None:
-            raise _NOT_FOUND
+            raise ProductNotFoundError()
         try:
             cart = await self._repo.add_item(
                 user_id,
@@ -94,7 +89,7 @@ class CartService:
                 product_version=snapshot.version,
             )
         except ProductTombstonedError as exc:
-            raise _NOT_FOUND from exc
+            raise ProductNotFoundError() from exc
         return _to_response(cart)
 
     async def set_quantity(self, user_id: uuid.UUID, *, product_id: uuid.UUID, quantity: int) -> CartResponse:
@@ -109,12 +104,12 @@ class CartService:
             raise InvalidCartOperationError(f"quantity {quantity} out of range (0..{self._max_qty_per_line})")
         if await self._products.get_snapshot(product_id) is None:
             await self._repo.remove_item(user_id, product_id=product_id)
-            raise _NOT_FOUND
+            raise ProductNotFoundError()
         cart = await self._repo.set_quantity(
             user_id, product_id=product_id, quantity=quantity, max_per_line=self._max_qty_per_line
         )
         if cart is None:
-            raise _LINE_NOT_FOUND
+            raise CartLineNotFoundError()
         return _to_response(cart)
 
     async def remove_item(self, user_id: uuid.UUID, *, product_id: uuid.UUID) -> CartResponse:

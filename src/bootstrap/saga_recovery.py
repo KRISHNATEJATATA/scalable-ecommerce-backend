@@ -34,116 +34,15 @@ import asyncio
 import contextlib
 import logging
 import signal
-import uuid
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from src.bootstrap.payment_gateway import make_payment_gateway
-from src.bootstrap.payment_refund import cancelled_order_refund_hook, orders_repository_with_payment_guard
-from src.cart.adapters.valkey.repository import ValkeyCartRepository
-from src.inventory.adapters.db.repository import InventoryRepository
-from src.inventory.application.service import InventoryService
-from src.orders.adapters.idempotency import ValkeyIdempotencyStore
+from src.bootstrap.saga_factory import build_checkout_saga
 from src.orders.application.checkout_saga import CheckoutSaga
-from src.orders.ports.checkout import BasketPort, ChargePort, ChargeResult, CheckoutLine, PriceTruthPort
-from src.payments.adapters.db.repository import PaymentsRepository
-from src.payments.application.service import PaymentsService
 from src.shared.config.setting import AppSettings, get_settings
 
 log = logging.getLogger(__name__)
-
-
-class _WorkerBasket(BasketPort):
-    """The saga's basket over the Valkey cart repository (no catalog needed).
-
-    Recovery only reads lines to rebuild hashes (which it doesn't need — the
-    crashed path never re-presents the token) and clears baskets on success, so
-    the product-snapshot port the request path carries is unnecessary here.
-    """
-
-    def __init__(self, valkey: object, *, ttl_seconds: int) -> None:
-        self._repo = ValkeyCartRepository(valkey, ttl_seconds=ttl_seconds)
-
-    async def get_lines(self, user_id: uuid.UUID) -> list[CheckoutLine]:
-        cart = await self._repo.get_cart(user_id)
-        if cart is None:
-            return []
-        return [
-            CheckoutLine(
-                product_id=uuid.UUID(line.product_id),
-                name=line.name,
-                unit_price=Decimal(line.unit_price),
-                quantity=line.quantity,
-            )
-            for line in cart.items
-        ]
-
-    async def clear(self, user_id: uuid.UUID) -> None:
-        await self._repo.clear_cart(user_id)
-
-    async def consume(self, user_id: uuid.UUID, lines: list[CheckoutLine]) -> None:
-        """Subtract the purchased quantities; concurrent adds always survive."""
-        await self._repo.consume_lines(user_id, lines=[(line.product_id, line.quantity) for line in lines])
-
-
-class _WorkerCharges(ChargePort):
-    """The saga's charges over the payments service.
-
-    Recovery is read-lookup plus the refund leg only: it never charges (the
-    payment token is never stored), but it *does* refund — the refund needs
-    only the idempotency key, so a crashed checkout whose order was cancelled
-    concurrently can still unwind its money automatically."""
-
-    def __init__(self, payments: PaymentsService) -> None:
-        self._payments = payments
-
-    async def charge(
-        self, *, order_id: uuid.UUID, idempotency_key: str, amount: Decimal, payment_token: str
-    ) -> ChargeResult:  # pragma: no cover - recovery never charges (no token stored)
-        raise RuntimeError("recovery must never charge: the payment token is never stored")
-
-    async def find_by_idempotency_key(self, idempotency_key: str) -> ChargeResult | None:
-        payment = await self._payments.get_by_idempotency_key(idempotency_key)
-        if payment is None:
-            return None
-        return ChargeResult(status=payment.status)
-
-    async def refund(self, *, idempotency_key: str, reason: str) -> bool:
-        return await self._payments.refund(idempotency_key=idempotency_key, reason=reason)
-
-
-class _WorkerPrices(PriceTruthPort):
-    """The saga's price truth, unwired: recovery never creates orders.
-
-    Price revalidation guards the fresh-checkout path only (a pending order
-    keeps the prices it was created with), and this saga only ever runs
-    ``recover_stuck`` — so a call here is a bug, answered like
-    ``_WorkerCharges.charge``: loudly.
-    """
-
-    async def current_prices(self, product_ids: list[uuid.UUID]) -> dict[uuid.UUID, Decimal]:
-        raise RuntimeError("recovery must never revalidate prices: only fresh checkouts create orders")
-
-
-class _WorkerHolds:
-    """The saga's holds over the inventory service (same calls as the live path)."""
-
-    def __init__(self, inventory: InventoryService) -> None:
-        self._inventory = inventory
-
-    async def reserve_many(self, lines: list[tuple[str, int]], order_id: uuid.UUID) -> None:
-        await self._inventory.reserve_many(lines, order_id)
-
-    async def release_for_order(self, order_id: uuid.UUID) -> int:
-        return await self._inventory.release_for_order(order_id)
-
-    async def restock_for_order(self, order_id: uuid.UUID) -> int:
-        return await self._inventory.restock_for_order(order_id)
-
-    async def commit_for_order(self, order_id: uuid.UUID, *, expected: int) -> int:
-        return await self._inventory.commit_for_order(order_id, expected=expected)
 
 
 class SagaRecovery:
@@ -159,32 +58,9 @@ class SagaRecovery:
         self._valkey = valkey
         self._settings = settings
 
-    def _saga(self, session) -> CheckoutSaga:
-        inventory = InventoryService(
-            InventoryRepository(session), reservation_ttl_seconds=self._settings.reservation_ttl_seconds
-        )
-        payments = PaymentsService(
-            PaymentsRepository(session),
-            # The same factory the API builds from: this worker refunds charges it
-            # never took, so a provider swap must reach it too — a
-            # worker stuck on the stub would flip a row to `refunded` while no
-            # money moved and nothing alerted.
-            make_payment_gateway(self._settings, self._valkey),
-            webhook_secret=self._settings.payment_webhook_secret,
-            webhook_tolerance_seconds=self._settings.payment_webhook_tolerance_seconds,
-            reconciliation_grace_seconds=self._settings.payment_reconciliation_grace_seconds,
-            reconciliation_max_age_seconds=self._settings.payment_reconciliation_max_age_seconds,
-            on_payment_succeeded=cancelled_order_refund_hook(session),
-        )
-        return CheckoutSaga(
-            orders_repository_with_payment_guard(session),
-            _WorkerBasket(self._valkey, ttl_seconds=self._settings.cart_ttl_seconds),
-            _WorkerHolds(inventory),
-            _WorkerCharges(payments),
-            ValkeyIdempotencyStore(self._valkey, ttl_seconds=self._settings.checkout_idempotency_ttl_seconds),
-            prices=_WorkerPrices(),
-            step_timeout_seconds=self._settings.checkout_saga_step_timeout_seconds,
-        )
+    def _saga(self, session: AsyncSession) -> CheckoutSaga:
+        """Build the saga over the shared factory (identical wiring to the request path)."""
+        return build_checkout_saga(session, self._valkey, self._settings)
 
     async def sweep_once(self) -> dict[str, int]:
         """One pass: settle every stuck checkout, return the outcome counts."""

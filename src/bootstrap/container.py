@@ -9,7 +9,6 @@ and tests inject fakes via ``app.dependency_overrides`` with no internal patchin
 from __future__ import annotations
 
 import uuid
-from decimal import Decimal
 from typing import Annotated
 
 from fastapi import Depends, Request
@@ -17,6 +16,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.bootstrap.payment_gateway import make_payment_gateway
 from src.bootstrap.payment_refund import cancelled_order_refund_hook, orders_repository_with_payment_guard
+from src.bootstrap.saga_factory import (
+    SagaBasket,
+    SagaCharges,
+    SagaPriceTruth,
+    SagaStockHolds,
+    build_checkout_saga,
+)
 from src.cart.adapters.valkey.repository import ValkeyCartRepository
 from src.cart.application.service import CartService
 from src.cart.ports.products import CartProductPort, ProductSnapshot
@@ -38,15 +44,11 @@ from src.inventory.adapters.db.repository import InventoryRepository
 from src.inventory.application.service import InventoryService
 from src.inventory.ports.ownership import StockOwnershipPort
 from src.inventory.ports.repository import InventoryRepositoryPort
-from src.orders.adapters.idempotency import ValkeyIdempotencyStore
 from src.orders.application.checkout_saga import CheckoutSaga
 from src.orders.application.service import OrdersService
 from src.orders.ports.checkout import (
     BasketPort,
     ChargePort,
-    ChargeResult,
-    CheckoutLine,
-    IdempotencyPort,
     PriceTruthPort,
     StockHoldsPort,
 )
@@ -201,124 +203,11 @@ def get_orders_repository(session: SessionDep) -> OrdersRepositoryPort:
     return orders_repository_with_payment_guard(session)
 
 
-class OrderBaskets(BasketPort):
-    """Orders' :class:`BasketPort` built over the cart service.
-
-    Lives here — the one place allowed to touch every module — so orders never
-    names cart. The cart's price/name snapshots become the order lines verbatim:
-    later catalog edits never rewrite order history.
-    """
-
-    def __init__(self, cart: CartService) -> None:
-        self._cart = cart
-
-    async def get_lines(self, user_id: uuid.UUID) -> list[CheckoutLine]:
-        """The user's current cart lines as checkout lines (``[]`` when empty)."""
-        cart = await self._cart.get_cart(user_id)
-        return [
-            CheckoutLine(
-                product_id=item.product_id,
-                name=item.name,
-                unit_price=item.unit_price,
-                quantity=item.quantity,
-            )
-            for item in cart.items
-        ]
-
-    async def clear(self, user_id: uuid.UUID) -> None:
-        """Empty the basket wholesale (the replay mop-up's exact-match clear)."""
-        await self._cart.clear_cart(user_id)
-
-    async def consume(self, user_id: uuid.UUID, lines: list[CheckoutLine]) -> None:
-        """Subtract the purchased quantities; concurrent adds always survive."""
-        await self._cart.consume_purchased(user_id, lines=[(line.product_id, line.quantity) for line in lines])
-
-
-class OrderStockHolds(StockHoldsPort):
-    """Orders' :class:`StockHoldsPort` built over the inventory service.
-
-    Lives here so orders never names inventory. SKU mapping ``str(product.id)``
-    is the composition seam — the saga is its production caller.
-    """
-
-    def __init__(self, inventory: InventoryService) -> None:
-        self._inventory = inventory
-
-    async def reserve_many(self, lines: list[tuple[str, int]], order_id: uuid.UUID) -> None:
-        """Hold every ``(sku, qty)`` line for ``order_id`` in one all-or-nothing transaction."""
-        await self._inventory.reserve_many(lines, order_id)
-
-    async def release_for_order(self, order_id: uuid.UUID) -> int:
-        """Release every still-held reservation of one order (compensation)."""
-        return await self._inventory.release_for_order(order_id)
-
-    async def restock_for_order(self, order_id: uuid.UUID) -> int:
-        """Reverse the order's committed reservations (cancelled after a full commit)."""
-        return await self._inventory.restock_for_order(order_id)
-
-    async def commit_for_order(self, order_id: uuid.UUID, *, expected: int) -> int:
-        """Consume the order's still-held reservations, all-or-nothing (success).
-
-        Returns the order's committed total after the call — the retry-safe
-        end-state the saga's paid-implies-consumed invariant checks against,
-        not the per-call row count. A shortfall against ``expected`` consumes
-        nothing.
-        """
-        return await self._inventory.commit_for_order(order_id, expected=expected)
-
-
-class OrderCharges(ChargePort):
-    """Orders' :class:`ChargePort` built over the payments service.
-
-    Lives here so orders never names payments. Terminal states map to the
-    saga's vocabulary; a still-``pending`` attempt is reported as-is so the
-    recovery poller defers to the payment reconciler.
-    """
-
-    def __init__(self, payments: PaymentsService) -> None:
-        self._payments = payments
-
-    async def charge(
-        self, *, order_id: uuid.UUID, idempotency_key: str, amount: Decimal, payment_token: str
-    ) -> ChargeResult:
-        """Charge through the gateway (idempotent on ``idempotency_key``)."""
-        payment = await self._payments.charge(
-            order_id=order_id,
-            idempotency_key=idempotency_key,
-            amount=amount,
-            payment_method_token=payment_token,
-        )
-        return ChargeResult(status=payment.status)
-
-    async def find_by_idempotency_key(self, idempotency_key: str) -> ChargeResult | None:
-        """The recorded charge outcome, or ``None`` if never charged."""
-        payment = await self._payments.get_by_idempotency_key(idempotency_key)
-        if payment is None:
-            return None
-        return ChargeResult(status=payment.status)
-
-    async def refund(self, *, idempotency_key: str, reason: str) -> bool:
-        """Reverse the charge through the payments service (idempotent per key)."""
-        return await self._payments.refund(idempotency_key=idempotency_key, reason=reason)
-
-
-class CatalogPriceTruth(PriceTruthPort):
-    """Orders' :class:`PriceTruthPort` built over the catalog repository.
-
-    Lives here — the one place allowed to touch every module — so orders never
-    names catalog. Deliberately the **repository**, not ``CatalogService``:
-    the service's cache-aside is invalidated by the same asynchronous events
-    whose propagation lag this guard exists to catch, so only the DB read is
-    authoritative enough to revalidate checkout prices against.
-    """
-
-    def __init__(self, catalog: CatalogRepositoryPort) -> None:
-        self._catalog = catalog
-
-    async def current_prices(self, product_ids: list[uuid.UUID]) -> dict[uuid.UUID, Decimal]:
-        """Live price per still-sellable id; gone products are absent."""
-        products = await self._catalog.get_products_by_ids(product_ids)
-        return {product.id: product.price for product in products}
+# Back-compat aliases: the saga port adapters live in
+# :mod:`src.bootstrap.saga_factory` (shared with the recovery worker); these
+# names stay importable for existing callers and tests.
+OrderStockHolds = SagaStockHolds
+OrderCharges = SagaCharges
 
 
 # The saga's provider functions live at the bottom of this file (after the
@@ -478,63 +367,46 @@ def get_payments_service(
 # them, and defined-after-use in source reads like a bug to the type checker
 # even though FastAPI resolves the strings lazily.
 def get_order_basket(
-    cart: Annotated[CartService, Depends(get_cart_service)],
+    repo: Annotated[CartRepositoryPort, Depends(get_cart_repository)],
 ) -> BasketPort:
     """Provide the cart-backed basket lines for checkout."""
-    return OrderBaskets(cart)
+    return SagaBasket(repo)
 
 
 def get_order_stock_holds(
     inventory: Annotated[InventoryService, Depends(get_inventory_service)],
 ) -> StockHoldsPort:
     """Provide the inventory-backed stock holds for the saga."""
-    return OrderStockHolds(inventory)
+    return SagaStockHolds(inventory)
 
 
 def get_order_charges(
     payments: Annotated[PaymentsService, Depends(get_payments_service)],
 ) -> ChargePort:
     """Provide the payments-backed charges for the saga."""
-    return OrderCharges(payments)
+    return SagaCharges(payments)
 
 
 def get_price_truth(
     catalog: Annotated[CatalogRepositoryPort, Depends(get_catalog_repository)],
 ) -> PriceTruthPort:
     """Provide the catalog-DB-backed price truth for checkout revalidation."""
-    return CatalogPriceTruth(catalog)
-
-
-def get_order_idempotency(request: Request) -> IdempotencyPort | None:
-    """Provide the Valkey idempotency fast path, or ``None`` if Valkey is down/absent.
-
-    ``None`` only loses the fast path — the DB UNIQUE backstop still prevents
-    duplicate orders, degrading to re-reading the stored row.
-    """
-    valkey = getattr(request.app.state, "valkey", None)
-    if valkey is None:
-        return None
-    return ValkeyIdempotencyStore(valkey, ttl_seconds=request.app.state.settings.checkout_idempotency_ttl_seconds)
+    return SagaPriceTruth(catalog)
 
 
 def get_checkout_saga(
-    repo: Annotated[OrdersRepositoryPort, Depends(get_orders_repository)],
-    basket: Annotated[BasketPort, Depends(get_order_basket)],
-    holds: Annotated[StockHoldsPort, Depends(get_order_stock_holds)],
-    charges: Annotated[ChargePort, Depends(get_order_charges)],
-    idempotency: Annotated[IdempotencyPort | None, Depends(get_order_idempotency)],
-    prices: Annotated[PriceTruthPort, Depends(get_price_truth)],
+    session: SessionDep,
     request: Request,
+    gateway: Annotated[PaymentGatewayPort, Depends(get_payment_gateway)],
 ) -> CheckoutSaga:
-    """Provide the checkout saga orchestrator over its ports."""
-    return CheckoutSaga(
-        repo,
-        basket,
-        holds,
-        charges,
-        idempotency,
-        prices=prices,
-        step_timeout_seconds=request.app.state.settings.checkout_saga_step_timeout_seconds,
+    """Provide the checkout saga orchestrator over its ports.
+
+    Delegates to the shared saga factory (the same wiring the recovery worker
+    builds from) — the only per-request input beyond the session is the cached
+    process-shared gateway and Valkey client off ``app.state``.
+    """
+    return build_checkout_saga(
+        session, getattr(request.app.state, "valkey", None), request.app.state.settings, gateway=gateway
     )
 
 

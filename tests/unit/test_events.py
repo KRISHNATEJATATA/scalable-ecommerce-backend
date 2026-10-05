@@ -40,7 +40,6 @@ from src.events.registry import PRODUCED_VERSIONS, REGISTRY, schema_for
 
 _EXPECTED = {
     "UserCreated",
-    "UserDeleted",
     "ProductCreated",
     "ProductUpdated",
     "ProductDeleted",
@@ -193,7 +192,6 @@ _EVENT_SAMPLES: dict[tuple[str, int], Callable[..., dict[str, Any]]] = {
         "user_id": user_id,
         "email": "a@b.com",
     },
-    ("UserDeleted", 1): lambda user_id, merchant_id: {"user_id": user_id},
     ("ProductCreated", 1): lambda user_id, merchant_id: {
         "product_id": user_id,
         "merchant_id": merchant_id,

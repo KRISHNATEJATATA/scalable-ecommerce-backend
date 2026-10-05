@@ -337,3 +337,29 @@ class KeycloakInvalidRequestError(Exception):
     def __init__(self, detail: str = "Keycloak rejected this request") -> None:
         super().__init__(detail)
         self.detail = detail
+
+
+class ProductNotFoundError(Exception):
+    """The referenced product is unknown or soft-deleted → 404.
+
+    A cart must never reference a product that cannot be checked out, so
+    add/set-quantity against a missing snapshot (or a tombstoned line) is a
+    caller-fixable outcome, not a server fault.
+    """
+
+    def __init__(self, detail: str = "product not found") -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+class CartLineNotFoundError(Exception):
+    """The cart holds no line for the requested product → 404.
+
+    Raised when set-quantity targets an absent line — including a ``0`` for an
+    absent line — distinct from :class:`ProductNotFoundError` so the client
+    can tell "re-add the product" apart from "nothing to update".
+    """
+
+    def __init__(self, detail: str = "line not in cart") -> None:
+        super().__init__(detail)
+        self.detail = detail

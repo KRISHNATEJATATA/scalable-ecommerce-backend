@@ -43,7 +43,7 @@ class User(Base, TimestampMixin):
 
 
 class Outbox(Base, OutboxMixin):
-    """Transactional outbox for identity-originated events (``UserCreated``, ``UserDeleted``, ...)."""
+    """Transactional outbox for identity-originated events (``UserCreated``)."""
 
     __tablename__ = "outbox"
     __table_args__ = (outbox_unpublished_index("identity"), {"schema": SCHEMA})
