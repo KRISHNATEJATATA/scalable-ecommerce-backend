@@ -50,6 +50,7 @@ from src.inventory.domain.reservation import Reservation as DomainReservation
 from src.inventory.domain.reservation import ReservationStatus
 from src.inventory.ports.repository import OutboxFactory, StockRejection
 from src.shared.db.outbox import OutboxMessage
+from src.shared.db.unit_of_work import UnitOfWork
 from src.shared.errors.exceptions import (
     InvalidReservationError,
     ReservationConflictError,
@@ -185,11 +186,32 @@ _MARK_RELEASED_BATCH_SQL = text(
 #: The ``OutboxFactory`` contract lives in ``ports`` and is imported above.
 
 
+class _BatchRaced(Exception):
+    """Internal: this attempt lost the uniqueness race — retry after re-reading."""
+
+    def __init__(self, sku: str) -> None:
+        super().__init__(sku)
+        self.sku = sku
+
+
+class _BatchRejection(Exception):
+    """Internal: stock refused this attempt's line — unwinds the savepoint, reported as ``StockRejection``."""
+
+    def __init__(self, sku: str, qty: int) -> None:
+        super().__init__(sku, qty)
+        self.sku = sku
+        self.qty = qty
+
+
 class InventoryRepository:
     """Implements :class:`src.inventory.ports.repository.InventoryRepositoryPort`."""
 
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+        # Bound to the request's unit of work; the repo participates but never
+        # commits it — the service opens the boundary, so a use-case composing
+        # several writes stays one atomic unit.
+        self.uow = UnitOfWork(session)
 
     async def get_by_sku(self, sku: str) -> DomainInventory | None:
         """The stock row for ``sku`` as a frozen snapshot, or ``None`` if the SKU has no inventory."""
@@ -208,9 +230,10 @@ class InventoryRepository:
         """
         row = (await self._session.execute(_UPSERT_SQL, {"sku": sku, "on_hand": on_hand})).first()
         if row is None:
-            await self._session.rollback()
+            # The guard refused: no write to undo, and the enclosing unit of
+            # work owns the transaction — just answer, never roll back here.
             return None
-        await self._session.commit()
+        await self._session.flush()
         # The RETURNING row is a plain ``Row`` (text() DML), not an ORM instance, so it
         # is built by hand — ``to_domain`` is typed to ``InventoryRow``.
         return DomainInventory(sku=row.sku, on_hand=row.on_hand, reserved=row.reserved, version=row.version)
@@ -335,12 +358,12 @@ class InventoryRepository:
         :class:`ReservationContendedError`). Unrecognised SQLSTATEs re-raise
         rather than being mistranslated into a stock answer.
 
-        The return is the placed rows refreshed after the commit (the commit
-        expires every loaded row) — one primary-key read per line, the same cost
-        the single-line path paid, while the batch's win is the single
-        connection, transaction and commit. Refresh by PK, not a re-read of the
-        active set: a row compensation flipped to ``released`` in the race window
-        still refreshes fine, where a set re-read would lose it.
+        The return is the placed rows refreshed after the flush — one primary-key
+        read per line, the same cost the single-line path paid, while the batch's
+        win is the single connection and transaction. Refresh by PK, not a re-read
+        of the active set: a row compensation flipped to ``released`` in the race
+        window still refreshes fine, where a set re-read would lose it. The
+        service commits the enclosing unit of work.
         """
         if not lines:
             return []
@@ -356,59 +379,62 @@ class InventoryRepository:
             # point against in-flight releases); only a unique violation earns
             # the lookup pass, which then knows every conflicting row's fate.
             existing = await self._active_map(order_id, skus) if attempt else {}
-            placed: list[Reservation] = []
-            raced = False
-            for sku, qty in ordered:
-                current = existing.get(sku)
-                if current is not None:
-                    held_qty = current.qty  # read BEFORE the rollback expires the row
-                    if held_qty != qty:
-                        # Roll back first: earlier-sorted lines of this attempt may
-                        # already be inserted/decremented in the open transaction,
-                        # and the saga's compensation runs on this same session —
-                        # raising dirty would let it commit a batch that never landed.
-                        await self._session.rollback()
-                        raise ReservationConflictError(sku, held_qty, qty)
-                    placed.append(current)  # earlier attempt's hold — don't deduct its stock twice
-                    continue
-                reservation = Reservation(
-                    sku=sku,
-                    qty=qty,
-                    order_id=order_id,
-                    expires_at=expires_at,
-                    status=ReservationStatus.HELD.value,
-                )
-                self._session.add(reservation)
-                try:
-                    await self._session.flush()
-                except IntegrityError as exc:
-                    await self._session.rollback()
-                    state = _sqlstate(exc)
-                    if state == _FOREIGN_KEY_VIOLATION:
-                        # No inventory row for this SKU, so there is nothing to hold.
-                        # Reported as insufficient stock, not a 500: to the caller an
-                        # unstocked SKU and a sold-out one are the same unavailability.
-                        log.info("reservation rejected: no inventory row for sku=%s", sku)
-                        return StockRejection(sku, qty)
-                    if state == _CHECK_VIOLATION:
-                        raise InvalidReservationError(
-                            f"invalid reservation for {sku!r}: quantity {qty} must be positive"
-                        ) from exc
-                    if state != _UNIQUE_VIOLATION:
-                        raise  # not ours to interpret — surface the real cause
-                    raced = True  # a duplicate landed between our read and this INSERT; reread and retry
-                    raced_sku = sku
-                    break
-                if await self.try_reserve_decrement(sku, qty) == 0:
-                    # The oversell guard refused this line: roll the WHOLE batch
-                    # back so no partial holds leak into the saga's compensation.
-                    await self._session.rollback()
-                    return StockRejection(sku, qty)
-                self._session.add(self._outbox_row(outbox_factory(sku, order_id, qty)))
-                placed.append(reservation)
-            if raced:
+            try:
+                # One savepoint per attempt: a lost race, a refused line or a
+                # conflict unwinds only this attempt — never the caller's
+                # surrounding unit of work, which owns the commit.
+                async with self._session.begin_nested():
+                    placed: list[Reservation] = []
+                    for sku, qty in ordered:
+                        current = existing.get(sku)
+                        if current is not None:
+                            held_qty = current.qty  # read BEFORE any unwind expires the row
+                            if held_qty != qty:
+                                # Raising unwinds the savepoint, so earlier-sorted
+                                # lines of this attempt never leak into the
+                                # caller's transaction as phantom holds.
+                                raise ReservationConflictError(sku, held_qty, qty)
+                            placed.append(current)  # earlier attempt's hold — don't deduct its stock twice
+                            continue
+                        reservation = Reservation(
+                            sku=sku,
+                            qty=qty,
+                            order_id=order_id,
+                            expires_at=expires_at,
+                            status=ReservationStatus.HELD.value,
+                        )
+                        self._session.add(reservation)
+                        try:
+                            await self._session.flush()
+                        except IntegrityError as exc:
+                            state = _sqlstate(exc)
+                            if state == _FOREIGN_KEY_VIOLATION:
+                                # No inventory row for this SKU, so there is nothing to hold.
+                                # Reported as insufficient stock, not a 500: to the caller an
+                                # unstocked SKU and a sold-out one are the same unavailability.
+                                log.info("reservation rejected: no inventory row for sku=%s", sku)
+                                raise _BatchRejection(sku, qty) from exc
+                            if state == _CHECK_VIOLATION:
+                                raise InvalidReservationError(
+                                    f"invalid reservation for {sku!r}: quantity {qty} must be positive"
+                                ) from exc
+                            if state != _UNIQUE_VIOLATION:
+                                raise  # not ours to interpret — surface the real cause
+                            raced_sku = sku
+                            # A duplicate landed between our read and this INSERT;
+                            # unwind the savepoint, reread and retry.
+                            raise _BatchRaced(sku) from exc
+                        if await self.try_reserve_decrement(sku, qty) == 0:
+                            # The oversell guard refused this line: unwind the
+                            # WHOLE batch so no partial holds leak into the saga's
+                            # compensation.
+                            raise _BatchRejection(sku, qty)
+                        self._session.add(self._outbox_row(outbox_factory(sku, order_id, qty)))
+                        placed.append(reservation)
+            except _BatchRaced:
                 continue
-            await self._session.commit()
+            except _BatchRejection as rejection:
+                return StockRejection(rejection.sku, rejection.qty)
             for reservation in placed:
                 await self._session.refresh(reservation)
             return [reservation_to_domain(row) for row in placed]
@@ -436,11 +462,12 @@ class InventoryRepository:
             )
         ).first()
         if row is None:
-            await self._session.rollback()
+            # No-op replay: no write to undo, and the enclosing unit of work
+            # owns the transaction — just answer, never roll back here.
             return False
         await self._require_one(_UNRESERVE_SQL, {"sku": row.sku, "qty": row.qty}, what="release unreserve")
         self._session.add(self._outbox_row(outbox_factory(row.sku, row.order_id, row.qty)))
-        await self._session.commit()
+        await self._session.flush()
         return True
 
     async def commit_reservation(self, reservation_id: uuid.UUID) -> bool:
@@ -461,10 +488,10 @@ class InventoryRepository:
             )
         ).first()
         if row is None:
-            await self._session.rollback()
+            # No-op replay: no write to undo — just answer inside the caller's transaction.
             return False
         await self._require_one(_CONSUME_SQL, {"sku": row.sku, "qty": row.qty}, what="commit consume")
-        await self._session.commit()
+        await self._session.flush()
         return True
 
     async def release_expired(self, *, batch_size: int, outbox_factory: OutboxFactory) -> int:
@@ -480,7 +507,8 @@ class InventoryRepository:
             await self._session.execute(_CLAIM_EXPIRED_SQL, {"held": ReservationStatus.HELD.value, "batch": batch_size})
         ).all()
         if not rows:
-            await self._session.rollback()
+            # Empty sweep: no locks taken, nothing written — the caller's
+            # transaction commits (nothing) on exit.
             return 0
         for row in rows:
             await self._require_one(_UNRESERVE_SQL, {"sku": row.sku, "qty": row.qty}, what="reaper unreserve")
@@ -489,7 +517,7 @@ class InventoryRepository:
             _MARK_RELEASED_BATCH_SQL,
             {"released": ReservationStatus.RELEASED.value, "ids": [row.id for row in rows]},
         )
-        await self._session.commit()
+        await self._session.flush()
         return len(rows)
 
     async def release_for_order(self, order_id: uuid.UUID, outbox_factory: OutboxFactory) -> int:
@@ -505,10 +533,9 @@ class InventoryRepository:
         ).all()
         if not rows:
             # No rollback on the empty replay: a zero-row claim holds no locks,
-            # and rolling back here would expire the caller's already-loaded
-            # rows — their later attribute access becomes a synchronous lazy
-            # load with no greenlet (MissingGreenlet). The next statement's
-            # commit closes the implicit transaction.
+            # and the caller's transaction may already hold work (the cancel's
+            # guarded flip) that must survive. The next statement's flush, or
+            # the service's commit, closes the unit of work.
             return 0
         for row in rows:
             await self._require_one(_UNRESERVE_SQL, {"sku": row.sku, "qty": row.qty}, what="order release unreserve")
@@ -517,7 +544,7 @@ class InventoryRepository:
             _MARK_RELEASED_BATCH_SQL,
             {"released": ReservationStatus.RELEASED.value, "ids": [row.id for row in rows]},
         )
-        await self._session.commit()
+        await self._session.flush()
         return len(rows)
 
     async def restock_for_order(self, order_id: uuid.UUID, outbox_factory: OutboxFactory) -> int:
@@ -548,7 +575,7 @@ class InventoryRepository:
             _MARK_RELEASED_BATCH_SQL,
             {"released": ReservationStatus.RELEASED.value, "ids": [row.id for row in rows]},
         )
-        await self._session.commit()
+        await self._session.flush()
         return len(rows)
 
     async def commit_for_order(self, order_id: uuid.UUID, *, expected: int) -> int:
@@ -597,10 +624,9 @@ class InventoryRepository:
         if not rows:
             return already_committed
         if already_committed + len(rows) < expected:
-            # Nothing was written: ending the transaction only drops the claim's
-            # row locks. commit(), not rollback() — rollback would expire the
-            # caller's loaded rows (the release path avoids it for the same reason).
-            await self._session.commit()
+            # Nothing was written: the service's commit on exit only drops the
+            # claim's row locks. Never roll back here — the caller's loaded
+            # rows would expire (the release path avoids it for the same reason).
             return already_committed
         for row in rows:
             await self._require_one(_CONSUME_SQL, {"sku": row.sku, "qty": row.qty}, what="order commit consume")
@@ -608,7 +634,7 @@ class InventoryRepository:
             _MARK_COMMITTED_BATCH_SQL,
             {"committed": ReservationStatus.COMMITTED.value, "ids": [row.id for row in rows]},
         )
-        await self._session.commit()
+        await self._session.flush()
         return already_committed + len(rows)
 
     async def _active_map(self, order_id: uuid.UUID, skus: list[str]) -> dict[str, Reservation]:
@@ -638,12 +664,12 @@ class InventoryRepository:
         so 0 rows means the guard refused: the counters disagree with the
         reservation we just transitioned. Silently continuing would commit the
         status flip and the ``StockReleased`` event while the stock never moved —
-        permanently losing those units. Roll back and surface it instead.
+        permanently losing those units. Raise and let the enclosing unit of work
+        roll back instead.
         """
         result = cast(CursorResult[Any], await self._session.execute(sql, params))
         rowcount = int(result.rowcount or 0)
         if rowcount != 1:
-            await self._session.rollback()
             raise StockMutationError(f"{what} affected {rowcount} rows, expected 1: {params}")
 
     @staticmethod

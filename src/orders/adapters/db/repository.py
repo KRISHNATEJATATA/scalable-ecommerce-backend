@@ -42,6 +42,7 @@ from src.orders.domain.order import Order as DomainOrder
 from src.orders.domain.order import SagaStep
 from src.shared.db.outbox import OutboxMessage
 from src.shared.db.pagination import Page, PageParams, apply_keyset, build_page, decode_cursor
+from src.shared.db.unit_of_work import UnitOfWork
 from src.shared.errors.exceptions import InvalidQueryParamError
 
 _SORT_COLUMNS = {"created_at": Order.created_at}
@@ -124,6 +125,9 @@ class OrdersRepository:
     ) -> None:
         self._session = session
         self._has_succeeded_payment = has_succeeded_payment
+        # Bound to the request's unit of work; the repo participates but never
+        # commits it. Recovery's per-order boundary drives the same handle.
+        self.uow = UnitOfWork(session)
 
     # --- reads ------------------------------------------------------
 
@@ -183,6 +187,10 @@ class OrdersRepository:
         the loser rolls back and reads the winner's row instead of failing.
         Any other integrity failure is re-raised, never mistranslated into a
         replay answer.
+
+        Participates in the caller's unit of work (the saga opens it): the
+        losing race unwinds only the inner savepoint below, never the caller's
+        work, and the winner is read inside the same unit of work.
         """
         order = Order(
             user_id=user_id,
@@ -192,17 +200,19 @@ class OrdersRepository:
             total=total,
             user_email=user_email,
         )
-        self._session.add(order)
         try:
             # The flush INSERT is where the immediate UNIQUE(user_id,
             # idempotency_key) is decided: the loser's INSERT blocks on the
             # winner's uncommitted row, the winner commits, and the loser's
             # flush raises 23505 right here — long before commit. Catching it
             # at the flush (not only at commit) is what keeps the race from
-            # escaping as an unhandled 500.
-            await self._session.flush()  # assign the id for the lines below
+            # escaping as an unhandled 500. The attempt is a **savepoint** so
+            # a lost race rolls back only this insert, never the caller's
+            # surrounding unit of work.
+            async with self._session.begin_nested():
+                self._session.add(order)
+                await self._session.flush()  # assign the id for the lines below
         except IntegrityError as exc:
-            await self._session.rollback()
             if _sqlstate(exc) != _UNIQUE_VIOLATION:
                 raise
             return await self._loser_reads_winner(user_id, idempotency_key, exc)
@@ -217,21 +227,15 @@ class OrdersRepository:
                 )
             )
         self._session.add(SagaLog(order_id=order.id, step="create", status="completed"))
-        # Snapshot the id before the commit so nothing below reads an ORM attribute.
+        # Snapshot the id before anything expires the instance.
         order_id = order.id
-        try:
-            await self._session.commit()
-        except IntegrityError as exc:
-            # Belt-and-braces: with the constraint immediate, the flush above
-            # already owns this decision — this catch only covers a UNIQUE
-            # surfacing at commit time (e.g. a deferred variant later).
-            await self._session.rollback()
-            if _sqlstate(exc) != _UNIQUE_VIOLATION:
-                raise
-            return await self._loser_reads_winner(user_id, idempotency_key, exc)
+        await self._session.flush()
         row = await self.get_order(order_id)
         if row is None:  # defensive: the order we just inserted must be re-readable
-            raise RuntimeError(f"inserted order {order_id} not found after commit")
+            # "after flush", not "after commit": this repository no longer
+            # commits — the enclosing unit of work owns the boundary, and
+            # the re-read happens inside it, before any commit exists.
+            raise RuntimeError(f"inserted order {order_id} not found after flush")
         return row, True
 
     async def _loser_reads_winner(
@@ -239,10 +243,10 @@ class OrdersRepository:
     ) -> tuple[DomainOrder, bool]:
         """Translate a lost idempotency race into the winner's row.
 
-        Runs after the rollback: a fresh transaction re-reads the committed
-        winner. ``RuntimeError`` only if the DB reported the conflict but the
-        winner is somehow invisible — never mistranslate a real failure into
-        a replay answer.
+        Runs after the savepoint unwinds: the same unit of work re-reads the
+        committed winner. ``RuntimeError`` only if the DB reported the conflict
+        but the winner is somehow invisible — never mistranslate a real failure
+        into a replay answer.
         """
         existing = await self.get_by_idempotency(user_id, idempotency_key)
         if existing is None:  # defensive: conflict reported but the winner isn't visible
@@ -262,8 +266,9 @@ class OrdersRepository:
         Raw UPDATE (not the ORM unit-of-work) so a crash-recovery replay racing a
         live request serializes in the DB — the loser matches zero rows instead
         of clobbering. The outbox row (``OrderPlaced`` on ``→ paid``) commits in
-        the same transaction as the flip, from values that don't include the
-        status itself, so it can never announce a state that didn't land.
+        the same unit of work as the flip (the service opens it), from values
+        that don't include the status itself, so it can never announce a state
+        that didn't land.
         """
         row = (
             await self._session.execute(
@@ -277,24 +282,35 @@ class OrdersRepository:
             )
         ).first()
         if row is None:
-            await self._session.rollback()
+            # The lifecycle refused: zero rows, nothing to undo. No rollback —
+            # the enclosing unit of work owns the transaction.
             return None
         if outbox is not None:
             self._session.add(Outbox(event_type=outbox.event_type, payload=outbox.payload))
         if to_status == OrderStatus.CANCELLED and self._has_succeeded_payment is not None:
-            try:
-                if await self._has_succeeded_payment(order_id):
-                    await self._request_refund_once(order_id)
-            except Exception:
-                await self._session.rollback()
-                raise
-        await self._session.commit()
+            # A raise unwinds the caller's unit of work, so the flip and the
+            # refund intent (or the absence of both) commit together or not at all.
+            if await self._has_succeeded_payment(order_id):
+                await self._request_refund_once(order_id)
+        await self._session.flush()
         return await self.get_order(order_id)
 
     async def log_saga_step(self, order_id: uuid.UUID, step: str, status: str) -> None:
-        """Journal one saga step attempt (recovery + compensation read this, not the code path)."""
+        """Journal one saga step attempt (recovery + compensation read this, not the code path).
+
+        Participates in the caller's unit of work: ends in ``flush()``, never
+        commits. The journal is the drive's heartbeat, so the saga's ``_log``
+        wraps every call in its **own** unit of work and asserts it is the
+        outermost block — each row is durable before the next step runs, which
+        is what lets the recovery poller treat a quiet journal as a crash
+        (``has_recent_saga_activity``). A nested call would only write a
+        SAVEPOINT and silently break that guarantee. (The user-facing cancel
+        marker is the one deliberate exception: it rides the cancel's own unit
+        of work for atomicity — flip + release + journal all commit or none —
+        and no liveness read depends on it.)
+        """
         self._session.add(SagaLog(order_id=order_id, step=step, status=status))
-        await self._session.commit()
+        await self._session.flush()
 
     async def journal_refund_if_cancelled(self, order_id: uuid.UUID) -> None:
         """Journal a refund intent in the caller's payment-transition transaction.
@@ -361,9 +377,12 @@ class OrdersRepository:
 
         A failed ``execute`` leaves the session's transaction aborted; every
         later statement would fail with ``PendingRollbackError`` and poison the
-        rest of the recovery batch. Roll back so the batch can continue.
+        rest of the recovery batch. Roll back so the batch can continue. This
+        drives the unit of work's own rollback — an adapter-only affordance for
+        the recovery worker, not a boundary decision a repository ever makes on
+        its own account.
         """
-        await self._session.rollback()
+        await self.uow.rollback()
 
     async def claim_stuck_pending(self, *, cutoff: datetime, batch_size: int) -> list[DomainOrder]:
         """Lease ``pending`` orders older than ``cutoff`` for the recovery poller.
@@ -374,9 +393,12 @@ class OrdersRepository:
         claiming the same order. Orders whose ``saga_log`` shows activity newer
         than the cutoff are left alone (a live drive — see the heartbeat note
         on :data:`_CLAIM_STUCK_SQL`). Returns the claimed orders with lines loaded.
+
+        Participates in the caller's unit of work: the saga wraps the claim and
+        commits before the settle loop reads each row, so the lease is durable
+        when settling starts.
         """
         ids = (await self._session.execute(_CLAIM_STUCK_SQL, {"cutoff": cutoff, "batch": batch_size})).scalars().all()
-        await self._session.commit()
         claimed: list[DomainOrder] = []
         for order_id in ids:
             row = await self.get_order(order_id)
@@ -394,13 +416,16 @@ class OrdersRepository:
         is what keeps the orphan count single). The touch also sets the retry
         cadence: a claimed row is not reclaimable until its lease ages past
         the cutoff.
+
+        Participates in the caller's unit of work (same lease discipline as
+        :meth:`claim_stuck_pending`): the saga commits the claim before the
+        retry loop reads each row.
         """
         ids = (
             (await self._session.execute(_CLAIM_PENDING_REFUND_SQL, {"cutoff": cutoff, "batch": batch_size}))
             .scalars()
             .all()
         )
-        await self._session.commit()
         claimed: list[DomainOrder] = []
         for order_id in ids:
             row = await self.get_order(order_id)

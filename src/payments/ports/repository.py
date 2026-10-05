@@ -23,6 +23,7 @@ from typing import Any, Protocol
 from src.payments.domain.payment import Payment
 from src.shared.db.outbox import OutboxMessage
 from src.shared.db.pagination import Page, PageParams
+from src.shared.db.unit_of_work import UnitOfWorkPort
 
 #: Builds the outbox message for one applied transition, from the updated row's
 #: own RETURNING values — so the event carries post-update state and is written
@@ -32,6 +33,13 @@ PaymentSucceededHook = Callable[[uuid.UUID], Awaitable[None]]
 
 
 class PaymentsRepositoryPort(Protocol):
+    @property
+    def uow(self) -> UnitOfWorkPort:
+        """The unit of work this repository is bound to. Repositories
+        participate in it but never commit it; the application service opens the
+        boundary with ``async with repo.uow.transaction():``."""
+        ...
+
     async def has_succeeded_for_order(self, order_id: uuid.UUID) -> bool:
         """Read whether a captured payment remains outstanding for this order."""
         ...

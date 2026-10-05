@@ -99,7 +99,10 @@ class OrdersService:
             return None
         self._assert_owner(row.user_id, user_id, is_admin)
         if row.status == OrderStatus.CANCELLED:
-            await self._holds.release_for_order(order_id)  # finish a crash between flip and release
+            # Finish a crash between flip and release — idempotent cleanup in
+            # its own unit of work (a replay releasing nothing commits nothing).
+            async with self._repo.uow.transaction():
+                await self._holds.release_for_order(order_id)
             return OrderResponse.model_validate(row)
         if row.status != OrderStatus.PENDING:
             raise OrderStateConflictError(f"only pending orders can be cancelled (order is {row.status})")
@@ -112,22 +115,28 @@ class OrdersService:
         charge_state = await self._repo.latest_saga_step(order_id, "charge")
         if charge_state in ("started", "completed", "unknown"):
             raise OrderStateConflictError("payment for this order is in progress; try again once it settles")
-        updated = await self._repo.transition_status(
-            order_id, expect=[OrderStatus.PENDING], to_status=OrderStatus.CANCELLED
-        )
-        if updated is None:
-            # Lost a race with the saga settling the order itself — re-read the
-            # settled truth rather than reporting a cancel that didn't land.
+        # One transaction: the guarded flip, the hold release and the journal
+        # row either all commit or none do. The holds port shares the request
+        # session, so its writes nest into this unit of work as a SAVEPOINT —
+        # a crash between flip and release can no longer leave a cancelled
+        # order holding stock (or a released hold on a still-pending order).
+        async with self._repo.uow.transaction():
+            updated = await self._repo.transition_status(
+                order_id, expect=[OrderStatus.PENDING], to_status=OrderStatus.CANCELLED
+            )
+            if updated is None:
+                # Lost a race with the saga settling the order itself — re-read the
+                # settled truth rather than reporting a cancel that didn't land.
+                final = await self._repo.get_order(order_id)
+                if final is None or final.status != OrderStatus.CANCELLED:
+                    raise OrderStateConflictError("the order settled while cancelling; re-read it")
+                return OrderResponse.model_validate(final)
+            await self._holds.release_for_order(order_id)
+            await self._repo.log_saga_step(order_id, "cancel", "completed")
             final = await self._repo.get_order(order_id)
-            if final is None or final.status != OrderStatus.CANCELLED:
-                raise OrderStateConflictError("the order settled while cancelling; re-read it")
+            if final is None:  # defensive: the row we just cancelled must re-read
+                raise RuntimeError(f"cancelled order {order_id} not found after flip")
             return OrderResponse.model_validate(final)
-        await self._holds.release_for_order(order_id)
-        await self._repo.log_saga_step(order_id, "cancel", "completed")
-        final = await self._repo.get_order(order_id)
-        if final is None:  # defensive: the row we just cancelled must re-read
-            raise RuntimeError(f"cancelled order {order_id} not found after flip")
-        return OrderResponse.model_validate(final)
 
     @staticmethod
     def _assert_owner(owner_id: uuid.UUID, caller_id: uuid.UUID, is_admin: bool) -> None:

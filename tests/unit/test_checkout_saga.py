@@ -1110,16 +1110,21 @@ async def test_late_capture_on_cancelled_order_journals_refund(session, confirma
 async def test_payment_confirmation_before_cancel_lock_journals_refund(session, sessionmaker_factory):
     """The payment hook sees pending, then cancellation waits for its order lock."""
     line = _line()
-    order, _ = await OrdersRepository(session).create_pending_order(
-        user_id=USER_A,
-        idempotency_key="key-confirm-before-cancel",
-        body_hash="test",
-        total=line.unit_price,
-        lines=[(line.product_id, line.name, line.unit_price, line.quantity)],
-    )
-    key = payment_key_for(USER_A, order.idempotency_key)
+    # Direct repository staging acts as the use-case here, so it opens the
+    # unit of work: the concurrent confirm/cancel sessions below must see
+    # committed rows, not another session's flushed-but-uncommitted writes.
+    orders_repo = OrdersRepository(session)
+    key = payment_key_for(USER_A, "key-confirm-before-cancel")
     gateway = StubPaymentGateway()
-    await PaymentsRepository(session).create_pending(order_id=order.id, idempotency_key=key, amount=line.unit_price)
+    async with orders_repo.uow.transaction():
+        order, _ = await orders_repo.create_pending_order(
+            user_id=USER_A,
+            idempotency_key="key-confirm-before-cancel",
+            body_hash="test",
+            total=line.unit_price,
+            lines=[(line.product_id, line.name, line.unit_price, line.quantity)],
+        )
+        await PaymentsRepository(session).create_pending(order_id=order.id, idempotency_key=key, amount=line.unit_price)
     captured = await gateway.charge(amount=line.unit_price, idempotency_key=key, payment_method_token="tok_visa")
     locked = asyncio.Event()
     release = asyncio.Event()
@@ -1149,10 +1154,13 @@ async def test_payment_confirmation_before_cancel_lock_journals_refund(session, 
     async def cancel() -> None:
         async with sessionmaker_factory() as cancelling_session:
             cancelling_started.set()
-            result = await orders_repository_with_payment_guard(cancelling_session).transition_status(
-                order.id, expect=[OrderStatus.PENDING], to_status=OrderStatus.CANCELLED
-            )
-            assert result is not None
+            repo = orders_repository_with_payment_guard(cancelling_session)
+            # Direct repository driver owns the unit of work here.
+            async with repo.uow.transaction():
+                result = await repo.transition_status(
+                    order.id, expect=[OrderStatus.PENDING], to_status=OrderStatus.CANCELLED
+                )
+                assert result is not None
 
     confirming = asyncio.create_task(confirm())
     cancelling: asyncio.Task[None] | None = None
@@ -1186,18 +1194,22 @@ async def test_payment_confirmation_before_cancel_lock_journals_refund(session, 
 
 
 async def test_failed_cancellation_refund_check_rolls_back_order(session):
-    order, _ = await OrdersRepository(session).create_pending_order(
-        user_id=USER_A, idempotency_key="key-cancel-check-failed", body_hash="test", total=Decimal("1"), lines=[]
-    )
+    staging = OrdersRepository(session)
+    async with staging.uow.transaction():
+        order, _ = await staging.create_pending_order(
+            user_id=USER_A, idempotency_key="key-cancel-check-failed", body_hash="test", total=Decimal("1"), lines=[]
+        )
     order_id = order.id
 
     async def unavailable(order_id: uuid.UUID) -> bool:
         raise RuntimeError("payment ledger unavailable")
 
     with pytest.raises(RuntimeError, match="payment ledger unavailable"):
-        await OrdersRepository(session, has_succeeded_payment=unavailable).transition_status(
-            order_id, expect=[OrderStatus.PENDING], to_status=OrderStatus.CANCELLED
-        )
+        # The flip runs inside a caller-owned unit of work, so the hook's
+        # raise rolls it back — the order stays pending.
+        repo = OrdersRepository(session, has_succeeded_payment=unavailable)
+        async with repo.uow.transaction():
+            await repo.transition_status(order_id, expect=[OrderStatus.PENDING], to_status=OrderStatus.CANCELLED)
     assert await _order_status(session, order_id) == "pending"
 
 
@@ -2758,6 +2770,61 @@ async def test_cancel_finishes_release_after_a_crashed_cancel(session):
     result = await service.cancel_order(user_id=USER_A, order_id=order.id, is_admin=False)
     assert result is not None and result.status == OrderStatus.CANCELLED
     assert await _stock(session, str(line.product_id)) == (5, 0)  # orphaned hold now released
+
+
+async def test_cancel_through_the_service_is_one_transaction(session):
+    """Ticket 04 acceptance: flip + release + journal either all commit or none.
+
+    A journal failure after the guarded flip and the hold release must unwind
+    both — no cancelled order with still-held stock, and no released hold on a
+    still-pending order, escapes. The session must stay usable afterwards.
+    """
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    staging = OrdersRepository(session)
+    async with staging.uow.transaction():
+        order, _ = await staging.create_pending_order(
+            user_id=USER_A,
+            idempotency_key="key-cancel-atomic",
+            body_hash="hash",
+            total=Decimal("19.99"),
+            lines=[(line.product_id, line.name, line.unit_price, line.quantity)],
+        )
+    inventory = InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)
+    await inventory.reserve(str(line.product_id), line.quantity, order.id)
+
+    repo = OrdersRepository(session)
+    service = OrdersService(repo, OrderStockHolds(inventory))
+    real_log = repo.log_saga_step
+
+    async def failing_log(order_id: uuid.UUID, step: str, status: str) -> None:
+        raise RuntimeError("journal unavailable")
+
+    repo.log_saga_step = failing_log  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="journal unavailable"):
+        await service.cancel_order(user_id=USER_A, order_id=order.id, is_admin=False)
+    assert await _order_status(session, order.id) == "pending"  # flip unwound
+    assert await _stock(session, str(line.product_id)) == (5, 1)  # hold kept, not released
+    markers = (
+        await session.execute(
+            text("SELECT count(*) FROM orders.saga_log WHERE order_id = :id AND step = 'cancel'"),
+            {"id": order.id},
+        )
+    ).scalar_one()
+    assert markers == 0
+
+    # The session recovered: a retry commits the whole trio together.
+    repo.log_saga_step = real_log  # type: ignore[method-assign]
+    result = await service.cancel_order(user_id=USER_A, order_id=order.id, is_admin=False)
+    assert result is not None and result.status == OrderStatus.CANCELLED
+    assert await _stock(session, str(line.product_id)) == (5, 0)
+    markers = (
+        await session.execute(
+            text("SELECT count(*) FROM orders.saga_log WHERE order_id = :id AND step = 'cancel'"),
+            {"id": order.id},
+        )
+    ).scalar_one()
+    assert markers == 1
 
 
 async def test_replaying_a_cancelled_checkout_is_409_not_201(session):

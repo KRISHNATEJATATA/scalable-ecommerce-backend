@@ -164,9 +164,14 @@ async def test_a_pending_resume_flips_once_even_if_the_first_attempt_crashed(ses
     )
 
     async with sessionmaker_factory() as fresh_session:
-        await PaymentsRepository(fresh_session).create_pending(
-            order_id=kwargs["order_id"], idempotency_key=kwargs["idempotency_key"], amount=kwargs["amount"]
-        )
+        # The staging session is the use-case here, so it owns the unit of
+        # work — without the commit the "crashed" row would vanish with the
+        # session instead of waiting for the retry below.
+        repo = PaymentsRepository(fresh_session)
+        async with repo.uow.transaction():
+            await repo.create_pending(
+                order_id=kwargs["order_id"], idempotency_key=kwargs["idempotency_key"], amount=kwargs["amount"]
+            )
 
     async with sessionmaker_factory() as fresh_session:
         response = await PaymentsService(PaymentsRepository(fresh_session), gateway, webhook_secret=SECRET).charge(

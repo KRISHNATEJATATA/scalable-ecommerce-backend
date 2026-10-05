@@ -21,9 +21,17 @@ from typing import Protocol
 from src.orders.domain.order import Order, OrderStatus, SagaStep
 from src.shared.db.outbox import OutboxMessage
 from src.shared.db.pagination import Page, PageParams
+from src.shared.db.unit_of_work import UnitOfWorkPort
 
 
 class OrdersRepositoryPort(Protocol):
+    @property
+    def uow(self) -> UnitOfWorkPort:
+        """The unit of work this repository is bound to. Repositories
+        participate in it but never commit it; the application service opens the
+        boundary with ``async with repo.uow.transaction():``."""
+        ...
+
     async def list_orders(
         self, user_id: uuid.UUID, params: PageParams, status: OrderStatus | None = None
     ) -> Page[Order]: ...

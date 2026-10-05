@@ -103,14 +103,16 @@ class InventoryService:
                 return None
             if owner_id != caller_id and not is_admin:
                 raise AuthorizationError("not the owner of this product")
-        row = await self._repo.upsert_stock(sku, on_hand)
-        if row is None:
-            # The guard refused, so the row exists — but re-read it for the held
-            # count, and treat a vanished row (can't happen post-refusal) as zero
-            # rather than dereferencing None.
-            current = await self._repo.get_by_sku(sku)
-            raise StockBelowReservedError(sku, on_hand, current.reserved if current else 0)
-        return InventoryResponse.model_validate(row)
+        # Service-owned boundary: the upsert's write commits here, not in the repo.
+        async with self._repo.uow.transaction():
+            row = await self._repo.upsert_stock(sku, on_hand)
+            if row is None:
+                # The guard refused, so the row exists — but re-read it for the held
+                # count, and treat a vanished row (can't happen post-refusal) as zero
+                # rather than dereferencing None.
+                current = await self._repo.get_by_sku(sku)
+                raise StockBelowReservedError(sku, on_hand, current.reserved if current else 0)
+            return InventoryResponse.model_validate(row)
 
     async def reserve(self, sku: str, qty: int, order_id: uuid.UUID) -> ReservationResponse:
         """Hold ``qty`` of ``sku`` for ``order_id`` until the TTL expires.
@@ -130,13 +132,17 @@ class InventoryService:
         if qty <= 0:
             raise InvalidReservationError(f"invalid reservation for {sku!r}: quantity {qty} must be positive")
         try:
-            row = await self._repo.reserve(
-                sku=sku,
-                qty=qty,
-                order_id=order_id,
-                expires_at=datetime.now(UTC) + self._ttl,
-                outbox=stock_reserved_outbox(sku, order_id, qty),
-            )
+            # Service-owned boundary: the hold + decrement + outbox row commit
+            # here. The repository only flushes, so a caller composing several
+            # writes (the cancel path) stays one atomic unit.
+            async with self._repo.uow.transaction():
+                row = await self._repo.reserve(
+                    sku=sku,
+                    qty=qty,
+                    order_id=order_id,
+                    expires_at=datetime.now(UTC) + self._ttl,
+                    outbox=stock_reserved_outbox(sku, order_id, qty),
+                )
         except ReservationConflictError:
             reservation_conflict_total.inc()
             log.info("reservation conflict: order line for sku=%s re-reserved with qty=%s", sku, qty)
@@ -172,12 +178,16 @@ class InventoryService:
                 raise InvalidReservationError(f"invalid reservation batch: sku {sku!r} appears more than once")
             seen.add(sku)
         try:
-            rows = await self._repo.reserve_many(
-                lines=lines,
-                order_id=order_id,
-                expires_at=datetime.now(UTC) + self._ttl,
-                outbox_factory=stock_reserved_outbox,
-            )
+            # Service-owned boundary: the whole two-attempt loop runs inside
+            # this unit of work — a direct repository caller no longer exists,
+            # and a composing caller (cancel, saga) nests into it as a savepoint.
+            async with self._repo.uow.transaction():
+                rows = await self._repo.reserve_many(
+                    lines=lines,
+                    order_id=order_id,
+                    expires_at=datetime.now(UTC) + self._ttl,
+                    outbox_factory=stock_reserved_outbox,
+                )
         except ReservationConflictError:
             reservation_conflict_total.inc()
             log.info("reservation conflict: order line re-reserved at a different quantity (order=%s)", order_id)
@@ -190,7 +200,8 @@ class InventoryService:
 
     async def release(self, reservation_id: uuid.UUID) -> bool:
         """Give a held reservation's stock back (saga compensation); ``False`` on replay."""
-        return await self._repo.release(reservation_id, stock_released_outbox)
+        async with self._repo.uow.transaction():
+            return await self._repo.release(reservation_id, stock_released_outbox)
 
     async def release_for_order(self, order_id: uuid.UUID) -> int:
         """Release every still-``held`` reservation of one order (saga compensation).
@@ -199,7 +210,8 @@ class InventoryService:
         visible through the saga's own compensation-rate signal, and a replay
         releasing nothing is the normal (not the alertable) case.
         """
-        return await self._repo.release_for_order(order_id, stock_released_outbox)
+        async with self._repo.uow.transaction():
+            return await self._repo.release_for_order(order_id, stock_released_outbox)
 
     async def restock_for_order(self, order_id: uuid.UUID) -> int:
         """Give back the stock of an order's ``committed`` reservations (saga compensation).
@@ -209,7 +221,8 @@ class InventoryService:
         many were reversed; a replay reverses nothing. Must only be called for
         an order that is terminally not ``paid``.
         """
-        return await self._repo.restock_for_order(order_id, stock_released_outbox)
+        async with self._repo.uow.transaction():
+            return await self._repo.restock_for_order(order_id, stock_released_outbox)
 
     async def commit_for_order(self, order_id: uuid.UUID, *, expected: int) -> int:
         """Consume the order's still-``held`` reservations, all-or-nothing (saga success).
@@ -222,11 +235,13 @@ class InventoryService:
         per-call rowcount) so a replay of an already-committed order reports its
         lines instead of a false shortfall.
         """
-        return await self._repo.commit_for_order(order_id, expected=expected)
+        async with self._repo.uow.transaction():
+            return await self._repo.commit_for_order(order_id, expected=expected)
 
     async def commit_reservation(self, reservation_id: uuid.UUID) -> bool:
         """Consume a held reservation on payment success; ``False`` on replay."""
-        return await self._repo.commit_reservation(reservation_id)
+        async with self._repo.uow.transaction():
+            return await self._repo.commit_reservation(reservation_id)
 
     async def release_expired(self, batch_size: int) -> int:
         """Release every hold past its TTL; returns how many (the reaper's use-case).
@@ -237,7 +252,8 @@ class InventoryService:
         *liveness* is still the expired-hold backlog alert (`docs/RUNBOOK.md` §8),
         since a dead worker reports nothing at all.
         """
-        released = await self._repo.release_expired(batch_size=batch_size, outbox_factory=stock_released_outbox)
+        async with self._repo.uow.transaction():
+            released = await self._repo.release_expired(batch_size=batch_size, outbox_factory=stock_released_outbox)
         if released:
             reaper_released_total.inc(released)
             log.info("released %d expired reservation(s)", released)

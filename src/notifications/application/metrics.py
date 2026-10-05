@@ -12,7 +12,7 @@ the notification-worker process, so they reach Prometheus via that worker's
   ``sent_emails`` row caught a delivery the Valkey dedupe missed — expected
   after the dedupe-TTL expiry, a redelivery signal otherwise).
 * ``notification_send_recovered_total`` — takeovers of a claimed-but-unmarked
-  send (ADR 0024's crash window). Each one is a resend whose predecessor MAY
+  send. Each one is a resend whose predecessor MAY
   have landed: the observable of the at-least-once residual, alertable when
   it moves without a worker crash.
 """

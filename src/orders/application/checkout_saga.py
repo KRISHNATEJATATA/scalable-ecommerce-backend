@@ -201,14 +201,18 @@ class CheckoutSaga:
                     raise OrderStateConflictError("cart is empty; nothing to check out")
                 await self._revalidate_prices(lines)
                 total = _total(lines)
-                order, created = await self._orders.create_pending_order(
-                    user_id=user_id,
-                    idempotency_key=idempotency_key,
-                    body_hash=body_hash,
-                    total=total,
-                    lines=[(line.product_id, line.name, line.unit_price, line.quantity) for line in lines],
-                    user_email=user_email,
-                )
+                # Service-owned boundary: the pending order + its lines + the
+                # first journal row commit here, not in the repository. A key
+                # replay reads the winner inside the same unit of work.
+                async with self._orders.uow.transaction():
+                    order, created = await self._orders.create_pending_order(
+                        user_id=user_id,
+                        idempotency_key=idempotency_key,
+                        body_hash=body_hash,
+                        total=total,
+                        lines=[(line.product_id, line.name, line.unit_price, line.quantity) for line in lines],
+                        user_email=user_email,
+                    )
                 if not created:
                     # Lost the create race: the winner's row is the truth — replay or
                     # resume it exactly as above.
@@ -486,18 +490,22 @@ class CheckoutSaga:
             if order is None:  # defensive: we created it moments ago
                 raise RuntimeError(f"checkout order {order_id} vanished mid-saga")
             await self._log(order_id, "mark_paid", "started")
-            paid = await self._orders.transition_status(
-                order_id,
-                expect=[OrderStatus.PENDING],
-                to_status=OrderStatus.PAID,
-                outbox=order_placed_outbox(
-                    order_id=order.id,
-                    user_id=order.user_id,
-                    total=order.total,
-                    items=order.items,
-                    user_email=order.user_email,
-                ),
-            )
+            # Service-owned boundary: the guarded flip + its ``OrderPlaced``
+            # outbox row commit here. The basket consume + idempotency remember
+            # below are best-effort cache/Valkey writes, deliberately outside.
+            async with self._orders.uow.transaction():
+                paid = await self._orders.transition_status(
+                    order_id,
+                    expect=[OrderStatus.PENDING],
+                    to_status=OrderStatus.PAID,
+                    outbox=order_placed_outbox(
+                        order_id=order.id,
+                        user_id=order.user_id,
+                        total=order.total,
+                        items=order.items,
+                        user_email=order.user_email,
+                    ),
+                )
             if paid is None:
                 # Lost the guarded flip — the recovery poller or a cancel
                 # settled the order concurrently. A poller settle is benign
@@ -703,7 +711,14 @@ class CheckoutSaga:
         checkout_compensation_total.labels(failed_step).inc()
         await self._log(order_id, "compensate", "started")
         await self._holds.release_for_order(order_id)
-        await self._orders.transition_status(order_id, expect=[OrderStatus.PENDING], to_status=OrderStatus.CANCELLED)
+        # Service-owned boundary for the terminal flip (the release above
+        # owns its own through the inventory service; the journal rows own
+        # theirs — compensation stays a sequence of small units, never one
+        # transaction held across the stock give-back).
+        async with self._orders.uow.transaction():
+            await self._orders.transition_status(
+                order_id, expect=[OrderStatus.PENDING], to_status=OrderStatus.CANCELLED
+            )
         await self._log(order_id, "compensate", "completed")
         log.info("checkout order %s compensated after %s failed", order_id, failed_step)
 
@@ -728,8 +743,12 @@ class CheckoutSaga:
         Every outcome increments ``checkout_recovery_total`` — in the poller
         process, so it is exported via the worker metrics, not the API's
         ``/metrics``.
+
+        Both claims are service-owned boundaries: each lease commits before
+        the settle loop reads the claimed rows.
         """
-        stuck = await self._orders.claim_stuck_pending(cutoff=cutoff, batch_size=batch_size)
+        async with self._orders.uow.transaction():
+            stuck = await self._orders.claim_stuck_pending(cutoff=cutoff, batch_size=batch_size)
         outcome = {"completed": 0, "compensated": 0, "deferred": 0, "refunded": 0, "refund_failed": 0}
         # Ids up front: the loop re-reads each order fresh instead of trusting
         # the claim-time snapshot, which a slow batch may have outlived.
@@ -766,8 +785,10 @@ class CheckoutSaga:
             log.info("saga recovery settled %d stuck order(s): %s", len(stuck), outcome)
         # The refund-retry claim: cancelled orders whose refund raised after the
         # intent was journaled. Same per-order boundary — one poisoned row must
-        # not stall the batch, and the marker keeps the pair claimable.
-        refund_claims = await self._orders.claim_cancelled_with_pending_refund(cutoff=cutoff, batch_size=batch_size)
+        # not stall the batch, and the marker keeps the pair claimable. The
+        # lease commits before the retry loop reads each row.
+        async with self._orders.uow.transaction():
+            refund_claims = await self._orders.claim_cancelled_with_pending_refund(cutoff=cutoff, batch_size=batch_size)
         refund_ids = [order.id for order in refund_claims]
         for order_id in refund_ids:
             try:
@@ -873,7 +894,7 @@ class CheckoutSaga:
                     idempotency_key=payment_key_for(order.user_id, order.idempotency_key),
                     reason="paid_without_consume",
                 ):
-                    await self._orders.log_saga_step(order.id, "refund", "refused")
+                    await self._log(order.id, "refund", "refused")
                     checkout_orphaned_paid_payments_total.inc()
                     log.error(
                         "checkout order %s: automatic refund of the succeeded payment failed; "
@@ -881,25 +902,28 @@ class CheckoutSaga:
                         order.id,
                     )
                 else:
-                    await self._orders.log_saga_step(order.id, "refund", "completed")
+                    await self._log(order.id, "refund", "completed")
                 await self._compensate(order.id, "paid-without-consume")
                 return "compensated"
-            await self._orders.log_saga_step(order.id, "commit", "completed")
-            await self._orders.log_saga_step(order.id, "mark_paid", "started")
-            paid = await self._orders.transition_status(
-                order.id,
-                expect=[OrderStatus.PENDING],
-                to_status=OrderStatus.PAID,
-                outbox=order_placed_outbox(
-                    order_id=order.id,
-                    user_id=order.user_id,
-                    total=order.total,
-                    items=order.items,
-                    user_email=order.user_email,
-                ),
-            )
+            await self._log(order.id, "commit", "completed")
+            await self._log(order.id, "mark_paid", "started")
+            # Service-owned boundary: the guarded flip + its ``OrderPlaced``
+            # outbox row commit here, not in the repository.
+            async with self._orders.uow.transaction():
+                paid = await self._orders.transition_status(
+                    order.id,
+                    expect=[OrderStatus.PENDING],
+                    to_status=OrderStatus.PAID,
+                    outbox=order_placed_outbox(
+                        order_id=order.id,
+                        user_id=order.user_id,
+                        total=order.total,
+                        items=order.items,
+                        user_email=order.user_email,
+                    ),
+                )
             if paid is not None and paid.status == OrderStatus.PAID:
-                await self._orders.log_saga_step(order.id, "mark_paid", "completed")
+                await self._log(order.id, "mark_paid", "completed")
                 await self._consume_basket(order.user_id, _lines_of(order))
             elif paid is None and await self._orders.get_order_status(order.id) == OrderStatus.CANCELLED:
                 # A cancel won the flip after every hold was committed: the
@@ -944,7 +968,20 @@ class CheckoutSaga:
     # --- internals -------------------------------------------------------
 
     async def _log(self, order_id: uuid.UUID, step: str, status: str) -> None:
-        await self._orders.log_saga_step(order_id, step, status)
+        """Journal one saga step in its own unit of work (the recovery heartbeat).
+
+        Asserts the outermost block: nested inside a caller's transaction this
+        would only write a SAVEPOINT, and the poller's quiet-journal-means-crash
+        read (``has_recent_saga_activity``) would go blind. Every caller
+        therefore journals outside any open unit of work — each row is durable
+        before the next step runs. (The user-facing cancel marker is the one
+        deliberate exception: it rides the cancel's own unit of work for
+        atomicity, and no liveness read depends on it.)
+        """
+        if self._orders.uow.depth != 0:
+            raise RuntimeError(f"saga journal must commit at depth 0 (called at depth {self._orders.uow.depth})")
+        async with self._orders.uow.transaction():
+            await self._orders.log_saga_step(order_id, step, status)
 
     async def _remember(
         self,

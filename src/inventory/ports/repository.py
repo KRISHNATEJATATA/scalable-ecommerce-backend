@@ -22,6 +22,7 @@ from typing import Protocol
 from src.inventory.domain.inventory import Inventory
 from src.inventory.domain.reservation import Reservation
 from src.shared.db.outbox import OutboxMessage
+from src.shared.db.unit_of_work import UnitOfWorkPort
 
 #: Builds the outbox message for one released hold, from ``(sku, order_id, qty)``.
 #: Defined here (the contract), imported by the adapter — never redeclared.
@@ -45,6 +46,13 @@ class StockRejection:
 
 
 class InventoryRepositoryPort(Protocol):
+    @property
+    def uow(self) -> UnitOfWorkPort:
+        """The unit of work this repository is bound to. Repositories
+        participate in it but never commit it; the application service opens the
+        boundary with ``async with repo.uow.transaction():``."""
+        ...
+
     async def get_by_sku(self, sku: str) -> Inventory | None:
         """The stock row for ``sku`` as a frozen snapshot, or ``None`` if the SKU has no inventory."""
         ...

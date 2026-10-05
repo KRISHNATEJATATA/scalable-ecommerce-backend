@@ -411,10 +411,21 @@ prod, compose services locally — never `BackgroundTasks`:
   row commit in the **same transaction**. Checkout reserves the whole cart as
   **one batch transaction** (`reserve_many`): lines are worked in SKU-sorted
   order so concurrent batches take inventory row locks in the same global
-  sequence (the deadlock-avoidance invariant — no parallel sessions are
-  introduced), and any rejection rolls back every line. Never replace it with
-  read-then-write, a row lock held across the request, a Valkey lock, or a
-  per-line transaction loop.
+   sequence (the deadlock-avoidance invariant — no parallel sessions are
+   introduced), and any rejection rolls back every line. Never replace it with
+   read-then-write, a row lock held across the request, a Valkey lock, or a
+   per-line transaction loop.
+- **Service-owned unit of work**: the application service opens every
+  transaction boundary (`async with repo.uow.transaction()`); repositories only
+  `flush()`, never commit or roll back. `UnitOfWork` is depth-aware over the
+  request-scoped session — the outermost block commits, nested blocks become
+  SAVEPOINTs — so a use-case composing several writes (cancel: guarded flip +
+  hold release + journal row) is one atomic unit. The saga journal heartbeat is
+  the deliberate exception: each `saga_log` row commits in its own outermost
+  transaction (asserted at depth 0), which is what lets the recovery poller read
+  a quiet journal as a crash. Never hold a transaction across a gateway call,
+  and never commit from inside a repository (the recovery error boundary's
+  adapter-only `rollback()` excepted).
 - **Reservation TTL + reaper**: every hold carries `expires_at`; the `service`-role
   reaper releases expired holds so a stalled saga can't leak stock into a phantom
   oversell-block. Keep `RESERVATION_TTL_SECONDS` longer than the saga's step
