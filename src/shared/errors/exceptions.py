@@ -276,8 +276,12 @@ class PreconditionFailedError(Exception):
     re-apply.
     """
 
-    def __init__(self) -> None:
-        self.detail = "the product changed since it was read (If-Match mismatch); re-read it and re-apply"
+    def __init__(self, detail: str | None = None) -> None:
+        self.detail = (
+            detail
+            if detail is not None
+            else "the product changed since it was read (If-Match mismatch); re-read it and re-apply"
+        )
         super().__init__(self.detail)
 
 

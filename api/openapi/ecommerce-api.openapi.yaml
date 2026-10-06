@@ -136,7 +136,9 @@ paths:
           headers:
             ETag:
               schema: { type: string }
-              description: The product's quoted `version` (e.g. `"7"`).
+              description: >-
+                The product's quoted `version` (e.g. `"7"`). Exposed
+                to browsers via `Access-Control-Expose-Headers`.
           content:
             application/json:
               schema:
@@ -178,7 +180,9 @@ paths:
           headers:
             ETag:
               schema: { type: string }
-              description: The post-write quoted `version`.
+              description: >-
+                The post-write quoted `version`. Exposed to browsers
+                via `Access-Control-Expose-Headers`.
           content:
             application/json:
               schema:
@@ -866,7 +870,9 @@ paths:
           headers:
             ETag:
               schema: { type: string }
-              description: The post-write quoted `version`.
+              description: >-
+                The post-write quoted `version`. Exposed to browsers
+                via `Access-Control-Expose-Headers`.
           content:
             application/json:
               schema:

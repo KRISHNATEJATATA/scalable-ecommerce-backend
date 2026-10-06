@@ -36,13 +36,14 @@ async def test_health_is_200():
 
 
 async def test_cors_exposes_request_id_to_the_browser():
-    """Allowed-origin responses must list X-Request-ID, X-Cache and Idempotent-Replay in
+    """Allowed-origin responses must list X-Request-ID, X-Cache, Idempotent-Replay and ETag in
     Access-Control-Expose-Headers.
 
     Browsers only hand CORS-safelisted response headers to page JavaScript;
     custom headers are hidden without the CORS listing — the SPA would read
-    ``null`` for X-Request-ID (demo inspector shows "—" on every success row)
-    and for the product GET's X-Cache (cache hit/miss demo reads as absent).
+    ``null`` for X-Request-ID (demo inspector shows "—" on every success row),
+    for the product GET's X-Cache (cache hit/miss demo reads as absent), and
+    for ETag (conditional-write If-Match round-trip unreadable).
     """
     settings = SETTINGS.model_copy(update={"cors_allow_origins": ["http://test"]})
     app = create_app(settings)
@@ -50,7 +51,7 @@ async def test_cors_exposes_request_id_to_the_browser():
         resp = await client.get("/v1/health", headers={"Origin": "http://test"})
     assert resp.headers["access-control-allow-origin"] == "http://test"
     exposed = {header.strip() for header in resp.headers["access-control-expose-headers"].split(",")}
-    assert exposed == {"X-Request-ID", "X-Cache", "Idempotent-Replay"}
+    assert exposed == {"X-Request-ID", "X-Cache", "Idempotent-Replay", "ETag"}
     assert resp.headers["X-Request-ID"]  # ...and the headers being exposed are actually sent
 
 

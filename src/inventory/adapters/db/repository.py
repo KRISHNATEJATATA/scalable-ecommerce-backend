@@ -133,7 +133,8 @@ _UPSERT_SQL = text(
 # so idempotency is identical in both variants.
 _UPSERT_SQL_VERSION_GUARDED = text(
     f"INSERT INTO {SCHEMA}.inventory (sku, on_hand, reserved, version) "  # noqa: S608
-    f"SELECT CAST(:sku AS VARCHAR(64)), :on_hand, 0, 1 WHERE EXISTS (SELECT 1 FROM {SCHEMA}.inventory WHERE sku = :sku) "  # noqa: S608
+    f"SELECT CAST(:sku AS VARCHAR(64)), :on_hand, 0, 1 WHERE EXISTS "  # noqa: S608
+    f"(SELECT 1 FROM {SCHEMA}.inventory WHERE sku = :sku) "  # noqa: S608
     f"ON CONFLICT (sku) DO UPDATE SET on_hand = EXCLUDED.on_hand, "  # noqa: S608
     f"version = CASE WHEN {SCHEMA}.inventory.on_hand IS DISTINCT FROM EXCLUDED.on_hand "  # noqa: S608
     f"THEN {SCHEMA}.inventory.version + 1 ELSE {SCHEMA}.inventory.version END "  # noqa: S608

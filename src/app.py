@@ -142,12 +142,14 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         # Browsers hide custom response headers from JS unless listed here —
         # without it the SPA can't read X-Request-ID to correlate rows with logs,
         # the catalog product GET's X-Cache (hit/miss/bypass) to show real cache
-        # behaviour instead of describing it, or checkout's Idempotent-Replay to
-        # tell a replayed order from a fresh one.
+        # behaviour instead of describing it, checkout's Idempotent-Replay to
+        # tell a replayed order from a fresh one, or ETag to echo back as
+        # If-Match on the conditional-write round-trip (catalog GET/PATCH, inventory PUT).
         expose_headers=[
             REQUEST_ID_HEADER,
             catalog_routes.PRODUCT_CACHE_HEADER,
             orders_routes.IDEMPOTENT_REPLAY_HEADER,
+            "ETag",  # SPA reads it for the If-Match round-trip — not CORS-safelisted.
         ],
     )
     app.add_middleware(
