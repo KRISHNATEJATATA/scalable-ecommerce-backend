@@ -12,11 +12,12 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Path, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Response, status
 
 from src.bootstrap.container import CurrentUserDep, get_inventory_service
 from src.inventory.api.schemas import InventoryResponse, StockUpsertRequest
 from src.inventory.application.service import InventoryService
+from src.shared.api.etag import parse_if_match, set_etag
 from src.shared.auth.dependencies import require_role
 from src.shared.auth.principal import Principal
 
@@ -41,6 +42,8 @@ async def upsert_stock(
     service: InventoryServiceDep,
     caller: CurrentUserDep,
     principal: MerchantPrincipalDep,
+    response: Response,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> InventoryResponse:
     """Declare the SKU's on-hand units (creates the row or re-points ``on_hand``).
 
@@ -48,8 +51,15 @@ async def upsert_stock(
     new ``on_hand`` — reserved units belong to checkouts in flight and may not
     be erased. ``403`` when a merchant targets another merchant's product;
     ``404`` when the SKU resolves to no live catalog product.
+
+    An ``If-Match: "<version>"`` header makes the write conditional: a stale
+    version answers 412 (re-read and re-apply) before any state changes.
+    The response carries ``ETag: "<version>"``.
     """
-    updated = await service.upsert_stock(sku, body.on_hand, caller_id=caller.id, is_admin=principal.is_admin)
+    updated = await service.upsert_stock(
+        sku, body.on_hand, caller_id=caller.id, is_admin=principal.is_admin, if_match=parse_if_match(if_match)
+    )
     if updated is None:
         raise _NOT_FOUND
+    set_etag(response, updated.version)
     return updated

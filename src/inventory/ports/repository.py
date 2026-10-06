@@ -57,13 +57,20 @@ class InventoryRepositoryPort(Protocol):
         """The stock row for ``sku`` as a frozen snapshot, or ``None`` if the SKU has no inventory."""
         ...
 
-    async def upsert_stock(self, sku: str, on_hand: int) -> Inventory | None:
+    async def upsert_stock(self, sku: str, on_hand: int, expected_version: int | None = None) -> Inventory | None:
         """Create the stock row for ``sku`` (or re-point an existing one's ``on_hand``).
 
         Idempotent: re-PUT with the same value lands the same state. ``None``
         when the row exists and its ``reserved`` exceeds the requested
         ``on_hand`` — live holds may not be erased, the caller must raise
-        ``on_hand`` or wait for the holds to release.
+        ``on_hand`` or wait for the holds to release. ``None`` also when a
+        versioned write names a row that does not exist (stale precondition).
+
+        ``expected_version`` is an opt-in compare-and-swap predicate: when set,
+        the statement inserts nothing for a missing row and the conflict path
+        additionally requires the row's current ``version`` to equal it, so a
+        stale writer matches no row and gets ``None`` (the caller
+        disambiguates 412 vs 409).
         """
         ...
 

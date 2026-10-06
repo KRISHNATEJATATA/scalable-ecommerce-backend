@@ -319,3 +319,250 @@ async def test_api_only_seeded_checkout_succeeds(app_ctx, rsa_key):
         stock = await client.get(f"/v1/products/{product_id}", headers=_auth(consumer))
     assert stock.status_code == 200
     assert stock.json()["available"] == 3
+
+
+# --- inventory PUT If-Match contract (failing-first) ----------------------
+# Catalog precedent: src/catalog/api/routes.py parse_if_match / etag_of.
+# Grammar: absent or "*" = unconditional; '"<n>"' = conditional; anything else
+# (unquoted, W/ prefix, list) = 400. Stale version = 412 Problem-Details.
+
+
+def _etag_of(version: int) -> str:
+    return f'"{version}"'
+
+
+async def _db_row(sessionmaker, sku: str) -> tuple[int, int]:
+    async with sessionmaker() as session:
+        row = (
+            await session.execute(
+                text("SELECT on_hand, version FROM inventory.inventory WHERE sku = :sku"),
+                {"sku": sku},
+            )
+        ).one()
+        return int(row[0]), int(row[1])
+
+
+async def test_if_match_stale_is_412_and_changes_nothing(app_ctx, rsa_key):
+    app, sessionmaker = app_ctx
+    sku, merchant = await _create_product(app, rsa_key)
+
+    async with _client(app) as client:
+        seeded = await client.put(f"/v1/admin/inventory/{sku}", headers=_auth(merchant), json={"on_hand": 10})
+        assert seeded.status_code == 200, seeded.text
+        v1 = seeded.json()["version"]
+        moved = await client.put(f"/v1/admin/inventory/{sku}", headers=_auth(merchant), json={"on_hand": 20})
+        assert moved.status_code == 200, moved.text
+        assert moved.json()["version"] != v1
+
+        stale = await client.put(
+            f"/v1/admin/inventory/{sku}",
+            headers={**_auth(merchant), "If-Match": _etag_of(v1)},
+            json={"on_hand": 99},
+        )
+        assert stale.status_code == 412, stale.text
+        assert stale.headers["content-type"] == "application/problem+json"
+
+        on_hand, version = await _db_row(sessionmaker, sku)
+        assert on_hand == 20
+        assert version == moved.json()["version"]
+
+
+async def test_if_match_matching_succeeds_with_etag(app_ctx, rsa_key):
+    app, _sessionmaker = app_ctx
+    sku, merchant = await _create_product(app, rsa_key)
+
+    async with _client(app) as client:
+        seeded = await client.put(f"/v1/admin/inventory/{sku}", headers=_auth(merchant), json={"on_hand": 10})
+        assert seeded.status_code == 200, seeded.text
+        v1 = seeded.json()["version"]
+
+        resp = await client.put(
+            f"/v1/admin/inventory/{sku}",
+            headers={**_auth(merchant), "If-Match": _etag_of(v1)},
+            json={"on_hand": 11},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["on_hand"] == 11
+        assert resp.headers["ETag"] == _etag_of(body["version"])
+        assert resp.headers["ETag"] == _etag_of(v1 + 1)
+
+
+async def test_upsert_without_if_match_is_unconditional(app_ctx, rsa_key):
+    app, _sessionmaker = app_ctx
+    sku, merchant = await _create_product(app, rsa_key)
+
+    async with _client(app) as client:
+        seeded = await client.put(f"/v1/admin/inventory/{sku}", headers=_auth(merchant), json={"on_hand": 10})
+        assert seeded.status_code == 200, seeded.text
+        resp = await client.put(f"/v1/admin/inventory/{sku}", headers=_auth(merchant), json={"on_hand": 12})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["on_hand"] == 12
+        assert resp.headers["ETag"] == _etag_of(resp.json()["version"])
+
+
+async def test_if_match_star_is_unconditional(app_ctx, rsa_key):
+    app, _sessionmaker = app_ctx
+    sku, merchant = await _create_product(app, rsa_key)
+
+    async with _client(app) as client:
+        seeded = await client.put(f"/v1/admin/inventory/{sku}", headers=_auth(merchant), json={"on_hand": 10})
+        assert seeded.status_code == 200, seeded.text
+        resp = await client.put(
+            f"/v1/admin/inventory/{sku}",
+            headers={**_auth(merchant), "If-Match": "*"},
+            json={"on_hand": 13},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["on_hand"] == 13
+        assert resp.headers["ETag"] == _etag_of(resp.json()["version"])
+
+
+async def test_if_match_malformed_is_400(app_ctx, rsa_key):
+    app, _sessionmaker = app_ctx
+    sku, merchant = await _create_product(app, rsa_key)
+
+    async with _client(app) as client:
+        seeded = await client.put(f"/v1/admin/inventory/{sku}", headers=_auth(merchant), json={"on_hand": 10})
+        assert seeded.status_code == 200, seeded.text
+        v1 = seeded.json()["version"]
+
+        for bad in (str(v1), f"W/{_etag_of(v1)}", f'{_etag_of(v1)}, "{v1 + 1}"'):
+            resp = await client.put(
+                f"/v1/admin/inventory/{sku}",
+                headers={**_auth(merchant), "If-Match": bad},
+                json={"on_hand": 11},
+            )
+            assert resp.status_code == 400, (bad, resp.text)
+            assert resp.headers["content-type"] == "application/problem+json"
+
+
+async def test_same_value_reput_with_matching_version_does_not_bump(app_ctx, rsa_key):
+    app, _sessionmaker = app_ctx
+    sku, merchant = await _create_product(app, rsa_key)
+
+    async with _client(app) as client:
+        seeded = await client.put(f"/v1/admin/inventory/{sku}", headers=_auth(merchant), json={"on_hand": 10})
+        assert seeded.status_code == 200, seeded.text
+        v1 = seeded.json()["version"]
+
+        again = await client.put(
+            f"/v1/admin/inventory/{sku}",
+            headers={**_auth(merchant), "If-Match": _etag_of(v1)},
+            json={"on_hand": 10},
+        )
+        assert again.status_code == 200, again.text
+        assert again.json()["version"] == v1
+        assert again.headers["ETag"] == _etag_of(v1)
+
+
+async def test_reserved_guard_without_if_match_still_409(app_ctx, rsa_key):
+    app, sessionmaker = app_ctx
+    sku, merchant = await _create_product(app, rsa_key)
+
+    async with _client(app) as client:
+        ok = await client.put(f"/v1/admin/inventory/{sku}", headers=_auth(merchant), json={"on_hand": 10})
+        assert ok.status_code == 200, ok.text
+
+    async with sessionmaker() as session:
+        await session.execute(
+            text(
+                "INSERT INTO inventory.reservations (id, sku, qty, order_id, status, expires_at) "
+                "VALUES (:id, :sku, 3, :oid, 'held', now() + interval '1 hour')"
+            ),
+            {"id": uuid.uuid4(), "sku": sku, "oid": uuid.uuid4()},
+        )
+        await session.execute(
+            text("UPDATE inventory.inventory SET reserved = 3 WHERE sku = :sku"),
+            {"sku": sku},
+        )
+        await session.commit()
+
+    async with _client(app) as client:
+        refused = await client.put(f"/v1/admin/inventory/{sku}", headers=_auth(merchant), json={"on_hand": 2})
+        assert refused.status_code == 409, refused.text
+        assert refused.headers["content-type"] == "application/problem+json"
+        assert "below" in refused.json()["detail"]
+
+
+async def test_etag_present_on_200(app_ctx, rsa_key):
+    app, _sessionmaker = app_ctx
+    sku, merchant = await _create_product(app, rsa_key)
+
+    async with _client(app) as client:
+        resp = await client.put(f"/v1/admin/inventory/{sku}", headers=_auth(merchant), json={"on_hand": 25})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert resp.headers["ETag"] == _etag_of(body["version"])
+
+
+async def test_if_match_stale_beats_reserved_guard_with_412(app_ctx, rsa_key):
+    """412 beats 409: a stale version + below-reserved on_hand answers 412, row unchanged."""
+    app, sessionmaker = app_ctx
+    sku, merchant = await _create_product(app, rsa_key)
+
+    async with _client(app) as client:
+        seeded = await client.put(f"/v1/admin/inventory/{sku}", headers=_auth(merchant), json={"on_hand": 10})
+        assert seeded.status_code == 200, seeded.text
+        v1 = seeded.json()["version"]
+
+    async with sessionmaker() as session:
+        await session.execute(
+            text(
+                "INSERT INTO inventory.reservations (id, sku, qty, order_id, status, expires_at) "
+                "VALUES (:id, :sku, 3, :oid, 'held', now() + interval '1 hour')"
+            ),
+            {"id": uuid.uuid4(), "sku": sku, "oid": uuid.uuid4()},
+        )
+        await session.execute(
+            text("UPDATE inventory.inventory SET reserved = 3 WHERE sku = :sku"),
+            {"sku": sku},
+        )
+        await session.commit()
+
+    async with _client(app) as client:
+        moved = await client.put(f"/v1/admin/inventory/{sku}", headers=_auth(merchant), json={"on_hand": 20})
+        assert moved.status_code == 200, moved.text
+        v2 = moved.json()["version"]
+        assert v2 != v1
+
+        refused = await client.put(
+            f"/v1/admin/inventory/{sku}",
+            headers={**_auth(merchant), "If-Match": _etag_of(v1)},
+            json={"on_hand": 2},
+        )
+        assert refused.status_code == 412, refused.text
+        assert refused.headers["content-type"] == "application/problem+json"
+
+        on_hand, version = await _db_row(sessionmaker, sku)
+        assert on_hand == 20
+        assert version == v2
+
+
+async def test_if_match_versioned_create_is_412_and_creates_nothing(app_ctx, rsa_key):
+    """A versioned precondition names a version that must exist: fresh-SKU create stays headerless."""
+    app, sessionmaker = app_ctx
+    sku, merchant = await _create_product(app, rsa_key)
+
+    async with _client(app) as client:
+        refused = await client.put(
+            f"/v1/admin/inventory/{sku}",
+            headers={**_auth(merchant), "If-Match": _etag_of(1)},
+            json={"on_hand": 10},
+        )
+        assert refused.status_code == 412, refused.text
+        assert refused.headers["content-type"] == "application/problem+json"
+
+    async with sessionmaker() as session:
+        row = (
+            await session.execute(
+                text("SELECT on_hand FROM inventory.inventory WHERE sku = :sku"),
+                {"sku": sku},
+            )
+        ).first()
+        assert row is None
+
+    # Headerless create still works after the refused versioned one.
+    async with _client(app) as client:
+        created = await client.put(f"/v1/admin/inventory/{sku}", headers=_auth(merchant), json={"on_hand": 10})
+        assert created.status_code == 200, created.text

@@ -121,6 +121,27 @@ _UPSERT_SQL = text(
     "RETURNING sku, on_hand, reserved, version"
 )
 
+# Version-guarded twin of ``_UPSERT_SQL``: the conflict path additionally
+# requires ``inventory.version = :expected_version``, so a stale writer's
+# UPDATE matches no row (empty RETURNING → ``None`` → the service answers 412,
+# while the stock guard above still answers 409). The insert is suppressed
+# unless the row already exists (``WHERE EXISTS``): a precondition names a
+# version that must currently exist, so a versioned write for a missing row
+# inserts nothing and likewise answers 412. One statement, so the
+# existence check and the insert/conflict write share a snapshot — no
+# check-then-insert race. Same-value re-PUTs keep the no-bump ``CASE``,
+# so idempotency is identical in both variants.
+_UPSERT_SQL_VERSION_GUARDED = text(
+    f"INSERT INTO {SCHEMA}.inventory (sku, on_hand, reserved, version) "  # noqa: S608
+    f"SELECT CAST(:sku AS VARCHAR(64)), :on_hand, 0, 1 WHERE EXISTS (SELECT 1 FROM {SCHEMA}.inventory WHERE sku = :sku) "  # noqa: S608
+    f"ON CONFLICT (sku) DO UPDATE SET on_hand = EXCLUDED.on_hand, "  # noqa: S608
+    f"version = CASE WHEN {SCHEMA}.inventory.on_hand IS DISTINCT FROM EXCLUDED.on_hand "  # noqa: S608
+    f"THEN {SCHEMA}.inventory.version + 1 ELSE {SCHEMA}.inventory.version END "  # noqa: S608
+    f"WHERE {SCHEMA}.inventory.reserved <= EXCLUDED.on_hand "  # noqa: S608
+    f"AND {SCHEMA}.inventory.version = :expected_version "  # noqa: S608
+    "RETURNING sku, on_hand, reserved, version"
+)
+
 # The status transition goes first: it is the idempotency gate. RETURNING hands
 # back the (sku, qty, order_id) to undo, so no second SELECT is needed.
 _MARK_RELEASED_SQL = text(
@@ -218,17 +239,32 @@ class InventoryRepository:
         row = (await self._session.execute(_inventory_select(Inventory.sku == sku))).scalar_one_or_none()
         return to_domain(row) if row is not None else None
 
-    async def upsert_stock(self, sku: str, on_hand: int) -> DomainInventory | None:
+    async def upsert_stock(self, sku: str, on_hand: int, expected_version: int | None = None) -> DomainInventory | None:
         """Seed or re-point the stock row for ``sku``; ``None`` if live holds exceed ``on_hand``.
 
         One atomic statement: a fresh SKU inserts (``reserved = 0``), an
         existing row's ``on_hand`` is replaced only while its current
         ``reserved`` fits under the new value, so in-flight checkouts can never
         be erased by an upsert. The ``RETURNING`` row *is* the post-write state —
-        mapped straight back, no second query. Commits on success — this is the
-        transaction.
+        mapped straight back, no second query. The service commits the
+        enclosing unit of work — the repo only flushes.
+
+        ``expected_version`` is an opt-in compare-and-swap predicate: when set,
+        the statement inserts nothing for a missing row and the conflict path
+        additionally requires the row's current ``version`` to equal it, so a
+        stale writer matches no row and gets ``None`` (the service
+        disambiguates 412 vs 409). When ``None`` (default) the unconditional
+        statement runs unchanged.
         """
-        row = (await self._session.execute(_UPSERT_SQL, {"sku": sku, "on_hand": on_hand})).first()
+        if expected_version is None:
+            row = (await self._session.execute(_UPSERT_SQL, {"sku": sku, "on_hand": on_hand})).first()
+        else:
+            row = (
+                await self._session.execute(
+                    _UPSERT_SQL_VERSION_GUARDED,
+                    {"sku": sku, "on_hand": on_hand, "expected_version": expected_version},
+                )
+            ).first()
         if row is None:
             # The guard refused: no write to undo, and the enclosing unit of
             # work owns the transaction — just answer, never roll back here.

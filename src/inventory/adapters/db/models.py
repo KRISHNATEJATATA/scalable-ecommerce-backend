@@ -20,10 +20,13 @@ class Base(DeclarativeBase):
 class Inventory(Base, ManualVersionMixin):
     """On-hand/reserved stock for a SKU.
 
-    Reservation/release is a raw ``UPDATE ... WHERE version = :v`` compare-
-    and-swap (see ``ManualVersionMixin``) so the atomic conditional decrement
+    Reservation/release is a raw ``UPDATE ... WHERE`` compare-and-swap (see
+    ``ManualVersionMixin``) so the atomic conditional decrement
     (``on_hand - reserved >= :qty``) and the version bump happen in one
-    statement, not through the ORM unit of work.
+    statement, not through the ORM unit of work. The merchant/admin stock
+    upsert layers an opt-in ``version = :expected_version`` predicate on the
+    conflict path only — callers that pass no version keep the unconditional
+    path, and no ORM ``version_id_col`` is involved.
     """
 
     __tablename__ = "inventory"

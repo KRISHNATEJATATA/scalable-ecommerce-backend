@@ -835,11 +835,25 @@ paths:
         `409` when the row's currently-reserved units (live checkout holds)
         would exceed the new `on_hand` — reserved units may not be erased; raise
         `on_hand` or wait for the holds to release. No response event: consumers
-        compose `available` (`on_hand - reserved`) fresh on every read.
+        compose `available` (`on_hand - reserved`) fresh on every read. Honours
+        an optional `If-Match` precondition: a stale version answers `412`
+        before any state changes — re-read and re-apply. The `412` check beats
+        the `409` reserved guard; a missing row written with a versioned
+        `If-Match` answers `412`.
       security:
         - bearerAuth: []
       parameters:
         - $ref: "#/components/parameters/Sku"
+        - name: If-Match
+          in: header
+          required: false
+          schema: { type: string }
+          description: >-
+            The quoted `version` from a previous read of this stock row (or `*`
+            for "must exist"). Optional — without it the write is an
+            unconditional last-writer-wins set (concurrent PUTs without
+            `If-Match` can still overwrite each other; `409` answers only the
+            reserved-guard, when live holds exceed the new `on_hand`).
       requestBody:
         required: true
         content:
@@ -849,10 +863,21 @@ paths:
       responses:
         "200":
           description: The stock row after the upsert.
+          headers:
+            ETag:
+              schema: { type: string }
+              description: The post-write quoted `version`.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Inventory"
+        "400":
+          description: >-
+            Malformed `If-Match` — not a quoted integer version and not `*`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -861,6 +886,15 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           description: The new `on_hand` is below the units currently reserved.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "412":
+          description: >-
+            The `If-Match` version does not match the stock row's current
+            `version` — the caller's copy is stale. Nothing was written;
+            re-read and re-apply.
           content:
             application/problem+json:
               schema:

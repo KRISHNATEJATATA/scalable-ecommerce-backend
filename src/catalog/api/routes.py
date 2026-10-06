@@ -15,7 +15,6 @@ track the header (the optimistic-lock 409 remains the server-side backstop).
 
 from __future__ import annotations
 
-import re
 import uuid
 from typing import Annotated
 
@@ -30,6 +29,7 @@ from src.catalog.api.schemas import (
     ProductUpdate,
 )
 from src.catalog.application.service import CacheRead, CatalogService
+from src.shared.api.etag import parse_if_match, set_etag
 from src.shared.api.query import reject_unknown_query_params
 from src.shared.auth.dependencies import PrincipalDep, require_role
 from src.shared.auth.principal import Principal
@@ -62,46 +62,6 @@ PRODUCT_CACHE_HEADER = "X-Cache"
 # Every query param the listing understands; anything else is a 400 (see
 # ``shared/api/query.py``) rather than a silently unfiltered page.
 _LIST_QUERY_PARAMS = frozenset({"limit", "sort", "cursor", "category", "merchant_id", "search"})
-
-# ``If-Match`` grammar this API accepts: ``*`` (any) or one quoted integer
-# (``"<version>"`` — W/ weak prefixes and list values are not produced by any
-# of this API's ETags, so they are rejected as malformed rather than guessed).
-_IF_MATCH_RE = re.compile(r"^\"(\d+)\"$")
-
-
-def etag_of(version: int) -> str:
-    """The entity tag for a product version: the quoted integer (RFC 9110 form)."""
-    return f'"{version}"'
-
-
-def parse_if_match(header: str | None) -> int | None:
-    """Parse ``If-Match`` into a version to compare, or ``None`` when no precondition.
-
-    Compares the quoted integer numerically (so a zero-padded echo of a real
-    version still matches — the API never issues leading zeros, and a padded
-    tag can only ever name a version that exists). Repeated ``If-Match``
-    header lines are not supported: Starlette serves only the first.
-
-    ``None`` (absent), ``*`` (any version), or a matching ``"<n>"`` all pass;
-    a malformed header is a 400 (the client is broken, not stale); anything
-    else is the exact version the client read.
-    """
-    if header is None:
-        return None
-    if header.strip() == "*":
-        return None
-    match = _IF_MATCH_RE.match(header.strip())
-    if match is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail='If-Match must be a quoted integer (ETag) or "*"',
-        )
-    return int(match.group(1))
-
-
-def set_etag(response: Response, product: ProductResponse) -> None:
-    """Stamp the response's ``ETag`` from the product's aggregate version."""
-    response.headers["ETag"] = etag_of(product.version)
 
 
 @router.get("", response_model=PageResponse[ProductResponse])
@@ -150,7 +110,7 @@ async def get_product(
         # Same 404 as the other routes, but the cache outcome travels on it —
         # HTTPException headers survive the Problem-Details mapping.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="product not found", headers=cache_header)
-    set_etag(response, product)
+    set_etag(response, product.version)
     if cache_header is not None:
         response.headers.update(cache_header)
     return product
@@ -191,7 +151,7 @@ async def update_product(
     )
     if product is None:
         raise _NOT_FOUND
-    set_etag(response, product)
+    set_etag(response, product.version)
     return product
 
 

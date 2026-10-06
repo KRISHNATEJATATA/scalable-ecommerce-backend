@@ -37,6 +37,7 @@ from src.shared.errors.exceptions import (
     AuthorizationError,
     InsufficientStockError,
     InvalidReservationError,
+    PreconditionFailedError,
     ReservationConflictError,
     StockBelowReservedError,
 )
@@ -78,7 +79,13 @@ class InventoryService:
         return {sku: InventoryResponse.model_validate(snapshot) for sku, snapshot in rows.items()}
 
     async def upsert_stock(
-        self, sku: str, on_hand: int, *, caller_id: uuid.UUID | None = None, is_admin: bool = False
+        self,
+        sku: str,
+        on_hand: int,
+        *,
+        caller_id: uuid.UUID | None = None,
+        is_admin: bool = False,
+        if_match: int | None = None,
     ) -> InventoryResponse | None:
         """Seed or re-point a SKU's ``on_hand`` (the merchant/admin stock upsert).
 
@@ -105,12 +112,17 @@ class InventoryService:
                 raise AuthorizationError("not the owner of this product")
         # Service-owned boundary: the upsert's write commits here, not in the repo.
         async with self._repo.uow.transaction():
-            row = await self._repo.upsert_stock(sku, on_hand)
+            row = await self._repo.upsert_stock(sku, on_hand, expected_version=if_match)
             if row is None:
-                # The guard refused, so the row exists — but re-read it for the held
-                # count, and treat a vanished row (can't happen post-refusal) as zero
-                # rather than dereferencing None.
+                # A guard refused: the version predicate (stale → 412,
+                # including a versioned write for a row that does not exist)
+                # or the reserved<=on_hand stock guard (→ 409). Re-read to
+                # tell them apart — 412 beats 409 when both could apply.
                 current = await self._repo.get_by_sku(sku)
+                if if_match is not None and (current is None or current.version != if_match):
+                    raise PreconditionFailedError(
+                        f"the stock for {sku!r} changed since it was read (If-Match mismatch); re-read it and re-apply"
+                    )
                 raise StockBelowReservedError(sku, on_hand, current.reserved if current else 0)
             return InventoryResponse.model_validate(row)
 

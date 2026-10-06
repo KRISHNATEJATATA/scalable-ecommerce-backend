@@ -11,8 +11,8 @@ Two distinct optimistic-lock mechanisms exist on purpose:
 - ``ManualVersionMixin``: a plain ``version`` column bumped by hand inside raw
   single-statement writes whose *arithmetic guard* is the real concurrency
   control (e.g. ``inventory.inventory``: ``WHERE on_hand - reserved >= :qty``).
-  The column exists so a future compare-and-swap (``WHERE version = :v``) can be
-  layered on without a migration — today nothing branches on it.
+  The column backs the opt-in compare-and-swap (``WHERE version = :v``) used by
+  the guarded upsert path — unconditional writes still bump without branching on it.
 """
 
 import uuid
