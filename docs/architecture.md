@@ -315,7 +315,11 @@ the exceptional path, not the routine race outcome.
 - **Timeouts are relationships, enforced at startup**: the per-step saga
   timeout (`CHECKOUT_SAGA_STEP_TIMEOUT_SECONDS`) must stay below
   `RESERVATION_TTL_SECONDS`, so a live checkout can't lose its stock to the
-  reaper mid-saga.
+  reaper mid-saga — and the whole-drive deadline
+  (`CHECKOUT_SAGA_OVERALL_TIMEOUT_SECONDS`, below the ALB idle timeout) must
+  stay above the step timeout, so a hanging step hits its step timeout while
+  the scope is still live for compensation instead of dying inside an
+  already-expired overall scope.
 - **Cross-module calls go through the saga's own ports**
   (`src/orders/ports/checkout.py`), implemented at the composition root over
   the inventory/payments/cart services — the saga module never imports a

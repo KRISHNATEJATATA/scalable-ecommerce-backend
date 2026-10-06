@@ -24,10 +24,11 @@ The adapters are unified over the lowest port that serves every caller:
 from __future__ import annotations
 
 import uuid
+from collections.abc import Awaitable, Callable
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.bootstrap.payment_gateway import make_payment_gateway
 from src.bootstrap.payment_refund import cancelled_order_refund_hook, orders_repository_with_payment_guard
@@ -186,6 +187,7 @@ def build_checkout_saga(
     settings: AppSettings,
     *,
     gateway: PaymentGatewayPort | None = None,
+    sessionmaker: async_sessionmaker[AsyncSession] | None = None,
 ) -> CheckoutSaga:
     """Build the checkout saga over one session, Valkey client, and settings.
 
@@ -197,6 +199,11 @@ def build_checkout_saga(
     ``valkey=None`` (bare test app) keeps the DB UNIQUE backstop for
     idempotency but raises for the cart — like the product read-cache there is
     no DB to degrade to, so a missing client is 503, not a silent fallback.
+    ``sessionmaker`` wires fresh-session compensation: after a step is
+    cancelled mid-query the request session may hold a cancelled asyncpg
+    operation and must not be reused, so compensation (release holds + cancel)
+    runs on a new session from this maker. ``None`` (direct construction in
+    tests) compensates on the request session after a best-effort rollback.
     """
     if valkey is None:
         raise DependencyUnavailableError("cart storage is not configured")
@@ -210,7 +217,7 @@ def build_checkout_saga(
         reconciliation_max_age_seconds=settings.payment_reconciliation_max_age_seconds,
         on_payment_succeeded=cancelled_order_refund_hook(session),
     )
-    return CheckoutSaga(
+    saga = CheckoutSaga(
         orders_repository_with_payment_guard(session),
         SagaBasket(ValkeyCartRepository(valkey, ttl_seconds=settings.cart_ttl_seconds)),
         SagaStockHolds(inventory),
@@ -218,4 +225,39 @@ def build_checkout_saga(
         ValkeyIdempotencyStore(valkey, ttl_seconds=settings.checkout_idempotency_ttl_seconds),
         prices=SagaPriceTruth(CatalogRepository(session)),
         step_timeout_seconds=settings.checkout_saga_step_timeout_seconds,
+        overall_timeout_seconds=settings.checkout_saga_overall_timeout_seconds,
     )
+    if sessionmaker is not None:
+        saga._fresh_compensate = _fresh_compensator(sessionmaker, settings, saga)
+    return saga
+
+
+def _fresh_compensator(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    settings: AppSettings,
+    saga: CheckoutSaga,
+) -> Callable[[uuid.UUID, str], Awaitable[None]]:
+    """Compensation runner over a new session per call (the post-cancel path).
+
+    Lives here — the one place allowed to compose modules — so the saga stays
+    port-only: it rebuilds the two collaborators compensation touches (orders
+    repository, inventory-backed holds) on a fresh session and drives the
+    saga's own scope-parameterized compensation on them. Each step commits in
+    its own small unit (never one transaction held across the give-back), and
+    release + guarded cancel are idempotent, so a retry or a concurrent poller
+    pass can never double-apply it.
+    """
+
+    async def _run(order_id: uuid.UUID, failed_step: str) -> None:
+        async with sessionmaker() as fresh:
+            fresh_inventory = InventoryService(
+                InventoryRepository(fresh), reservation_ttl_seconds=settings.reservation_ttl_seconds
+            )
+            await saga.compensate_with(
+                orders_repository_with_payment_guard(fresh),
+                SagaStockHolds(fresh_inventory),
+                order_id,
+                failed_step,
+            )
+
+    return _run

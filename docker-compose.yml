@@ -394,7 +394,8 @@ services:
       DATABASE_URL: postgresql+asyncpg://ecommerce:ecommerce@postgres:5432/ecommerce
       VALKEY_URL: redis://valkey:6379/0
       RESERVATION_TTL_SECONDS: "900"
-      CHECKOUT_SAGA_STEP_TIMEOUT_SECONDS: "60"
+      CHECKOUT_SAGA_STEP_TIMEOUT_SECONDS: "30"
+      CHECKOUT_SAGA_OVERALL_TIMEOUT_SECONDS: "50"
       CHECKOUT_SAGA_RECOVERY_POLL_INTERVAL_SECONDS: "10.0"
       WORKER_METRICS_PORT: "9100"
     ports:

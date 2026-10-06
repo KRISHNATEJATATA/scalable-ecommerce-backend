@@ -317,7 +317,14 @@ class AppSettings(BaseSettings):
     # Must stay well under RESERVATION_TTL_SECONDS (enforced below): a step that
     # runs longer than the hold lets the reaper reclaim stock from a live
     # checkout. The recovery poller settles orders still `pending` past this age.
-    checkout_saga_step_timeout_seconds: int = Field(default=60, gt=0)
+    checkout_saga_step_timeout_seconds: int = Field(default=30, gt=0)
+    # Overall deadline for one checkout drive (reserve → charge → commit →
+    # paid), bounding what the per-step timeouts above can stretch to in sum.
+    # Must stay below the ALB idle timeout (default 60 s): without it a slow
+    # dependency stretches one request over up to four step timeouts while the
+    # load balancer has already gone away — the request then holds a pooled DB
+    # connection (and sometimes an open transaction) for work nobody will read.
+    checkout_saga_overall_timeout_seconds: int = Field(default=50, gt=0)
     checkout_saga_recovery_batch_size: int = Field(default=50, gt=0)
     # The recovery poller's own sweep cadence — deliberately NOT the reservation
     # reaper's interval: the two workers share no schedule contract, so retuning
@@ -502,6 +509,36 @@ class AppSettings(BaseSettings):
                 "checkout_saga_step_timeout_seconds must stay below reservation_ttl_seconds "
                 f"({self.checkout_saga_step_timeout_seconds} >= {self.reservation_ttl_seconds}): "
                 "a live checkout would lose its stock to the reaper mid-saga"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_saga_overall_timeout_below_reservation_ttl(self) -> "AppSettings":
+        """Fail-fast: the whole checkout drive must finish before its stock hold can expire.
+
+        The per-step validator above bounds one step; this bounds their sum.
+        A drive that routinely outlived the TTL would get its stock reclaimed
+        mid-flight and compensate (or refund) a sale that should have
+        succeeded. Keep it below the ALB idle timeout too (default 60 s) — the
+        default 50 s does both — so a slow dependency can't pin a request
+        worker past the load balancer's patience. And it must stay ABOVE the
+        step timeout: with overall <= step a hanging step blows the overall
+        deadline first, so compensation would run inside an already-expired
+        scope (instantly cancelled — the caller sees a 500 and only the
+        recovery poller settles the order). Step-first keeps compensation on a
+        live scope.
+        """
+        if self.checkout_saga_overall_timeout_seconds >= self.reservation_ttl_seconds:
+            raise ValueError(
+                "checkout_saga_overall_timeout_seconds must stay below reservation_ttl_seconds "
+                f"({self.checkout_saga_overall_timeout_seconds} >= {self.reservation_ttl_seconds}): "
+                "a live checkout would lose its stock to the reaper mid-saga"
+            )
+        if self.checkout_saga_overall_timeout_seconds <= self.checkout_saga_step_timeout_seconds:
+            raise ValueError(
+                "checkout_saga_overall_timeout_seconds must stay above checkout_saga_step_timeout_seconds "
+                f"({self.checkout_saga_overall_timeout_seconds} <= {self.checkout_saga_step_timeout_seconds}): "
+                "a hanging step must hit its step timeout (with a live scope for compensation) before the overall fires"
             )
         return self
 

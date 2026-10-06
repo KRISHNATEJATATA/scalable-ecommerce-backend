@@ -8,6 +8,7 @@ and tests inject fakes via ``app.dependency_overrides`` with no internal patchin
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Annotated
 
@@ -66,6 +67,8 @@ from src.shared.errors.exceptions import (
 )
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
+
+log = logging.getLogger(__name__)
 
 
 # --- catalog repository ----------------------------------------------------
@@ -403,10 +406,19 @@ def get_checkout_saga(
 
     Delegates to the shared saga factory (the same wiring the recovery worker
     builds from) — the only per-request input beyond the session is the cached
-    process-shared gateway and Valkey client off ``app.state``.
+    process-shared gateway and Valkey client off ``app.state``.     The
+    sessionmaker off ``app.state`` wires fresh-session compensation, so a step
+    cancelled mid-query never compensates on the tainted request session.
     """
+    sessionmaker = getattr(request.app.state, "db_sessionmaker", None)
+    if sessionmaker is None:
+        log.warning("checkout saga built without a sessionmaker: post-cancel compensation reuses the request session")
     return build_checkout_saga(
-        session, getattr(request.app.state, "valkey", None), request.app.state.settings, gateway=gateway
+        session,
+        getattr(request.app.state, "valkey", None),
+        request.app.state.settings,
+        gateway=gateway,
+        sessionmaker=sessionmaker,
     )
 
 

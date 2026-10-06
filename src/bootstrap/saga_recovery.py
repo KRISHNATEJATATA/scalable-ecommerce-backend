@@ -60,7 +60,7 @@ class SagaRecovery:
 
     def _saga(self, session: AsyncSession) -> CheckoutSaga:
         """Build the saga over the shared factory (identical wiring to the request path)."""
-        return build_checkout_saga(session, self._valkey, self._settings)
+        return build_checkout_saga(session, self._valkey, self._settings, sessionmaker=self._sessionmaker)
 
     async def sweep_once(self) -> dict[str, int]:
         """One pass: settle every stuck checkout, return the outcome counts."""

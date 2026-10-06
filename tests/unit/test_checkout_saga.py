@@ -979,6 +979,107 @@ async def test_charge_timeout_with_pending_payment_leaves_pending_not_cancelled(
     assert await _stock(session, str(line.product_id)) == (5, 1)  # hold kept, not released
 
 
+async def test_overall_drive_deadline_compensates_without_reusing_cancelled_session(session):
+    """one request-scoped deadline bounds the whole drive below the LB idle timeout.
+
+    A live-order check that hangs past the overall deadline must answer 409
+    (never a hung request or a 500), and compensation must not reuse the
+    cancelled session: the rollback-then-compensate path leaves the order
+    cancelled and the reserve's hold released.
+    """
+    import asyncio
+
+    class _HangingLiveCheck(OrdersRepository):
+        async def get_order(self, order_id):
+            await asyncio.sleep(10)  # longer than the overall deadline below
+            return await super().get_order(order_id)
+
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    inventory = InventoryService(InventoryRepository(session), reservation_ttl_seconds=900)
+    payments = PaymentsService(PaymentsRepository(session), StubPaymentGateway(), webhook_secret="test-secret")
+    saga = CheckoutSaga(
+        _HangingLiveCheck(session),
+        basket,
+        OrderStockHolds(inventory),
+        OrderCharges(payments),
+        _Idempotency(),
+        prices=_BasketTruth(basket),
+        step_timeout_seconds=30,
+        overall_timeout_seconds=1,
+    )
+    try:
+        await saga.checkout(user_id=USER_A, idempotency_key="key-overall", payment_token="tok_visa")
+    except OrderStateConflictError as exc:
+        assert "timed out" in exc.detail
+    else:
+        raise AssertionError("expected OrderStateConflictError")
+
+    order_id = (await session.execute(text("SELECT id FROM orders.orders"))).scalar_one()
+    assert await _order_status(session, order_id) == "cancelled"
+    assert await _stock(session, str(line.product_id)) == (5, 0)  # hold released, not leaked
+
+
+async def test_reserve_cancel_compensates_on_fresh_session(session, sessionmaker_factory):
+    """compensation after a cancelled DB step runs off the tainted session.
+
+    A reserve hanging past the step timeout is cancelled mid-query; the
+    release + cancel must then run on a fresh session (wired explicitly here),
+    leaving the order cancelled while the request session stays usable.
+    """
+    import asyncio
+
+    class _HangingHolds:
+        async def reserve_many(self, lines, order_id):
+            await asyncio.sleep(30)  # longer than the step timeout below
+
+        async def release_for_order(self, order_id):
+            return 0
+
+        async def restock_for_order(self, order_id):
+            return 0
+
+        async def commit_for_order(self, order_id, *, expected):
+            return 0
+
+    line = _line()
+    await _seed(session, str(line.product_id), 5)
+    basket = _Basket()
+    basket.stock(USER_A, line)
+    payments = PaymentsService(PaymentsRepository(session), StubPaymentGateway(), webhook_secret="test-secret")
+    saga = CheckoutSaga(
+        OrdersRepository(session),
+        basket,
+        _HangingHolds(),
+        OrderCharges(payments),
+        _Idempotency(),
+        prices=_BasketTruth(basket),
+        step_timeout_seconds=0.5,
+        overall_timeout_seconds=30,
+    )
+    fresh_calls: list[str] = []
+
+    async def _fresh(order_id, failed_step):
+        fresh_calls.append(failed_step)
+        async with sessionmaker_factory() as fresh:
+            fresh_inventory = InventoryService(InventoryRepository(fresh), reservation_ttl_seconds=900)
+            await saga.compensate_with(OrdersRepository(fresh), OrderStockHolds(fresh_inventory), order_id, failed_step)
+
+    saga._fresh_compensate = _fresh
+    try:
+        await saga.checkout(user_id=USER_A, idempotency_key="key-fresh", payment_token="tok_visa")
+    except OrderStateConflictError as exc:
+        assert "reservation timed out" in exc.detail
+    else:
+        raise AssertionError("expected OrderStateConflictError")
+
+    assert fresh_calls == ["reserve"]
+    order_id = (await session.execute(text("SELECT id FROM orders.orders"))).scalar_one()
+    assert await _order_status(session, order_id) == "cancelled"
+
+
 @pytest.mark.parametrize("lookup_fails", [False, True])
 async def test_transport_timeout_after_capture_keeps_order_pending(session, lookup_fails):
     """The resilience wrapper translates a transport timeout into a 503 after capture."""
@@ -2907,7 +3008,7 @@ async def test_factory_is_the_single_wiring_for_request_and_recovery_paths(sessi
     fails closed (503) instead of silently degrading.
     """
     settings = get_settings()
-    request_saga = build_checkout_saga(session, real_valkey, settings)
+    request_saga = build_checkout_saga(session, real_valkey, settings, sessionmaker=sessionmaker_factory)
     recovery_saga = SagaRecovery(sessionmaker_factory, real_valkey, settings)._saga(session)
 
     for saga in (request_saga, recovery_saga):
@@ -2918,6 +3019,14 @@ async def test_factory_is_the_single_wiring_for_request_and_recovery_paths(sessi
         assert isinstance(saga._prices, SagaPriceTruth)
         assert isinstance(saga._idempotency, ValkeyIdempotencyStore)
         assert saga._step_timeout == settings.checkout_saga_step_timeout_seconds
+        assert saga._overall_timeout == settings.checkout_saga_overall_timeout_seconds
+        # Both composition roots hand the factory a sessionmaker, so post-cancel
+        # compensation runs on a fresh session, never the cancelled one.
+        assert saga._fresh_compensate is not None
+
+    # Without a sessionmaker (direct construction) the saga falls back to the
+    # request session after a best-effort rollback.
+    assert build_checkout_saga(session, real_valkey, settings)._fresh_compensate is None
 
     with pytest.raises(DependencyUnavailableError):
         build_checkout_saga(session, None, settings)

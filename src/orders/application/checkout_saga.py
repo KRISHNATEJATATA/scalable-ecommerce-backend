@@ -42,6 +42,7 @@ import json
 import logging
 import uuid
 from collections import Counter
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from decimal import Decimal
 
@@ -126,6 +127,8 @@ class CheckoutSaga:
         *,
         prices: PriceTruthPort,
         step_timeout_seconds: int,
+        overall_timeout_seconds: int = 50,
+        fresh_compensate: Callable[[uuid.UUID, str], Awaitable[None]] | None = None,
     ) -> None:
         self._orders = orders
         self._basket = basket
@@ -134,6 +137,14 @@ class CheckoutSaga:
         self._idempotency = idempotency
         self._prices = prices
         self._step_timeout = step_timeout_seconds
+        self._overall_timeout = overall_timeout_seconds
+        # Fresh-session compensation runner, wired by the composition root
+        # (which owns a sessionmaker). Runs release-holds + cancel on a new
+        # session after a step was cancelled mid-query — the request session
+        # may then hold a cancelled asyncpg operation and must not be reused.
+        # ``None`` (direct construction in tests) falls back to the request
+        # session after a best-effort rollback.
+        self._fresh_compensate = fresh_compensate
 
     # --- the checkout entry point -------------------------------------
 
@@ -331,220 +342,293 @@ class CheckoutSaga:
         total = _total(lines)
         charged = False
         charge_uncertain = False
+        compensated = False
+        settled_paid = False
+        failed_step = "reserve"
         try:
-            await self._log(order_id, "reserve", "started")
-            try:
-                async with asyncio.timeout(self._step_timeout):
-                    # One all-or-nothing batch, not a per-line loop: up to a
-                    # cart-full of sequential reserve transactions stretched the
-                    # step's latency, connection occupancy and lock exposure.
-                    # SKU mapping str(product.id) is the composition seam.
-                    await self._holds.reserve_many([(str(line.product_id), line.quantity) for line in lines], order_id)
-            except TimeoutError as exc:
-                # The reserve may have landed without its answer returning —
-                # compensate whatever holds exist rather than leaking them.
-                await self._compensate(order_id, "reserve")
-                raise OrderStateConflictError("checkout reservation timed out") from exc
-            await self._log(order_id, "reserve", "completed")
-
-            await self._log(order_id, "charge", "started")
-            # Last word before money moves: a cancel (or a compensating poller)
-            # that landed while we were reserving must abort the charge here,
-            # not after it. The canceller owns the release in that case — this
-            # branch only refuses to charge a dead order.
-            live = await self._orders.get_order(order_id)
-            if live is None:
-                log.error("checkout order %s was cancelled mid-drive before charging", order_id)
-                raise OrderStateConflictError("the order was cancelled while checking out; start a new checkout")
-            if live.status == OrderStatus.PAID:
-                # Not a cancel: the create-race loser resuming this same PENDING
-                # order (or vice versa) already drove it to PAID concurrently —
-                # reserve/commit are idempotent per order, so both frames reaching
-                # here is expected, not a crash. Replay the final state exactly
-                # like ``_replay_or_resume``'s PAID branch, rather than refusing a
-                # checkout that in fact succeeded.
-                log.info("checkout order %s settled concurrently before charging; reading final state", order_id)
-                response = _response(live)
-                await self._remember(user_id, idempotency_key, body_hash, 201, response)
-                await self._clear_basket_if_replay_mop_up(user_id, response.items)
-                return response, False
-            if live.status != OrderStatus.PENDING:
-                log.error("checkout order %s was cancelled mid-drive before charging", order_id)
-                raise OrderStateConflictError("the order was cancelled while checking out; start a new checkout")
-            try:
-                async with asyncio.timeout(self._step_timeout):
-                    charge = await self._charges.charge(
-                        order_id=order_id,
-                        idempotency_key=payment_key_for(user_id, idempotency_key),
-                        amount=total,
-                        payment_token=payment_token,
-                    )
-            except (CircuitOpenError, DependencyBudgetExhaustedError):
-                raise  # No provider call was admitted; ordinary compensation is safe.
-            except (TimeoutError, DependencyUnavailableError):
-                # The charge may have landed without its answer returning —
-                # settle from the recorded outcome instead of guessing.
-                charge_uncertain = True
+            # One request-scoped deadline over the whole drive — reserve, charge
+            # and both commit attempts share it. Without this a slow dependency
+            # stretches one HTTP request over up to four step timeouts while the
+            # load balancer (default idle timeout 60 s) has already gone away,
+            # holding a pooled DB connection and sometimes an open transaction
+            # for work nobody will read. Per-step timeouts below stay as the
+            # inner backstops; an escape past them lands in the TimeoutError arm
+            # below, which settles without reusing the cancelled session.
+            async with asyncio.timeout(self._overall_timeout):
+                await self._log(order_id, "reserve", "started")
                 try:
-                    charge = await self._charges.find_by_idempotency_key(payment_key_for(user_id, idempotency_key))
-                except Exception:
-                    log.exception("checkout order %s: charge lookup failed after an uncertain outcome", order_id)
-                    charge = None
-                if charge is None or not charge.failed:
-                    # Unknown or still-pending outcome: the gateway may confirm a
-                    # moment later, and compensating here could cancel an order
-                    # whose payment succeeds (money taken, no order). Leave it
-                    # pending for the reconciler/recovery poller — never unwind.
-                    await self._log(order_id, "charge", "unknown")
-                    raise OrderStateConflictError(
-                        "payment outcome unknown; retry with the same Idempotency-Key to settle"
-                    ) from None
-                await self._log(order_id, "charge", "failed")
-                charge_uncertain = False
-                await self._compensate(order_id, "charge")
-                raise OrderStateConflictError("checkout payment failed; the order was cancelled") from None
-            if charge.refunded:
-                # The charge under this key was already returned (a previous
-                # pass's refund — the poller's paid-without-consume leg, or this
-                # drive's own orphan arm before a client retry). No money stands
-                # behind the order, so it must not be driven further: settle it
-                # as the charge failure it functionally is (release + cancel) and
-                # answer terminally. Falling through to the "still processing"
-                # arm below would loop the client forever — every retry re-drives,
-                # journals, and (via has_recent_saga_activity) starves the very
-                # poller that would settle the order.
-                await self._log(order_id, "charge", "refunded")
-                await self._compensate(order_id, "charge")
-                raise OrderStateConflictError(
-                    "the payment for this checkout was refunded; start a new checkout with a new Idempotency-Key"
-                )
-            if not charge.succeeded:
-                if not charge.failed:
-                    # Still processing (the provider accepted the charge but
-                    # hasn't decided it): money may move the moment it settles,
-                    # so never unwind here. Same contract as the timeout arm
-                    # above — leave it pending for the reconciler/recovery
-                    # poller instead of cancelling a charge that may succeed.
-                    await self._log(order_id, "charge", "unknown")
-                    raise OrderStateConflictError(
-                        "payment outcome unknown; retry with the same Idempotency-Key to settle"
-                    )
-                await self._log(order_id, "charge", "failed")
-                await self._compensate(order_id, "charge")
-                raise OrderStateConflictError("payment was declined; the order was cancelled")
-            charged = True
-            charge_uncertain = False
-            await self._log(order_id, "charge", "completed")
+                    async with asyncio.timeout(self._step_timeout):
+                        # One all-or-nothing batch, not a per-line loop: up to a
+                        # cart-full of sequential reserve transactions stretched the
+                        # step's latency, connection occupancy and lock exposure.
+                        # SKU mapping str(product.id) is the composition seam.
+                        await self._holds.reserve_many(
+                            [(str(line.product_id), line.quantity) for line in lines], order_id
+                        )
+                except TimeoutError as exc:
+                    # The reserve may have landed without its answer returning —
+                    # compensate whatever holds exist rather than leaking them.
+                    # The cancellation may have tainted the request session
+                    # mid-query, so compensate on a fresh one, never it. The
+                    # flag goes up BEFORE the await: if compensation itself
+                    # raises (or is itself cancelled), the outer arm must not
+                    # compensate a second time — release + guarded cancel are
+                    # idempotent, but one saga counts once. A failed
+                    # compensation still raises the timeout 409 below (never a
+                    # 500-shaped mask): the order stays claimable and the
+                    # recovery poller finishes what this frame could not.
+                    compensated = True
+                    try:
+                        await self._compensate_after_cancel(order_id, "reserve")
+                    except Exception:
+                        log.exception(
+                            "checkout order %s: post-cancel compensation failed; the recovery poller owns it",
+                            order_id,
+                        )
+                    raise OrderStateConflictError("checkout reservation timed out") from exc
+                await self._log(order_id, "reserve", "completed")
+                failed_step = "charge"
 
-            await self._log(order_id, "commit", "started")
-            try:
-                async with asyncio.timeout(self._step_timeout):
-                    await self._holds.commit_for_order(order_id, expected=len(lines))
-            except TimeoutError:
-                # Commits are idempotent per order: finish what the timeout
-                # interrupted rather than compensating a paid checkout. Still
-                # bounded — an unbounded retry could hang the request forever.
-                # A second failure leaves the order pending for the recovery
-                # poller (see below) — never a cancel after money moved.
+                await self._log(order_id, "charge", "started")
+                # Last word before money moves: a cancel (or a compensating poller)
+                # that landed while we were reserving must abort the charge here,
+                # not after it. The canceller owns the release in that case — this
+                # branch only refuses to charge a dead order.
+                live = await self._orders.get_order(order_id)
+                if live is None:
+                    log.error("checkout order %s was cancelled mid-drive before charging", order_id)
+                    raise OrderStateConflictError("the order was cancelled while checking out; start a new checkout")
+                if live.status == OrderStatus.PAID:
+                    # Not a cancel: the create-race loser resuming this same PENDING
+                    # order (or vice versa) already drove it to PAID concurrently —
+                    # reserve/commit are idempotent per order, so both frames reaching
+                    # here is expected, not a crash. Replay the final state exactly
+                    # like ``_replay_or_resume``'s PAID branch, rather than refusing a
+                    # checkout that in fact succeeded.
+                    log.info("checkout order %s settled concurrently before charging; reading final state", order_id)
+                    settled_paid = True
+                    response = _response(live)
+                    await self._remember(user_id, idempotency_key, body_hash, 201, response)
+                    await self._clear_basket_if_replay_mop_up(user_id, response.items)
+                    return response, False
+                if live.status != OrderStatus.PENDING:
+                    log.error("checkout order %s was cancelled mid-drive before charging", order_id)
+                    raise OrderStateConflictError("the order was cancelled while checking out; start a new checkout")
+                try:
+                    async with asyncio.timeout(self._step_timeout):
+                        charge = await self._charges.charge(
+                            order_id=order_id,
+                            idempotency_key=payment_key_for(user_id, idempotency_key),
+                            amount=total,
+                            payment_token=payment_token,
+                        )
+                except (CircuitOpenError, DependencyBudgetExhaustedError):
+                    raise  # No provider call was admitted; ordinary compensation is safe.
+                except (TimeoutError, DependencyUnavailableError):
+                    # The charge may have landed without its answer returning —
+                    # settle from the recorded outcome instead of guessing.
+                    charge_uncertain = True
+                    try:
+                        charge = await self._charges.find_by_idempotency_key(payment_key_for(user_id, idempotency_key))
+                    except Exception:
+                        log.exception("checkout order %s: charge lookup failed after an uncertain outcome", order_id)
+                        charge = None
+                    if charge is None or not charge.failed:
+                        # Unknown or still-pending outcome: the gateway may confirm a
+                        # moment later, and compensating here could cancel an order
+                        # whose payment succeeds (money taken, no order). Leave it
+                        # pending for the reconciler/recovery poller — never unwind.
+                        await self._log(order_id, "charge", "unknown")
+                        raise OrderStateConflictError(
+                            "payment outcome unknown; retry with the same Idempotency-Key to settle"
+                        ) from None
+                    await self._log(order_id, "charge", "failed")
+                    charge_uncertain = False
+                    # Same-session compensation is safe here: the lookup above
+                    # just answered on this session, proving it survived the
+                    # cancellation (a poisoned session raises there and takes
+                    # the leave-pending branch instead).
+                    await self._compensate(order_id, "charge")
+                    raise OrderStateConflictError("checkout payment failed; the order was cancelled") from None
+                if charge.refunded:
+                    # The charge under this key was already returned (a previous
+                    # pass's refund — the poller's paid-without-consume leg, or this
+                    # drive's own orphan arm before a client retry). No money stands
+                    # behind the order, so it must not be driven further: settle it
+                    # as the charge failure it functionally is (release + cancel) and
+                    # answer terminally. Falling through to the "still processing"
+                    # arm below would loop the client forever — every retry re-drives,
+                    # journals, and (via has_recent_saga_activity) starves the very
+                    # poller that would settle the order.
+                    await self._log(order_id, "charge", "refunded")
+                    await self._compensate(order_id, "charge")
+                    raise OrderStateConflictError(
+                        "the payment for this checkout was refunded; start a new checkout with a new Idempotency-Key"
+                    )
+                if not charge.succeeded:
+                    if not charge.failed:
+                        # Still processing (the provider accepted the charge but
+                        # hasn't decided it): money may move the moment it settles,
+                        # so never unwind here. Same contract as the timeout arm
+                        # above — leave it pending for the reconciler/recovery
+                        # poller instead of cancelling a charge that may succeed.
+                        await self._log(order_id, "charge", "unknown")
+                        raise OrderStateConflictError(
+                            "payment outcome unknown; retry with the same Idempotency-Key to settle"
+                        )
+                    await self._log(order_id, "charge", "failed")
+                    await self._compensate(order_id, "charge")
+                    raise OrderStateConflictError("payment was declined; the order was cancelled")
+                charged = True
+                charge_uncertain = False
+                await self._log(order_id, "charge", "completed")
+                failed_step = "commit"
+
+                await self._log(order_id, "commit", "started")
                 try:
                     async with asyncio.timeout(self._step_timeout):
                         await self._holds.commit_for_order(order_id, expected=len(lines))
-                except TimeoutError as exc:
-                    raise OrderStateConflictError(
-                        "checkout commit timed out; it will be settled automatically"
-                    ) from exc
-            # The paid-without-consume guard: commit_for_order reports how many
-            # of the order's holds it actually consumed (counted as the order's
-            # committed total, so a timed-out-but-landed first attempt is not a
-            # false shortfall). Fewer than the order has lines means the stock
-            # left this payment's ownership — the reaper released it, or a cancel
-            # did. Paying would take money for units the order no longer owns.
-            # Compensate is forbidden here (money moved): journal the shortfall
-            # and hand the order to whoever can still settle it — the recovery
-            # poller for a still-pending order (it refunds + cancels),
-            # or this frame's own refund when a cancel already ended the order,
-            # because the poller never claims a terminal one.
-            if not await self._commit_holds(order_id, expected=len(lines)):
-                await self._log(order_id, "commit", "shortfall")
-                # A cancel that won the F3 guard's check-then-act window left
-                # this order already terminal (its release is what emptied the
-                # holds). The pending-order poller claim never settles a
-                # terminal row, so this frame starts the refund itself — and
-                # journals the intent, so the poller's refund claim retries a
-                # raise.
-                if await self._orders.get_order_status(order_id) == OrderStatus.CANCELLED:
-                    refund = await self._refund_orphaned_charge(
-                        order_id, user_id, idempotency_key, reason="order_cancelled_after_charge"
-                    )
-                    raise OrderStateConflictError(
-                        "the order was cancelled while the payment was completing; " + _REFUND_OUTCOME_DETAIL[refund]
-                    ) from None
-                raise OrderStateConflictError(
-                    "checkout stock could not be committed; the order will be settled automatically"
-                ) from None
-            # Either attempt landed: close the step in the journal — the execution
-            # trace must not show a paid order's commit stuck at "started".
-            await self._log(order_id, "commit", "completed")
-
-            order = await self._orders.get_order(order_id)
-            if order is None:  # defensive: we created it moments ago
-                raise RuntimeError(f"checkout order {order_id} vanished mid-saga")
-            await self._log(order_id, "mark_paid", "started")
-            # Service-owned boundary: the guarded flip + its ``OrderPlaced``
-            # outbox row commit here. The basket consume + idempotency remember
-            # below are best-effort cache/Valkey writes, deliberately outside.
-            async with self._orders.uow.transaction():
-                paid = await self._orders.transition_status(
-                    order_id,
-                    expect=[OrderStatus.PENDING],
-                    to_status=OrderStatus.PAID,
-                    outbox=order_placed_outbox(
-                        order_id=order.id,
-                        user_id=order.user_id,
-                        total=order.total,
-                        items=order.items,
-                        user_email=order.user_email,
-                    ),
-                )
-            if paid is None:
-                # Lost the guarded flip — the recovery poller or a cancel
-                # settled the order concurrently. A poller settle is benign
-                # (read the truth); a cancel after the payment succeeded took
-                # money for an order that no longer exists: never return it as
-                # a created order, and never leave the money out there —
-                # reverse the charge (durable + idempotent refund).
-                paid = await self._orders.get_order(order_id)
-                if paid is None:  # defensive: settled means present
-                    raise RuntimeError(f"checkout order {order_id} vanished mid-saga")
-                if paid.status == OrderStatus.PAID:
-                    log.info("checkout order %s settled concurrently; reading final state", order_id)
-                else:
-                    # The money-moved-but-order-died undo: the refund needs only
-                    # the idempotency key (no token), so it works here and from
-                    # recovery. Its outcome decides the answer: the money back,
-                    # the journaled intent the poller retries, or the
-                    # refused orphan pair a human reconciles (counted inside).
-                    refund = await self._refund_orphaned_charge(
-                        order_id, user_id, idempotency_key, reason="order_cancelled_after_charge"
-                    )
-                    if refund == "refunded":
-                        log.info(
-                            "checkout order %s was cancelled while the payment was completing; the charge was "
-                            "refunded automatically",
-                            order_id,
+                except TimeoutError:
+                    # Commits are idempotent per order: finish what the timeout
+                    # interrupted rather than compensating a paid checkout. Still
+                    # bounded — an unbounded retry could hang the request forever.
+                    # A second failure leaves the order pending for the recovery
+                    # poller (see below) — never a cancel after money moved.
+                    try:
+                        async with asyncio.timeout(self._step_timeout):
+                            await self._holds.commit_for_order(order_id, expected=len(lines))
+                    except TimeoutError as exc:
+                        raise OrderStateConflictError(
+                            "checkout commit timed out; it will be settled automatically"
+                        ) from exc
+                # The paid-without-consume guard: commit_for_order reports how many
+                # of the order's holds it actually consumed (counted as the order's
+                # committed total, so a timed-out-but-landed first attempt is not a
+                # false shortfall). Fewer than the order has lines means the stock
+                # left this payment's ownership — the reaper released it, or a cancel
+                # did. Paying would take money for units the order no longer owns.
+                # Compensate is forbidden here (money moved): journal the shortfall
+                # and hand the order to whoever can still settle it — the recovery
+                # poller for a still-pending order (it refunds + cancels),
+                # or this frame's own refund when a cancel already ended the order,
+                # because the poller never claims a terminal one.
+                if not await self._commit_holds(order_id, expected=len(lines)):
+                    await self._log(order_id, "commit", "shortfall")
+                    # A cancel that won the F3 guard's check-then-act window left
+                    # this order already terminal (its release is what emptied the
+                    # holds). The pending-order poller claim never settles a
+                    # terminal row, so this frame starts the refund itself — and
+                    # journals the intent, so the poller's refund claim retries a
+                    # raise.
+                    if await self._orders.get_order_status(order_id) == OrderStatus.CANCELLED:
+                        refund = await self._refund_orphaned_charge(
+                            order_id, user_id, idempotency_key, reason="order_cancelled_after_charge"
                         )
+                        raise OrderStateConflictError(
+                            "the order was cancelled while the payment was completing; "
+                            + _REFUND_OUTCOME_DETAIL[refund]
+                        ) from None
                     raise OrderStateConflictError(
-                        "the order was cancelled while the payment was completing; " + _REFUND_OUTCOME_DETAIL[refund]
+                        "checkout stock could not be committed; the order will be settled automatically"
+                    ) from None
+                # Either attempt landed: close the step in the journal — the execution
+                # trace must not show a paid order's commit stuck at "started".
+                await self._log(order_id, "commit", "completed")
+
+                order = await self._orders.get_order(order_id)
+                if order is None:  # defensive: we created it moments ago
+                    raise RuntimeError(f"checkout order {order_id} vanished mid-saga")
+                await self._log(order_id, "mark_paid", "started")
+                # Service-owned boundary: the guarded flip + its ``OrderPlaced``
+                # outbox row commit here. The basket consume + idempotency remember
+                # below are best-effort cache/Valkey writes, deliberately outside.
+                async with self._orders.uow.transaction():
+                    paid = await self._orders.transition_status(
+                        order_id,
+                        expect=[OrderStatus.PENDING],
+                        to_status=OrderStatus.PAID,
+                        outbox=order_placed_outbox(
+                            order_id=order.id,
+                            user_id=order.user_id,
+                            total=order.total,
+                            items=order.items,
+                            user_email=order.user_email,
+                        ),
                     )
-            else:
-                await self._log(order_id, "mark_paid", "completed")
-            response = _response(paid)
-            if paid.status == OrderStatus.PAID:
-                await self._consume_basket(user_id, lines)
-                await self._remember(user_id, idempotency_key, body_hash, 201, response)
-            return response, True
+                if paid is None:
+                    # Lost the guarded flip — the recovery poller or a cancel
+                    # settled the order concurrently. A poller settle is benign
+                    # (read the truth); a cancel after the payment succeeded took
+                    # money for an order that no longer exists: never return it as
+                    # a created order, and never leave the money out there —
+                    # reverse the charge (durable + idempotent refund).
+                    paid = await self._orders.get_order(order_id)
+                    if paid is None:  # defensive: settled means present
+                        raise RuntimeError(f"checkout order {order_id} vanished mid-saga")
+                    if paid.status == OrderStatus.PAID:
+                        log.info("checkout order %s settled concurrently; reading final state", order_id)
+                    else:
+                        # The money-moved-but-order-died undo: the refund needs only
+                        # the idempotency key (no token), so it works here and from
+                        # recovery. Its outcome decides the answer: the money back,
+                        # the journaled intent the poller retries, or the
+                        # refused orphan pair a human reconciles (counted inside).
+                        refund = await self._refund_orphaned_charge(
+                            order_id, user_id, idempotency_key, reason="order_cancelled_after_charge"
+                        )
+                        if refund == "refunded":
+                            log.info(
+                                "checkout order %s was cancelled while the payment was completing; the charge was "
+                                "refunded automatically",
+                                order_id,
+                            )
+                        raise OrderStateConflictError(
+                            "the order was cancelled while the payment was completing; "
+                            + _REFUND_OUTCOME_DETAIL[refund]
+                        )
+                else:
+                    await self._log(order_id, "mark_paid", "completed")
+                response = _response(paid)
+                if paid.status == OrderStatus.PAID:
+                    await self._consume_basket(user_id, lines)
+                    await self._remember(user_id, idempotency_key, body_hash, 201, response)
+                return response, True
         except (OrderStateConflictError, CheckoutIdempotencyConflictError):
             raise
+        except TimeoutError as exc:
+            # The OVERALL drive deadline fired (per-step timeouts are handled
+            # locally above — an escape past them means the sum blew the
+            # request budget). The cancelled step may have tainted the request
+            # session mid-query, so settle without reusing it. Money-moved
+            # keeps the pending-for-recovery rule: unwinding would take payment
+            # without an order. Anything earlier compensates fresh (or not at
+            # all when the reserve arm above already did — release + guarded
+            # cancel are idempotent, but the counter should count one saga once). A
+            # failed compensation still raises the timeout 409 below, never a
+            # 500-shaped mask — the order stays claimable for the poller.
+            if settled_paid:
+                # The order already reached PAID through the concurrent-settle
+                # replay above — never compensate it. A same-key retry replays
+                # the stored response. (This frame's own success tail sets no
+                # flag: every await between its mark_paid and return swallows
+                # cancellation, so the outer arm is unreachable there.)
+                raise OrderStateConflictError(
+                    "checkout timed out; retry with the same Idempotency-Key to settle"
+                ) from exc
+            if charged or charge_uncertain:
+                log.error("checkout failed after payment succeeded; leaving pending for recovery", exc_info=True)
+                raise OrderStateConflictError(
+                    "checkout could not complete after payment; it will be settled automatically"
+                ) from None
+            if not compensated:
+                try:
+                    await self._compensate_after_cancel(order_id, failed_step)
+                except Exception:
+                    log.exception(
+                        "checkout order %s: post-cancel compensation failed; the recovery poller owns it",
+                        order_id,
+                    )
+            raise OrderStateConflictError("checkout timed out; retry with the same Idempotency-Key to settle") from exc
         except Exception:
             if charged or charge_uncertain:
                 # Money already moved: unwinding would take payment without an
@@ -698,6 +782,61 @@ class CheckoutSaga:
             return False
         return True
 
+    async def compensate_with(
+        self,
+        orders: OrdersRepositoryPort,
+        holds: StockHoldsPort,
+        order_id: uuid.UUID,
+        failed_step: str,
+    ) -> None:
+        """Release every hold taken for the order, then cancel it, on the given scope.
+
+        The same release + guarded-cancel as :meth:`_compensate`, parameterized
+        by scope so the composition root can drive it on a fresh session after
+        a step was cancelled mid-query (see :meth:`_compensate_after_cancel`).
+        ``failed_step`` labels ``checkout_compensation_total``.
+        """
+        checkout_compensation_total.labels(failed_step).inc()
+        await self._log_on(orders, order_id, "compensate", "started")
+        await holds.release_for_order(order_id)
+        # Service-owned boundary for the terminal flip (the release above
+        # owns its own through the inventory service; the journal rows own
+        # theirs — compensation stays a sequence of small units, never one
+        # transaction held across the stock give-back).
+        async with orders.uow.transaction():
+            await orders.transition_status(order_id, expect=[OrderStatus.PENDING], to_status=OrderStatus.CANCELLED)
+        await self._log_on(orders, order_id, "compensate", "completed")
+        log.info("checkout order %s compensated after %s failed", order_id, failed_step)
+
+    async def _compensate_after_cancel(self, order_id: uuid.UUID, failed_step: str) -> None:
+        """Compensate after a step was cancelled mid-query — never on the tainted session.
+
+        An ``asyncio.timeout`` cancellation can land inside an asyncpg
+        operation, after which the request-scoped session is fragile to reuse
+        (the next query may raise on the cancelled connection). Roll it back
+        first — releasing any locks the dead step still holds, so the fresh
+        session below doesn't block on them — then run the release + cancel on
+        a fresh session when the composition root provided one. If even the
+        rollback fails, the dead transaction may still hold row locks the fresh
+        session then waits on (bounded by the statement timeout, not forever):
+        compensation stays correct, just slower — and the recovery poller
+        remains the backstop. Without a fresh scope (direct construction in
+        tests) fall back to the request session; the rollback above is then
+        the only hardening.
+        """
+        try:
+            await self._orders.rollback()
+        except Exception:
+            log.warning(
+                "checkout order %s: rollback of the cancelled session failed; compensating anyway",
+                order_id,
+                exc_info=True,
+            )
+        if self._fresh_compensate is not None:
+            await self._fresh_compensate(order_id, failed_step)
+        else:
+            await self._compensate(order_id, failed_step)
+
     async def _compensate(self, order_id: uuid.UUID, failed_step: str) -> None:
         """Release every hold taken for the order, then cancel it (reverse order of the drive).
 
@@ -708,19 +847,7 @@ class CheckoutSaga:
         user-facing cancel is the mirror image of compensation
         and deliberately never lands here.
         """
-        checkout_compensation_total.labels(failed_step).inc()
-        await self._log(order_id, "compensate", "started")
-        await self._holds.release_for_order(order_id)
-        # Service-owned boundary for the terminal flip (the release above
-        # owns its own through the inventory service; the journal rows own
-        # theirs — compensation stays a sequence of small units, never one
-        # transaction held across the stock give-back).
-        async with self._orders.uow.transaction():
-            await self._orders.transition_status(
-                order_id, expect=[OrderStatus.PENDING], to_status=OrderStatus.CANCELLED
-            )
-        await self._log(order_id, "compensate", "completed")
-        log.info("checkout order %s compensated after %s failed", order_id, failed_step)
+        await self.compensate_with(self._orders, self._holds, order_id, failed_step)
 
     # --- recovery: settle what a crash left pending ---------------------
 
@@ -978,10 +1105,14 @@ class CheckoutSaga:
         deliberate exception: it rides the cancel's own unit of work for
         atomicity, and no liveness read depends on it.)
         """
-        if self._orders.uow.depth != 0:
-            raise RuntimeError(f"saga journal must commit at depth 0 (called at depth {self._orders.uow.depth})")
-        async with self._orders.uow.transaction():
-            await self._orders.log_saga_step(order_id, step, status)
+        await self._log_on(self._orders, order_id, step, status)
+
+    async def _log_on(self, orders: OrdersRepositoryPort, order_id: uuid.UUID, step: str, status: str) -> None:
+        """Journal one saga step on the given scope (fresh-session compensation journals fresh)."""
+        if orders.uow.depth != 0:
+            raise RuntimeError(f"saga journal must commit at depth 0 (called at depth {orders.uow.depth})")
+        async with orders.uow.transaction():
+            await orders.log_saga_step(order_id, step, status)
 
     async def _remember(
         self,

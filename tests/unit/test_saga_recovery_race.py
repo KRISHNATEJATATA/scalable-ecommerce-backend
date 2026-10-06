@@ -32,6 +32,7 @@ def _settings() -> AppSettings:
         _env_file=None,
         database_url=str(get_settings().database_url),
         checkout_saga_step_timeout_seconds=60,
+        checkout_saga_overall_timeout_seconds=120,
     )
 
 
