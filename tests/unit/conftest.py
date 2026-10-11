@@ -32,7 +32,7 @@ _TRUNCATE = text(
     "inventory.reservations, inventory.inventory, inventory.outbox, "
     "identity.users, identity.outbox, "
     "payments.payments, payments.outbox, "
-    "notifications.recipients, notifications.sent_emails, "
+    "notifications.recipients, notifications.order_recipients, notifications.sent_emails, "
     "notifications.email_suppressions CASCADE"
 )
 

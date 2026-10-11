@@ -1,0 +1,10 @@
+Good news — your payment has been refunded.
+
+We cancelled your order $order_id and returned the full amount to your
+original payment method.
+
+Order: $order_id
+Amount refunded: $amount
+
+Depending on your payment provider, the money can take a few business days
+to appear on your statement. No action is needed from you.

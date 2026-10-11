@@ -1,4 +1,5 @@
-"""The notification repository port — recipients, suppressions, the durable send state."""
+"""The notification repository port — recipients, the order→email projection,
+suppressions, the durable send state."""
 
 from __future__ import annotations
 
@@ -31,6 +32,19 @@ class NotificationRepositoryPort(Protocol):
         """Materialize ``UserCreated`` (user_id → email); a re-delivery refreshes the email."""
         ...
 
+    async def upsert_order_email(self, order_id: uuid.UUID, email: str) -> None:
+        """Materialize ``OrderPlaced`` (order_id → email) — the Order Recipient
+        projection, the refund notice's address source. Written from the event
+        the worker already consumes, before any send decision; a re-delivery
+        refreshes the email."""
+        ...
+
+    async def get_order_email(self, order_id: uuid.UUID) -> str | None:
+        """The email known for ``order_id`` (the Order Recipient) — how a
+        ``PaymentRefunded`` (which carries no address) resolves its recipient.
+        ``None`` = never seen; the caller raises for redrive → DLQ."""
+        ...
+
     async def get_recipient_email(self, user_id: uuid.UUID) -> str | None:
         """The email known for ``user_id`` — the FALLBACK address source for an
         ``OrderPlaced`` that doesn't carry one (pre-snapshot events). ``None``
@@ -43,7 +57,7 @@ class NotificationRepositoryPort(Protocol):
         ...
 
     async def has_sent(self, order_id: uuid.UUID, email_type: str) -> bool:
-        """Whether a confirmation is recorded ``sent`` for the order."""
+        """Whether an email of this type is recorded ``sent`` for the order."""
         ...
 
     async def claim_send(self, order_id: uuid.UUID, email_type: str, recipient: str) -> ClaimResult:

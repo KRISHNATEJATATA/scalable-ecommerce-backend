@@ -11,7 +11,15 @@ from decimal import Decimal
 
 import pytest
 
-from src.events.models import OrderPlaced, OrderPlacedData, OrderPlacedLine, UserCreated, UserCreatedData
+from src.events.models import (
+    OrderPlaced,
+    OrderPlacedData,
+    OrderPlacedLine,
+    PaymentRefunded,
+    PaymentRefundedData,
+    UserCreated,
+    UserCreatedData,
+)
 from src.notifications.adapters.db.models import EmailSuppression
 from src.notifications.adapters.db.repository import NotificationRepository
 from src.notifications.adapters.notification_worker import make_notification_handler
@@ -45,6 +53,24 @@ def _order_placed_event(order_id: uuid.UUID, user_id: uuid.UUID, user_email: str
 
 def _user_created_event(user_id: uuid.UUID, email: str) -> dict:
     return UserCreated.new(trace_id="", data=UserCreatedData(user_id=user_id, email=email)).model_dump(mode="json")
+
+
+def _payment_refunded_event(order_id: uuid.UUID, amount: str = "25.00") -> dict:
+    """A validated, normalized PaymentRefunded (the shape SqsConsumer hands the handler).
+
+    The wire carries NO recipient — only the charge's ids, the amount and the
+    gateway ref — which is exactly why the refund email resolves the Order
+    Recipient projection.
+    """
+    return PaymentRefunded.new(
+        trace_id="",
+        data=PaymentRefundedData(
+            payment_id=uuid.uuid4(),
+            order_id=order_id,
+            amount=Decimal(amount),
+            gateway_ref="chrg_123",
+        ),
+    ).model_dump(mode="json")
 
 
 class _RecordingSender:
@@ -275,6 +301,150 @@ async def test_handler_routes_user_created_and_order_placed(sessionmaker_factory
     assert sender.calls[0]["to"] == "buyer@example.com"
 
 
+async def test_handler_routes_payment_refunded(sessionmaker_factory):
+    """The full worker path: OrderPlaced feeds the projection, PaymentRefunded
+    sends the refund email — two emails, one order."""
+    sender = _RecordingSender()
+    handler = make_notification_handler(sessionmaker_factory, sender, _THEME)
+    order_id = uuid.uuid4()
+    await handler(_order_placed_event(order_id, uuid.uuid4(), user_email="buyer@example.com"))
+    await handler(_payment_refunded_event(order_id))
+    assert [c["to"] for c in sender.calls] == ["buyer@example.com", "buyer@example.com"]
+
+
+async def test_payment_refunded_sends_the_refund_email_and_records_it(session):
+    """The refund email names the order and the amount in customer-safe copy,
+    carries the claim's persisted message id, and is recorded under
+    ``refund_issued`` — its own Claimed Send beside the confirmation's."""
+    repo = NotificationRepository(session)
+    sender = _RecordingSender()
+    service = NotificationService(repo, sender, _THEME)
+    order_id = uuid.uuid4()
+    await service.handle_order_placed(_order_placed_event(order_id, uuid.uuid4(), user_email="buyer@example.com"))
+    assert len(sender.calls) == 1  # the confirmation
+    await service.handle_payment_refunded(_payment_refunded_event(order_id, "42.50"))
+    assert len(sender.calls) == 2
+    call = sender.calls[1]
+    assert call["to"] == "buyer@example.com"
+    assert str(order_id) in call["subject"]
+    assert str(order_id) in call["body"]
+    assert "42.50" in call["body"]
+    assert str(order_id) in (call["body_html"] or "")
+    assert "42.50" in (call["body_html"] or "")
+    # Customer-safe: the charge's provider reference never reaches the mail.
+    assert "chrg_123" not in call["body"] and "chrg_123" not in call["subject"]
+    assert uuid.UUID(call["message_id"]).version == 4
+    assert await repo.has_sent(order_id, "refund_issued") is True
+    # The confirmation's Claimed Send is untouched by the refund's.
+    assert await repo.has_sent(order_id, "order_confirmation") is True
+
+
+async def test_refund_redelivery_cannot_double_send(session):
+    """The sent_emails backstop (UNIQUE(order_id, email_type)) keeps a
+    dedupe-TTL-expiry redelivery of PaymentRefunded from ever double-sending."""
+    repo = NotificationRepository(session)
+    sender = _RecordingSender()
+    service = NotificationService(repo, sender, _THEME)
+    order_id = uuid.uuid4()
+    await service.handle_order_placed(_order_placed_event(order_id, uuid.uuid4(), user_email="buyer@example.com"))
+    event = _payment_refunded_event(order_id)
+    await service.handle_payment_refunded(event)
+    await service.handle_payment_refunded(event)  # the redelivery
+    assert len(sender.calls) == 2  # confirmation + ONE refund email
+
+
+async def test_refund_email_resolves_the_projection_even_when_the_confirmation_was_suppressed(session):
+    """The Order Recipient projection is fed BEFORE any send decision: an order
+    whose confirmation was suppressed still has its address recorded, so the
+    refund handler RESOLVES the recipient (and then honours the same
+    suppression — a hard-bounced address is never mailed again) rather than
+    raising a projection miss. The orders where mail matters most are not the
+    ones that lose their address source."""
+    repo = NotificationRepository(session)
+    sender = _RecordingSender()
+    service = NotificationService(repo, sender, _THEME)
+    order_id = uuid.uuid4()
+    session.add(EmailSuppression(recipient="bounced@example.com", reason="hard_bounce"))
+    await session.commit()
+    await service.handle_order_placed(_order_placed_event(order_id, uuid.uuid4(), user_email="bounced@example.com"))
+    assert sender.calls == []  # confirmation suppressed
+    # The address is recorded anyway — the projection is not the send state.
+    assert await repo.get_order_email(order_id) == "bounced@example.com"
+    # Resolvable, so no raise; the same suppression list applies to the refund.
+    await service.handle_payment_refunded(_payment_refunded_event(order_id))
+    assert sender.calls == []
+    assert await repo.has_sent(order_id, "refund_issued") is False
+
+
+async def test_refund_email_sends_when_the_confirmation_send_never_completed(session):
+    """The complementary half: an order whose confirmation is still ``pending``
+    (claimed, never sent — the crash window) also resolves the refund email's
+    recipient from the projection."""
+    repo = NotificationRepository(session)
+    sender = _RecordingSender()
+    service = NotificationService(repo, sender, _THEME)
+    order_id = uuid.uuid4()
+    # Simulate the confirmation's crashed attempt: claim, no send, no mark.
+    await repo.upsert_order_email(order_id, "buyer@example.com")
+    claim = await repo.claim_send(order_id, "order_confirmation", "buyer@example.com")
+    assert claim.outcome == "claimed"
+    await service.handle_payment_refunded(_payment_refunded_event(order_id))
+    assert [c["to"] for c in sender.calls] == ["buyer@example.com"]
+    assert await repo.has_sent(order_id, "refund_issued") is True
+
+
+async def test_refund_without_a_projection_row_raises_for_redrive(session):
+    """No Order Recipient for the refunded order → the handler raises: the
+    message is left for SQS redrive → DLQ, never silently skipped (a transient
+    cross-topic race self-heals on redelivery; a permanent miss stays visible)."""
+    repo = NotificationRepository(session)
+    sender = _RecordingSender()
+    service = NotificationService(repo, sender, _THEME)
+    with pytest.raises(UnknownRecipientError):
+        await service.handle_payment_refunded(_payment_refunded_event(uuid.uuid4()))
+    assert sender.calls == []
+
+
+async def test_refund_send_failure_after_the_claim_retries_cleanly(session):
+    """The shared claim discipline: a transient send failure raises AFTER the
+    refund claim (row stays ``pending``), and the retry takes the claim over
+    and sends — the same recovery the confirmation exercises."""
+    repo = NotificationRepository(session)
+    order_id = uuid.uuid4()
+    placed = _order_placed_event(order_id, uuid.uuid4(), user_email="buyer@example.com")
+    event = _payment_refunded_event(order_id)
+    await NotificationService(repo, _RecordingSender(), _THEME).handle_order_placed(placed)
+    failing = NotificationService(repo, _RecordingSender(fail=True), _THEME)
+    with pytest.raises(RuntimeError):
+        await failing.handle_payment_refunded(event)
+    assert await repo.has_sent(order_id, "refund_issued") is False
+    sender = _RecordingSender()
+    await NotificationService(repo, sender, _THEME).handle_payment_refunded(event)
+    assert len(sender.calls) == 1
+    assert await repo.has_sent(order_id, "refund_issued") is True
+
+
+async def test_refund_crash_window_takeover_resends_with_the_same_message_id(session):
+    """Crash AFTER the provider accepted but BEFORE the mark: the redelivery finds
+    the ``pending`` refund claim, takes it over, and resends with the SAME persisted
+    message_id — the at-least-once duplicate is now detectable and reconcilable."""
+    repo = NotificationRepository(session)
+    sender = _RecordingSender()
+    service = NotificationService(repo, sender, _THEME)
+    order_id = uuid.uuid4()
+    await service.handle_order_placed(_order_placed_event(order_id, uuid.uuid4(), user_email="buyer@example.com"))
+    email_type = EmailType.REFUND_ISSUED.value
+    # Simulate the crashed attempt: claim + send, no mark (process died here).
+    claim = await repo.claim_send(order_id, email_type, "buyer@example.com")
+    assert claim.outcome == "claimed"
+    assert await repo.has_sent(order_id, email_type) is False
+    # The redelivery: takeover → resend with the identical persisted id.
+    await service.handle_payment_refunded(_payment_refunded_event(order_id))
+    assert len(sender.calls) == 2  # confirmation + the refund redelivery
+    assert sender.calls[1]["message_id"] == str(claim.message_id)
+    assert await repo.has_sent(order_id, email_type) is True
+
+
 def test_missing_theme_dir_fails_fast(tmp_path):
     """A missing theme dir/file is a worker-BOOT failure (the fail-fast contract):
     from_settings raises before any queue or SMTP contact."""
@@ -282,16 +452,46 @@ def test_missing_theme_dir_fails_fast(tmp_path):
         EmailTheme.from_settings(str(tmp_path / "no-such-theme"))
 
 
+def test_missing_refund_files_fail_fast(tmp_path):
+    """The theme-dir contract covers EVERY email type: a dir carrying only the
+    confirmation triple (a pre-ticket-02 mounted theme) is a boot failure, not
+    a silent fall-back to packaged refund copy."""
+    theme_dir = tmp_path / "legacy-acme"
+    theme_dir.mkdir()
+    for name in ("subject.txt", "body.txt", "body.html"):
+        (theme_dir / name).write_text("x\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="refund_subject.txt"):
+        EmailTheme.from_settings(str(theme_dir))
+
+
+def test_packaged_theme_renders_the_refund_email():
+    """The packaged minimal theme carries the refund triple: both placeholders
+    substituted, no template syntax leaking into customer-facing copy."""
+    subject, body, body_html = _THEME.render_refund_issued("o-1", "42.50")
+    assert "o-1" in subject and "42.50" not in subject  # the subject names only the order
+    assert "o-1" in body and "42.50" in body
+    assert "o-1" in body_html and "42.50" in body_html
+    for rendered in (subject, body, body_html):
+        assert "$" not in rendered
+
+
 def test_custom_theme_dir_override(tmp_path):
     """A frontend-mounted dir overrides the packaged default: the copy comes from
-    the pointed-at files (the startup-decided branding switch)."""
+    the pointed-at files (the startup-decided branding switch) for BOTH types."""
     theme_dir = tmp_path / "acme-mail"
     theme_dir.mkdir()
     (theme_dir / "subject.txt").write_text("Your ACME order — $order_id\n", encoding="utf-8")
     (theme_dir / "body.txt").write_text("Thanks!\n\n$order_id\n", encoding="utf-8")
     (theme_dir / "body.html").write_text("<p>$order_id</p>\n", encoding="utf-8")
+    (theme_dir / "refund_subject.txt").write_text("ACME refund — $order_id\n", encoding="utf-8")
+    (theme_dir / "refund_body.txt").write_text("Refunded: $amount\n", encoding="utf-8")
+    (theme_dir / "refund_body.html").write_text("<p>Refunded: $amount</p>\n", encoding="utf-8")
     theme = EmailTheme.from_settings(str(theme_dir))
     subject, body, body_html = theme.render_order_confirmation("o-1", "1.00", "- x1", "<li>x1</li>")
     assert subject == "Your ACME order — o-1"
     assert "Thanks!" in body and "o-1" in body
     assert body_html == "<p>o-1</p>\n"
+    refund_subject, refund_body, refund_html = theme.render_refund_issued("o-2", "7.00")
+    assert refund_subject == "ACME refund — o-2"
+    assert refund_body == "Refunded: 7.00\n"
+    assert refund_html == "<p>Refunded: 7.00</p>\n"

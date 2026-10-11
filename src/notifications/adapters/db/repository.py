@@ -16,7 +16,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.notifications.adapters.db.models import EmailSuppression, Recipient, SentEmail
+from src.notifications.adapters.db.models import EmailSuppression, OrderRecipient, Recipient, SentEmail
 from src.notifications.domain.email import EmailStatus
 from src.notifications.ports.repository import ClaimOutcome, ClaimResult, NotificationRepositoryPort
 
@@ -50,6 +50,24 @@ class NotificationRepository(NotificationRepositoryPort):
             )
         )
         await self._session.commit()
+
+    async def upsert_order_email(self, order_id: uuid.UUID, email: str) -> None:
+        """Materialize ``OrderPlaced`` (order_id → email): insert or refresh
+        (idempotent on re-delivery). Written before any send decision, so a
+        suppressed or unsent confirmation still records the Order Recipient."""
+        await self._session.execute(
+            pg_insert(OrderRecipient)
+            .values(order_id=order_id, email=email)
+            .on_conflict_do_update(
+                index_elements=[OrderRecipient.order_id],
+                set_={"email": email, "updated_at": func.now()},
+            )
+        )
+        await self._session.commit()
+
+    async def get_order_email(self, order_id: uuid.UUID) -> str | None:
+        stmt = select(OrderRecipient.email).where(OrderRecipient.order_id == order_id)
+        return (await self._session.execute(stmt)).scalar_one_or_none()
 
     async def get_recipient_email(self, user_id: uuid.UUID) -> str | None:
         stmt = select(Recipient.email).where(Recipient.user_id == user_id)

@@ -1,14 +1,19 @@
 """SQLAlchemy models for the ``notifications`` schema.
 
-Three small tables, no outbox (this module emits no events — it consumes them):
+Four small tables, no outbox (this module emits no events — it consumes them):
 
 * ``recipients`` — the bus-delivered materialization of ``UserCreated``
   (user_id → email). ``user_id`` is an id-value ref to ``identity.users``
-  (no cross-module FK). The send path resolves the recipient here, so the
-  consumer never reads identity/Keycloak directly.
+  (no cross-module FK). The confirmation send path falls back to it when an
+  ``OrderPlaced`` predates the event-carried address.
+* ``order_recipients`` — the bus-delivered materialization of ``OrderPlaced``
+  (order_id → email), upserted before any send decision. ``order_id`` is an
+  id-value ref to ``orders.orders`` (no cross-module FK). This is the refund
+  notice's address source: ``PaymentRefunded`` carries no recipient, and the
+  projection is written from events the worker already consumes.
 * ``sent_emails`` — the durable send state: ``UNIQUE(order_id, email_type)``
-  claimed (``pending``) BEFORE the send and marked ``sent`` after, so every
-  send has a durable record and a crash mid-window is visible + reconcilable.
+  claimed (``pending``) BEFORE the send and marked ``sent`` after, so every send
+  has a durable record and a crash mid-window is visible + reconcilable.
   ``message_id`` is the uuid4 generated at claim time, reused by every resend.
 * ``email_suppressions`` — hard bounce / spam complaint ⇒ never send again.
   The check is live now; the writer is the SES bounce/complaint consumer,
@@ -26,7 +31,7 @@ from src.shared.db.mixins import TimestampMixin
 
 SCHEMA = "notifications"
 
-__all__ = ["SCHEMA", "Base", "EmailSuppression", "Recipient", "SentEmail"]
+__all__ = ["SCHEMA", "Base", "EmailSuppression", "OrderRecipient", "Recipient", "SentEmail"]
 
 
 class Base(DeclarativeBase):
@@ -40,6 +45,23 @@ class Recipient(Base, TimestampMixin):
     __table_args__ = {"schema": SCHEMA}
 
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+
+
+class OrderRecipient(Base, TimestampMixin):
+    """``OrderPlaced`` materialized: which email belongs to which order id.
+
+    The refund notice's address source — ``PaymentRefunded`` carries no
+    recipient, so the worker resolves the Order Recipient here (from the
+    ``OrderPlaced`` it already consumes, upserted before any send decision).
+    """
+
+    __tablename__ = "order_recipients"
+    __table_args__ = {"schema": SCHEMA}
+
+    order_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True
+    )  # id-value ref to orders.orders (no cross-module FK)
     email: Mapped[str] = mapped_column(String(255), nullable=False)
 
 

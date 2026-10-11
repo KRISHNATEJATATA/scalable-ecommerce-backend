@@ -4,8 +4,8 @@ Registered on the default ``prometheus_client`` registry; incremented only in
 the notification-worker process, so they reach Prometheus via that worker's
 ``WORKER_METRICS_PORT`` (same pattern as ``src/orders/application/metrics.py``).
 
-* ``notification_sent_total`` — one increment per confirmation actually sent,
-  labeled by ``email_type``.
+* ``notification_sent_total`` — one increment per email actually sent
+  (confirmation, refund issued), labeled by ``email_type``.
 * ``notification_suppressed_total`` — sends deliberately NOT made, by
   ``reason``: ``suppressed`` (recipient on the suppression list — hard bounce
   or spam complaint ⇒ never send again) and ``already_sent`` (a ``sent``

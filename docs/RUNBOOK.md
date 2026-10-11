@@ -643,7 +643,8 @@ what ran; the backlog says what it failed to.
 
 ### 15. Notification sends stuck `pending` (the crash window, reconciled)
 
-Order-confirmation delivery is explicitly **at-least-once** : the
+Notification delivery (order confirmation, refund issued — every
+`sent_emails` type) is explicitly **at-least-once** : the
 notification consumer claims a `notifications.sent_emails` row as `pending`
 **before** sending and marks it `sent` after the provider accepts. A row that
 stays `pending` past the redrive window means the worker crashed between claim
@@ -665,13 +666,15 @@ Per row, decide from evidence, not guesswork:
    MIME header, which SES preserves (SES **overwrites** the RFC `Message-ID`
    even on raw sends, so never correlate on that in prod). Locally, search
    Mailpit for the header value. Takeover resends reuse the SAME persisted id,
-   so every attempt of one confirmation correlates under one identifier.
+   so every attempt of one send correlates under one identifier.
 2. **It landed** ⇒ flip the row: `UPDATE notifications.sent_emails
    SET status='sent', updated_at=now() WHERE order_id=... AND email_type=...;`
    — no resend, done.
 3. **It never landed** ⇒ delete the row (`DELETE ... WHERE status='pending'
-   AND ...`); the next `OrderPlaced` redelivery/DLQ replay re-claims and
-   sends cleanly. (If the original message already DLQ'd, replay it per §4.)
+    AND ...`); the next redelivery/DLQ replay of the type's own event
+    (`OrderPlaced` for `order_confirmation`, `PaymentRefunded` for
+    `refund_issued`) re-claims and sends cleanly. (If the original message
+    already DLQ'd, replay it per §4.)
 
 **Monitoring.** `notification_send_recovered_total` counts takeovers of
 claimed-but-unmarked sends — each increment is one crash-window recovery (a

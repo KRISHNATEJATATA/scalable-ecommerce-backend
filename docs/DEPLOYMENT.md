@@ -39,7 +39,7 @@ depth):
 | Image worker | `python -m src.catalog.adapters.image_worker` | `image-uploads` | sniff · re-encode · thumbnails → `image_status` |
 | Cache worker | `python -m src.catalog.adapters.cache_worker` | `catalog-cache` | invalidate Valkey read-cache on `ProductUpdated`/`ProductDeleted` |
 | Cart consumer | `python -m src.cart.adapters.cart_consumer` | `cart-events` | record one durable product projection/tombstone per `ProductUpdated`/`ProductDeleted`; cart reads reconcile their own lines |
-| Notification consumer | `python -m src.notifications.adapters.notification_worker` | `notifications` | send the order-confirmation email on `OrderPlaced` (recipient from the event's checkout-time `user_email`; the `UserCreated`-materialized recipients table is the fallback); SMTP locally, SES in prod |
+| Notification consumer | `python -m src.notifications.adapters.notification_worker` | `notifications` | send the order-confirmation email on `OrderPlaced` (recipient from the event's checkout-time `user_email`; the `UserCreated`-materialized recipients table is the fallback) and the refund-issued email on `PaymentRefunded` (recipient from the `order_recipients` projection); SMTP locally, SES in prod |
 | Reservation reaper | `python -m src.inventory.adapters.reaper` | Postgres `reservations` | release holds past `expires_at` (SKIP LOCKED) so a stalled saga can't leak stock |
 | Payment reconciler | `python -m src.bootstrap.payment_reconciler` | Postgres `payments` | resolve charges still `pending` past their grace window by asking the gateway (missed-webhook backstop) |
 | Retention prune | `python -m scripts.retention_prune` | Postgres `outbox`×5 + `reservations` + `saga_log` | batched deletes of terminal history past its retention (published outbox rows, released/committed reservations, saga_log of terminal orders) — see RUNBOOK §14 |
@@ -85,16 +85,26 @@ pure Valkey (no Postgres): size it by memory, not connections.
 cart, which is acceptable here and never is for an order.
 
 The **notification consumer** drains the `notifications` queue (`OrderPlaced` +
-`UserCreated`) and sends the order-confirmation email. The recipient is the
+`UserCreated` + `PaymentRefunded`) and sends notification emails: the
+order-confirmation email on `OrderPlaced`, and the refund-issued email on
+`PaymentRefunded` — the customer-facing half of the saga's automatic refund
+compensation (ADR 0021; the theme-dir contract change behind it is ticket 02's,
+agreed with the frontend mirror). The confirmation's recipient is the
 `OrderPlaced` event's own checkout-time `user_email` (an order-row snapshot
 taken from the authenticated caller), so the send no longer depends on the
 user's `UserCreated` having landed first — cross-subscription event ordering is
 not guaranteed, and the miss used to redrive → DLQ a healthy order's
-confirmation. Recipients are also materialized bus-side from `UserCreated`
-events into `notifications.recipients` (the event carries `user_id` + `email`),
-the fallback for `OrderPlaced` events written before they carried the address —
-neither path reads identity/Keycloak. Only an event with NEITHER address source
-(e.g. a pre-snapshot event from a user the consumer has never seen) is left for
+confirmation. Every handled `OrderPlaced` is also materialized into
+`notifications.order_recipients` (order_id → email) **before any send
+decision** — the refund email's address source, present even when the
+confirmation was suppressed or never sent, because `PaymentRefunded` carries no
+recipient and no identity lookup is ever made. A refund event whose order has
+no projection row raises for redrive → DLQ (a transient cross-topic race
+self-heals on redelivery; a permanent miss stays visible, never a silent skip).
+`UserCreated` events are likewise materialized into `notifications.recipients`
+(the event carries `user_id` + `email`), the fallback for `OrderPlaced` events
+written before they carried the address — neither path reads identity/Keycloak.
+Only an event with NO resolvable address source is left for
 redrive → DLQ rather than silently dropped. Delivery is explicitly
 **at-least-once** — never described as duplicate-proof: the Valkey
 dedupe (per-subscription, on `event_id`) suppresses plain redeliveries, and the

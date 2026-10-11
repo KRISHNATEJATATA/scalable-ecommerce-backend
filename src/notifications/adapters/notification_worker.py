@@ -1,22 +1,28 @@
-"""Notification worker — the `service`-role consumer that sends order-confirmation
-emails.
+"""Notification worker — the `service`-role consumer that sends notification emails.
 
 Thin SQS transport shell over the generic idempotent :class:`SqsConsumer`: it
-drains the ``notifications`` queue (subscribed to ``OrderPlaced`` and
-``UserCreated`` via SNS — see ``CONSUMERS`` in ``scripts/bus_bootstrap.py``)
-and hands each validated event to the application service:
+drains the ``notifications`` queue (subscribed to ``OrderPlaced``,
+``UserCreated`` and ``PaymentRefunded`` via SNS — see ``CONSUMERS`` in
+``scripts/bus_bootstrap.py``) and hands each validated event to the application
+service:
 
 * ``UserCreated`` upserts the recipient (user_id → email) into this module's
   own ``recipients`` table — the bus-delivered materialization that keeps the
-  send path free of any cross-module identity read, and the FALLBACK address
+  send paths free of any cross-module identity read, and the FALLBACK address
   source for ``OrderPlaced`` events written before the event carried one.
-* ``OrderPlaced`` renders + sends the confirmation via the sender port, with
-  the suppression-list check and the durable ``sent_emails`` claim state (see
+* ``OrderPlaced`` sends the order confirmation via the sender port, with the
+  suppression-list check and the durable ``sent_emails`` claim state (see
   :class:`~src.notifications.application.service.NotificationService`). The
   recipient is the event's own checkout-time ``user_email`` when present —
   the send no longer depends on the user's ``UserCreated`` having landed
   first (cross-subscription ordering was never guaranteed; the miss used to
-  redrive → DLQ a healthy order's confirmation).
+  redrive → DLQ a healthy order's confirmation). The handled event also feeds
+  the Order Recipient projection (order_id → email), the refund notice's
+  address source.
+* ``PaymentRefunded`` sends the refund-issued email — the customer-facing
+  half of the saga's automatic refund compensation.
+  The event carries no address; the Order Recipient projection resolves it,
+  and an unresolvable one raises for redrive → DLQ, never a silent skip.
 
 Delivery is explicitly AT-LEAST-ONCE, never duplicate-proof:
 ``SqsConsumer`` dedupes on ``event_id`` **within this subscription**
@@ -55,7 +61,7 @@ def make_notification_handler(sessionmaker: Any, sender: Any, theme: Any) -> Han
 
     A per-message session (the worker pool's shape: one session at a time per
     coroutine) wraps the repository + service for each event. The loaded
-    :class:`~src.notifications.themes.EmailTheme` carries the confirmation copy.
+    :class:`~src.notifications.themes.EmailTheme` carries every email type's copy.
     """
 
     async def _handle(event: dict[str, Any]) -> None:
@@ -66,7 +72,9 @@ def make_notification_handler(sessionmaker: Any, sender: Any, theme: Any) -> Han
                 await service.handle_user_created(event)
             elif event_type == "OrderPlaced":
                 await service.handle_order_placed(event)
-            else:  # pragma: no cover - the subscription only carries these two events
+            elif event_type == "PaymentRefunded":
+                await service.handle_payment_refunded(event)
+            else:  # pragma: no cover - the subscription only carries these three events
                 log.warning("notification worker ignoring unexpected event type %r", event_type)
 
     return _handle
@@ -76,7 +84,8 @@ async def run_worker(settings: AppSettings, sessionmaker: Any, valkey: Any, stop
     """Build a real SQS-backed notification consumer and run its loop."""
     if not settings.notifications_queue_url:
         raise RuntimeError("NOTIFICATIONS_QUEUE_URL must be configured for the notification worker")
-    # The theme loads first (fail-fast at boot: a missing/misrouted theme dir is
+    # The theme loads first (fail-fast at boot: a missing/misrouted theme dir —
+    # or one from before the per-type triples, missing the refund_* files — is
     # a boot failure, before any queue or SMTP contact — same contract as the
     # sender selection below).
     theme = EmailTheme.from_settings(settings.notification_email_theme_dir)

@@ -30,10 +30,14 @@ CONSUMERS: dict[str, list[str]] = {
     "order-events": ["OrderPlaced"],
     "catalog-cache": ["ProductUpdated", "ProductDeleted"],
     "cart-events": ["ProductUpdated", "ProductDeleted"],
-    # Order-confirmation emails: the notification consumer materializes
-    # recipients from UserCreated (which carries user_id + email) and sends on
-    # OrderPlaced (see src/notifications) — no cross-module identity read.
-    "notifications": ["OrderPlaced", "UserCreated"],
+    # Notification emails: the notification consumer materializes recipients
+    # from UserCreated (which carries user_id + email), sends the confirmation
+    # on OrderPlaced (see src/notifications) — no cross-module identity read —
+    # and tells the customer their money came back on PaymentRefunded (the
+    # customer-facing half of the saga's refund compensation). The
+    # event keeps its saga-events subscription too: that durable home is for
+    # the consumer that eventually choreographs settlement.
+    "notifications": ["OrderPlaced", "UserCreated", "PaymentRefunded"],
     # The checkout saga reacts to these outcomes in-process today (the
     # orchestrator calls the services directly and the recovery poller reads
     # the payment row), so no SQS consumer drains this queue yet — the
