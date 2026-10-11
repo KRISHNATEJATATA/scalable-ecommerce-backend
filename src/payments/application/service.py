@@ -186,20 +186,14 @@ class PaymentsService:
                 result.reason or "unknown",
             )
             return False
-        # The flip + ``PaymentRefunded`` outbox row commit together: the
-        # service owns this boundary (the repository only flushes), so the
-        # money-side undo and its announcement are one atomic fact.
-        # NOTE: the gateway call above stays OUTSIDE any transaction — a unit
-        # of work must never span an external call.
-        async with self._repo.uow.transaction():
-            updated = await self._repo.transition(
-                payment_id,
-                to_status=PaymentStatus.REFUNDED.value,
-                gateway_ref=gateway_ref,
-                failure_reason=None,
-                outbox_factory=payment_refunded_outbox,
-                expect=PaymentStatus.SUCCEEDED.value,
-            )
+        updated = await self._repo.transition(
+            payment_id,
+            to_status=PaymentStatus.REFUNDED.value,
+            gateway_ref=gateway_ref,
+            failure_reason=None,
+            outbox_factory=payment_refunded_outbox,
+            expect=PaymentStatus.SUCCEEDED.value,
+        )
         if updated is None:
             # Already final in a way this read did not see. The only way a
             # ``succeeded`` read loses the ``succeeded → refunded`` flip is a
@@ -240,13 +234,9 @@ class PaymentsService:
         with a different order/amount is rejected rather than silently resumed."""
         self._reject_raw_pan(payment_method_token)
         gateway = self._require_gateway()
-        # Service-owned boundary: the idempotent create commits here. The
-        # gateway call below stays OUTSIDE any transaction — a unit of work
-        # must never hold row locks across an external call.
-        async with self._repo.uow.transaction():
-            row, created = await self._repo.create_pending(
-                order_id=order_id, idempotency_key=idempotency_key, amount=amount
-            )
+        row, created = await self._repo.create_pending(
+            order_id=order_id, idempotency_key=idempotency_key, amount=amount
+        )
         if not created:
             if row.order_id != order_id or row.amount != amount:
                 raise PaymentIdempotencyConflictError()
@@ -289,15 +279,16 @@ class PaymentsService:
         reason = payload.get("reason")
         payment_id = row.id
         prior_status = row.status
-        # The read above stays outside the unit of work; the guarded flip
-        # below opens the service-owned boundary (see ``_apply_outcome``), so
-        # a duplicate delivery never commits a half-applied outcome.
-        updated = await self._apply_outcome(
-            payment_id,
-            outcome=outcome,
-            gateway_ref=ref if isinstance(ref, str) else None,
-            failure_reason=reason if isinstance(reason, str) else None,
-        )
+        # The read → guarded flip is one unit of work: the service opens the
+        # boundary, and the repository's own block nests inside it as a savepoint,
+        # so a duplicate delivery never interns a half-applied outcome.
+        async with self._repo.uow.transaction():
+            updated = await self._apply_outcome(
+                payment_id,
+                outcome=outcome,
+                gateway_ref=ref if isinstance(ref, str) else None,
+                failure_reason=reason if isinstance(reason, str) else None,
+            )
         if updated is not None:
             log.info("webhook applied: payment %s → %s", payment_id, outcome)
         else:  # already final: duplicate or out-of-order delivery — nothing to do
@@ -450,25 +441,21 @@ class PaymentsService:
         ``pending`` for the reconciliation poller."""
         if outcome == GatewayOutcome.PENDING:
             return None
-        # Service-owned boundary: the guarded flip + its outbox row commit
-        # here. ``on_succeeded`` (the cancelled-order refund-intent journal)
-        # runs inside the same unit of work via the transition below.
-        async with self._repo.uow.transaction():
-            if outcome == GatewayOutcome.SUCCEEDED:
-                return await self._repo.transition(
-                    payment_id,
-                    to_status=PaymentStatus.SUCCEEDED.value,
-                    gateway_ref=gateway_ref,
-                    outbox_factory=payment_succeeded_outbox,
-                    on_succeeded=self._on_payment_succeeded,
-                )
+        if outcome == GatewayOutcome.SUCCEEDED:
             return await self._repo.transition(
                 payment_id,
-                to_status=PaymentStatus.FAILED.value,
+                to_status=PaymentStatus.SUCCEEDED.value,
                 gateway_ref=gateway_ref,
-                failure_reason=failure_reason or "unknown",
-                outbox_factory=payment_failed_outbox,
+                outbox_factory=payment_succeeded_outbox,
+                on_succeeded=self._on_payment_succeeded,
             )
+        return await self._repo.transition(
+            payment_id,
+            to_status=PaymentStatus.FAILED.value,
+            gateway_ref=gateway_ref,
+            failure_reason=failure_reason or "unknown",
+            outbox_factory=payment_failed_outbox,
+        )
 
 
 def _response(row: Payment) -> PaymentResponse:

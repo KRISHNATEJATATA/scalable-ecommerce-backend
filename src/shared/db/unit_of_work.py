@@ -50,9 +50,7 @@ class UnitOfWorkPort(Protocol):
     """The transaction handle an application service drives.
 
     Repositories and services depend on this abstraction; ``UnitOfWork`` is the
-    adapter over a request-scoped ``AsyncSession``. Only ``transaction()`` is
-    part of the contract — committing is a policy decision the service owns,
-    so there is deliberately no ``commit()``/``rollback()`` to call around it.
+    adapter over a request-scoped ``AsyncSession``.
     """
 
     @property
@@ -60,10 +58,9 @@ class UnitOfWorkPort(Protocol):
         """The underlying session — repositories query through it, never commit it."""
         ...
 
-    @property
-    def depth(self) -> int:
-        """Current nesting depth on the session (0 = no open unit of work)."""
-        ...
+    async def commit(self) -> None: ...
+
+    async def rollback(self) -> None: ...
 
     def transaction(self) -> AbstractAsyncContextManager[None]:
         """A block whose clean exit commits the outermost transaction and no-op-nests inside one."""
@@ -81,19 +78,12 @@ class UnitOfWork:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    @property
-    def depth(self) -> int:
-        """Current nesting depth on the session (0 = no open unit of work)."""
-        return int(self.session.info.get(_DEPTH_KEY, 0))
+    async def commit(self) -> None:
+        """Commit the session's current transaction."""
+        await self.session.commit()
 
     async def rollback(self) -> None:
-        """Drop the session's current transaction (recovery's per-order error boundary).
-
-        Adapter-only affordance — not part of :class:`UnitOfWorkPort`, so no
-        caller can bypass depth tracking and unwind (or commit) a half-finished
-        operation. There is deliberately no ``commit()`` here either: the
-        outermost ``transaction()`` exit is the single commit point.
-        """
+        """Drop the session's current transaction (recovery's per-order error boundary)."""
         await self.session.rollback()
 
     @contextmanager

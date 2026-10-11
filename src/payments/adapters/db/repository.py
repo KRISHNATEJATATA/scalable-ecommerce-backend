@@ -89,10 +89,7 @@ class PaymentsRepository:
 
         ``ON CONFLICT DO NOTHING`` + re-select keeps the uniqueness race in the DB:
         two concurrent first-requests each either insert or read the winner's row —
-        exactly one of them reports ``created=True``.
-
-        Participates in the caller's unit of work (the service opens it): ends in
-        ``flush()``, never commits."""
+        exactly one of them reports ``created=True``."""
         stmt = (
             pg_insert(Payment)
             .values(
@@ -104,19 +101,18 @@ class PaymentsRepository:
             .on_conflict_do_nothing(constraint="uq_payments_idempotency_key")
             .returning(Payment.id)
         )
-        inserted_id = (await self._session.execute(stmt)).scalar_one_or_none()
-        if inserted_id is None:
-            existing = await self.get_by_idempotency_key(idempotency_key)
-            if existing is None:  # defensive: conflict reported but the winner isn't visible
-                raise RuntimeError(f"idempotency conflict for {idempotency_key!r} but no row found")
-            return existing, False
-        await self._session.flush()
-        row = await self.get(inserted_id)
-        if row is None:  # defensive: the row we just inserted must be re-readable
-            # "after flush", not "after commit" — same reason as the orders
-            # repository: the boundary lives in the unit of work, not here.
-            raise RuntimeError(f"inserted payment {inserted_id} not found after flush")
-        return row, True
+        async with self.uow.transaction():
+            inserted_id = (await self._session.execute(stmt)).scalar_one_or_none()
+            if inserted_id is None:
+                existing = await self.get_by_idempotency_key(idempotency_key)
+                if existing is None:  # defensive: conflict reported but the winner isn't visible
+                    raise RuntimeError(f"idempotency conflict for {idempotency_key!r} but no row found")
+                return existing, False
+            await self._session.flush()
+            row = await self.get(inserted_id)
+            if row is None:  # defensive: the row we just inserted must be re-readable
+                raise RuntimeError(f"inserted payment {inserted_id} not found after commit")
+            return row, True
 
     async def transition(
         self,
@@ -137,12 +133,8 @@ class PaymentsRepository:
         guard is ``pending`` by default (charge outcomes are decided exactly
         once); the saga's refund leg passes ``succeeded`` so only a real refund
         wins. The outbox factory is fed the update's own RETURNING values and
-        its message is written before the service commits, so the event can never
-        announce a state that didn't land.
-
-        Participates in the caller's unit of work (the service opens it): a lost
-        guarded flip returns ``None`` without rolling back, and ``on_succeeded``
-        runs inside the same unit of work, so a half-applied outcome never commits."""
+        its message is written before the commit, so the event can never
+        announce a state that didn't land."""
         stmt = (
             update(Payment)
             .where(Payment.id == payment_id, Payment.status == (expect or PaymentStatus.PENDING.value))
@@ -152,23 +144,23 @@ class PaymentsRepository:
             # in-session synchronization of the identity map is redundant work.
             .execution_options(synchronize_session=False)
         )
-        row = (await self._session.execute(stmt)).mappings().first()
-        if row is None:
-            # Lost the guarded flip — matched zero rows, so there is nothing
-            # to undo. Return without rolling back: the caller (or the
-            # enclosing unit of work) owns the transaction, and a rollback
-            # here would discard its surrounding work.
-            return None
-        if outbox_factory is not None:
-            self._session.add(self._outbox_row(outbox_factory(row)))
-        if on_succeeded is not None:
-            # A raise unwinds the caller's unit of work (rollback at the top
-            # level, savepoint release inside a caller's transaction), so a
-            # half-applied outcome — payment flipped, refund intent missing —
-            # never commits.
-            await on_succeeded(row["order_id"])
-        await self._session.flush()
-        return await self.get(payment_id)
+        async with self.uow.transaction():
+            row = (await self._session.execute(stmt)).mappings().first()
+            if row is None:
+                # Lost the guarded flip — matched zero rows, so there is nothing
+                # to undo. Return without rolling back: the caller (or the
+                # enclosing unit of work) owns the transaction, and a rollback
+                # here would discard its surrounding work.
+                return None
+            if outbox_factory is not None:
+                self._session.add(self._outbox_row(outbox_factory(row)))
+            if on_succeeded is not None:
+                # A raise unwinds this block (rollback at the top level, savepoint
+                # release inside a caller's transaction), so a half-applied
+                # outcome — payment flipped, refund intent missing — never commits.
+                await on_succeeded(row["order_id"])
+            await self._session.flush()
+            return await self.get(payment_id)
 
     async def due_for_reconciliation(
         self, *, grace_seconds: int, max_age_seconds: int, batch_size: int

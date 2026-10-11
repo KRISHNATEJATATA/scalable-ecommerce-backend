@@ -33,12 +33,10 @@ PaymentSucceededHook = Callable[[uuid.UUID], Awaitable[None]]
 
 
 class PaymentsRepositoryPort(Protocol):
-    @property
-    def uow(self) -> UnitOfWorkPort:
-        """The unit of work this repository is bound to. Repositories
-        participate in it but never commit it; the application service opens the
-        boundary with ``async with repo.uow.transaction():``."""
-        ...
+    #: The unit of work this repository is bound to. Repositories
+    #: participate in it but never commit it; the application service opens the
+    #: boundary with ``async with repo.uow.transaction():``.
+    uow: UnitOfWorkPort
 
     async def has_succeeded_for_order(self, order_id: uuid.UUID) -> bool:
         """Read whether a captured payment remains outstanding for this order."""

@@ -25,12 +25,10 @@ from src.shared.db.unit_of_work import UnitOfWorkPort
 
 
 class OrdersRepositoryPort(Protocol):
-    @property
-    def uow(self) -> UnitOfWorkPort:
-        """The unit of work this repository is bound to. Repositories
-        participate in it but never commit it; the application service opens the
-        boundary with ``async with repo.uow.transaction():``."""
-        ...
+    #: The unit of work this repository is bound to. Repositories
+    #: participate in it but never commit it; the application service opens the
+    #: boundary with ``async with repo.uow.transaction():``.
+    uow: UnitOfWorkPort
 
     async def list_orders(
         self, user_id: uuid.UUID, params: PageParams, status: OrderStatus | None = None
